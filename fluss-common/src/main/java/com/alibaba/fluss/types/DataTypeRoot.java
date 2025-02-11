@@ -48,11 +48,15 @@ import java.util.Set;
 public enum DataTypeRoot {
     CHAR(DataTypeFamily.PREDEFINED, DataTypeFamily.CHARACTER_STRING),
 
+    VARCHAR(DataTypeFamily.PREDEFINED, DataTypeFamily.CHARACTER_STRING),
+
     STRING(DataTypeFamily.PREDEFINED, DataTypeFamily.CHARACTER_STRING),
 
     BOOLEAN(DataTypeFamily.PREDEFINED),
 
     BINARY(DataTypeFamily.PREDEFINED, DataTypeFamily.BINARY_STRING),
+
+    VARBINARY(DataTypeFamily.PREDEFINED, DataTypeFamily.BINARY_STRING),
 
     BYTES(DataTypeFamily.PREDEFINED, DataTypeFamily.BINARY_STRING),
 
@@ -100,6 +104,8 @@ public enum DataTypeRoot {
             DataTypeFamily.EXTENSION),
 
     ARRAY(DataTypeFamily.CONSTRUCTED, DataTypeFamily.COLLECTION),
+
+    MULTISET(DataTypeFamily.CONSTRUCTED, DataTypeFamily.COLLECTION),
 
     MAP(DataTypeFamily.CONSTRUCTED, DataTypeFamily.EXTENSION),
 

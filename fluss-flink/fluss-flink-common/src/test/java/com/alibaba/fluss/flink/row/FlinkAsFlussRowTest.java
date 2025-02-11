@@ -19,10 +19,16 @@ package com.alibaba.fluss.flink.row;
 
 import com.alibaba.fluss.row.BinaryString;
 import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.InternalArray;
+import com.alibaba.fluss.row.InternalMap;
+import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
+import com.alibaba.fluss.types.DataTypes;
 
 import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.GenericArrayData;
+import org.apache.flink.table.data.GenericMapData;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
@@ -31,7 +37,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
 
+import static com.alibaba.fluss.row.serializer.InternalArraySerializer.convertToJavaArray;
+import static com.alibaba.fluss.row.serializer.InternalMapSerializer.convertToJavaMap;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.AssertionsForClassTypes.offset;
 
@@ -58,13 +68,27 @@ class FlinkAsFlussRowTest {
                         TimestampData.fromInstant(Instant.ofEpochMilli(1672531200000L)),
                         TimestampData.fromEpochMillis(1672531200000L, 3),
                         new byte[] {1, 2, 3},
-                        null);
+                        null,
+                        new GenericArrayData(new Integer[] {1, 2, 3}),
+                        new GenericMapData(
+                                new HashMap<Integer, StringData>() {
+                                    {
+                                        put(0, null);
+                                        put(5, StringData.fromString("5"));
+                                        put(6, StringData.fromString("6"));
+                                        put(666, StringData.fromString("666"));
+                                    }
+                                }),
+                        GenericRowData.of(
+                                StringData.fromString("a"),
+                                GenericRowData.of(1, StringData.fromString("nested")),
+                                42));
         row = new FlinkAsFlussRow().replace(flinkRow);
     }
 
     @Test
     public void testGetFieldCount() {
-        assertThat(14).isEqualTo(row.getFieldCount());
+        assertThat(17).isEqualTo(row.getFieldCount());
     }
 
     @Test
@@ -152,5 +176,38 @@ class FlinkAsFlussRowTest {
     public void testGetBytes() {
         byte[] bytes = row.getBytes(12);
         assertThat(bytes).isEqualTo(new byte[] {1, 2, 3});
+    }
+
+    @Test
+    public void testGetArray() {
+        InternalArray array = row.getArray(14);
+        assertThat(array.size()).isEqualTo(3);
+        assertThat(array.getInt(0)).isEqualTo(1);
+        assertThat(array.getInt(1)).isEqualTo(2);
+        assertThat(array.getInt(2)).isEqualTo(3);
+
+        Object[] javaArray = convertToJavaArray(array, DataTypes.INT());
+        assertThat(javaArray).isEqualTo(new Object[] {1, 2, 3});
+    }
+
+    @Test
+    public void testGetMap() {
+        InternalMap map = row.getMap(15);
+        assertThat(map.size()).isEqualTo(4);
+        Map<Object, Object> javaMap = convertToJavaMap(map, DataTypes.INT(), DataTypes.STRING());
+        assertThat(javaMap.get(0)).isEqualTo(null);
+        assertThat(javaMap.get(5).toString()).isEqualTo("5");
+        assertThat(javaMap.get(6).toString()).isEqualTo("6");
+        assertThat(javaMap.get(666).toString()).isEqualTo("666");
+    }
+
+    @Test
+    public void testGetRow() {
+        InternalRow nestedRow = row.getRow(16, 2);
+        assertThat(nestedRow.getString(0)).isEqualTo(BinaryString.fromString("a"));
+        assertThat(nestedRow.getRow(1, 2).getInt(0)).isEqualTo(1);
+        assertThat(nestedRow.getRow(1, 2).getString(1))
+                .isEqualTo(BinaryString.fromString("nested"));
+        assertThat(nestedRow.getInt(2)).isEqualTo(42);
     }
 }

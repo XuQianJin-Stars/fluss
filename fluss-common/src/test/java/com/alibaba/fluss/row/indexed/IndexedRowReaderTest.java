@@ -20,6 +20,7 @@ package com.alibaba.fluss.row.indexed;
 import com.alibaba.fluss.row.BinaryString;
 import com.alibaba.fluss.row.Decimal;
 import com.alibaba.fluss.types.DataType;
+import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.utils.DateTimeUtils;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -96,6 +97,20 @@ public class IndexedRowReaderTest {
         assertThat(reader.readTimestampNtz(1).toString()).isEqualTo("2023-10-25T12:01:13.182");
         assertThat(reader.readTimestampNtz(5).toString()).isEqualTo("2023-10-25T12:01:13.182");
         assertThat(reader.readTimestampLtz(1).toString()).isEqualTo("2023-10-25T12:01:13.182Z");
-        assertThat(reader.isNullAt(18)).isTrue();
+
+        assertThat(reader.isNullAt(18)).isFalse();
+        assertThat(reader.readTimestampLtz(5).toString()).isEqualTo("2023-10-25T12:01:13.182Z");
+
+        // array
+        assertThat(reader.readArray().size()).isEqualTo(3);
+
+        // map
+        assertThat(reader.readMap().size()).isEqualTo(3);
+
+        // row
+        assertThat(reader.readRow((RowType) dataTypes[21]).getInt(0)).isEqualTo(123);
+
+        // null field
+        assertThat(reader.isNullAt(22)).isEqualTo(true);
     }
 }

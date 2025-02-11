@@ -59,14 +59,14 @@ import static com.alibaba.fluss.record.TestData.DATA_1_WITH_KEY_AND_VALUE;
 import static com.alibaba.fluss.record.TestData.EXPECTED_LOG_RESULTS_FOR_DATA_1_WITH_PK;
 import static com.alibaba.fluss.server.testutils.KvTestUtils.assertLookupResponse;
 import static com.alibaba.fluss.server.testutils.RpcMessageTestUtils.assertFetchLogResponse;
-import static com.alibaba.fluss.server.testutils.RpcMessageTestUtils.assertFetchLogResponseWithRowKind;
+import static com.alibaba.fluss.server.testutils.RpcMessageTestUtils.assertFetchLogResponseWithChangeType;
 import static com.alibaba.fluss.server.testutils.RpcMessageTestUtils.assertProduceLogResponse;
 import static com.alibaba.fluss.server.testutils.RpcMessageTestUtils.createTable;
 import static com.alibaba.fluss.server.testutils.RpcMessageTestUtils.newFetchLogRequest;
 import static com.alibaba.fluss.server.testutils.RpcMessageTestUtils.newLookupRequest;
 import static com.alibaba.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequest;
 import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordsEquals;
-import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordsEqualsWithRowKind;
+import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordsEqualsWithChangeType;
 import static com.alibaba.fluss.testutils.DataTestUtils.genKvRecordBatch;
 import static com.alibaba.fluss.testutils.DataTestUtils.genKvRecords;
 import static com.alibaba.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
@@ -199,7 +199,7 @@ public class ReplicaFetcherITCase {
                 bucketId);
 
         // check leader log data.
-        assertFetchLogResponseWithRowKind(
+        assertFetchLogResponseWithChangeType(
                 leaderGateWay.fetchLog(newFetchLogRequest(-1, tableId, bucketId, 0L)).get(),
                 tableId,
                 bucketId,
@@ -240,7 +240,7 @@ public class ReplicaFetcherITCase {
             assertThat(resultForBucket.getTableBucket()).isEqualTo(tb);
             LogRecords records = resultForBucket.records();
             assertThat(records).isNotNull();
-            assertLogRecordsEqualsWithRowKind(
+            assertLogRecordsEqualsWithChangeType(
                     DATA1_ROW_TYPE, records, EXPECTED_LOG_RESULTS_FOR_DATA_1_WITH_PK);
         }
     }

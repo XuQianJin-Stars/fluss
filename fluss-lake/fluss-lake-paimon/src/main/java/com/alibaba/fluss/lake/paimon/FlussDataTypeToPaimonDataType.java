@@ -32,12 +32,15 @@ import com.alibaba.fluss.types.FloatType;
 import com.alibaba.fluss.types.IntType;
 import com.alibaba.fluss.types.LocalZonedTimestampType;
 import com.alibaba.fluss.types.MapType;
+import com.alibaba.fluss.types.MultisetType;
 import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.types.SmallIntType;
 import com.alibaba.fluss.types.StringType;
 import com.alibaba.fluss.types.TimeType;
 import com.alibaba.fluss.types.TimestampType;
 import com.alibaba.fluss.types.TinyIntType;
+import com.alibaba.fluss.types.VarBinaryType;
+import com.alibaba.fluss.types.VarCharType;
 
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
@@ -54,6 +57,12 @@ public class FlussDataTypeToPaimonDataType implements DataTypeVisitor<DataType> 
     }
 
     @Override
+    public DataType visit(VarCharType varCharType) {
+        return withNullability(
+                DataTypes.VARCHAR(varCharType.getLength()), varCharType.isNullable());
+    }
+
+    @Override
     public DataType visit(StringType stringType) {
         return withNullability(DataTypes.STRING(), stringType.isNullable());
     }
@@ -66,6 +75,12 @@ public class FlussDataTypeToPaimonDataType implements DataTypeVisitor<DataType> 
     @Override
     public DataType visit(BinaryType binaryType) {
         return withNullability(DataTypes.BINARY(binaryType.getLength()), binaryType.isNullable());
+    }
+
+    @Override
+    public DataType visit(VarBinaryType varBinaryType) {
+        return withNullability(
+                DataTypes.VARBINARY(varBinaryType.getLength()), varBinaryType.isNullable());
     }
 
     @Override
@@ -158,6 +173,13 @@ public class FlussDataTypeToPaimonDataType implements DataTypeVisitor<DataType> 
                     field.getDescription().orElse(null));
         }
         return withNullability(rowTypeBuilder.build(), rowType.isNullable());
+    }
+
+    @Override
+    public DataType visit(MultisetType multisetType) {
+        return withNullability(
+                DataTypes.MULTISET(multisetType.getElementType().accept(this)),
+                multisetType.isNullable());
     }
 
     private DataType withNullability(DataType paimon, boolean nullable) {

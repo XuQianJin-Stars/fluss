@@ -20,12 +20,19 @@ package com.alibaba.fluss.row.indexed;
 import com.alibaba.fluss.memory.MemorySegment;
 import com.alibaba.fluss.row.BinaryString;
 import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.GenericArray;
+import com.alibaba.fluss.row.GenericMap;
+import com.alibaba.fluss.row.GenericRow;
 import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
+import com.alibaba.fluss.row.serializer.InternalArraySerializer;
+import com.alibaba.fluss.row.serializer.InternalMapSerializer;
+import com.alibaba.fluss.row.serializer.InternalRowSerializer;
 import com.alibaba.fluss.types.DataType;
 import com.alibaba.fluss.types.DataTypes;
 import com.alibaba.fluss.types.IntType;
+import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.types.StringType;
 import com.alibaba.fluss.utils.DateTimeUtils;
 import com.alibaba.fluss.utils.TypeUtils;
@@ -36,8 +43,13 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.util.HashMap;
+import java.util.Map;
 
+import static com.alibaba.fluss.row.BinaryString.fromString;
 import static com.alibaba.fluss.row.TestInternalRowGenerator.createAllTypes;
+import static com.alibaba.fluss.row.serializer.InternalArraySerializer.convertToJavaArray;
+import static com.alibaba.fluss.row.serializer.InternalMapSerializer.convertToJavaMap;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -68,9 +80,9 @@ public class IndexedRowTest {
 
         assertAllTypeEquals(row);
 
-        assertThat(row.getHeaderSizeInBytes()).isEqualTo(15);
-        assertThat(row.getSizeInBytes()).isEqualTo(117);
-        assertThat(row.getFieldCount()).isEqualTo(19);
+        assertThat(row.getHeaderSizeInBytes()).isEqualTo(27);
+        assertThat(row.getSizeInBytes()).isEqualTo(247);
+        assertThat(row.getFieldCount()).isEqualTo(22);
         assertThat(row.anyNull()).isTrue();
         assertThat(row.anyNull(new int[] {0, 1})).isFalse();
     }
@@ -190,7 +202,32 @@ public class IndexedRowTest {
         writer.writeTimestampNtz(TimestampNtz.fromMillis(1698235273182L), 1);
         writer.writeTimestampNtz(TimestampNtz.fromMillis(1698235273182L), 5);
         writer.writeTimestampLtz(TimestampLtz.fromEpochMillis(1698235273182L), 1);
-        writer.setNullAt(18);
+        writer.writeTimestampLtz(TimestampLtz.fromEpochMillis(1698235273182L), 5);
+
+        // 19: array
+        writer.writeArray(
+                new GenericArray(new Object[] {1, 2, 3}),
+                new InternalArraySerializer(DataTypes.INT()));
+
+        // 20: map
+        Map<Object, Object> javaMap = new HashMap<>();
+        javaMap.put(0, null);
+        javaMap.put(1, fromString("1"));
+        javaMap.put(2, fromString("2"));
+        writer.writeMap(
+                new GenericMap(javaMap),
+                new InternalMapSerializer(DataTypes.INT(), DataTypes.STRING()));
+
+        // 21: row
+        GenericRow genericRow = GenericRow.of(123, GenericRow.of(20), fromString("Test"));
+        writer.writeRow(
+                genericRow,
+                new InternalRowSerializer(
+                        RowType.of(
+                                DataTypes.INT(), RowType.of(DataTypes.INT()), DataTypes.STRING())));
+
+        // 22: null field
+        writer.setNullAt(22);
         return writer;
     }
 
@@ -213,7 +250,21 @@ public class IndexedRowTest {
                 .isEqualTo(Decimal.fromBigDecimal(new BigDecimal(10), 20, 0));
         assertThat(row.getTimestampNtz(15, 1).toString()).isEqualTo("2023-10-25T12:01:13.182");
         assertThat(row.getTimestampNtz(16, 5).toString()).isEqualTo("2023-10-25T12:01:13.182");
-        assertThat(row.getTimestampLtz(17, 5).toString()).isEqualTo("2023-10-25T12:01:13.182Z");
-        assertThat(row.isNullAt(18)).isTrue();
+        assertThat(row.getTimestampLtz(17, 1).toString()).isEqualTo("2023-10-25T12:01:13.182Z");
+        assertThat(row.getTimestampLtz(18, 5).toString()).isEqualTo("2023-10-25T12:01:13.182Z");
+
+        assertThat(row.getArray(19).size()).isEqualTo(3);
+        assertThat(convertToJavaArray(row.getArray(19), DataTypes.INT()))
+                .isEqualTo(new Object[] {1, 2, 3});
+
+        Map<Object, Object> javaMap =
+                convertToJavaMap(row.getMap(20), DataTypes.INT(), DataTypes.STRING());
+        assertThat(javaMap.get(0)).isEqualTo(null);
+        assertThat(javaMap.get(1).toString()).isEqualTo("1");
+        assertThat(javaMap.get(2).toString()).isEqualTo("2");
+
+        assertThat(row.getRow(21, 3).getFieldCount()).isEqualTo(3);
+        assertThat(row.getRow(21, 3).getInt(0)).isEqualTo(123);
+        assertThat(row.getRow(21, 3).getString(2).toString()).isEqualTo("Test");
     }
 }

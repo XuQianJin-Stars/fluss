@@ -22,13 +22,18 @@ import com.alibaba.fluss.memory.MemorySegment;
 import com.alibaba.fluss.row.BinarySegmentUtils;
 import com.alibaba.fluss.row.BinaryString;
 import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.InternalArray;
+import com.alibaba.fluss.row.InternalMap;
+import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
 import com.alibaba.fluss.types.DataType;
+import com.alibaba.fluss.types.RowType;
 
 import java.io.Serializable;
 import java.util.Arrays;
 
+import static com.alibaba.fluss.row.BinaryRow.calculateBitSetWidthInBytes;
 import static com.alibaba.fluss.types.DataTypeChecks.getLength;
 import static com.alibaba.fluss.types.DataTypeChecks.getPrecision;
 import static com.alibaba.fluss.types.DataTypeChecks.getScale;
@@ -43,10 +48,12 @@ import static com.alibaba.fluss.types.DataTypeChecks.getScale;
 @Internal
 public class IndexedRowReader {
 
+    private final int fieldCount;
     private final int nullBitsSizeInBytes;
     private final int variableColumnLengthListInBytes;
     // nullBitSet size + variable column length list size.
     private final int headerSizeInBytes;
+    private final DataType[] types;
 
     private MemorySegment segment;
     private int offset;
@@ -54,7 +61,9 @@ public class IndexedRowReader {
     private int variableLengthPosition;
 
     public IndexedRowReader(DataType[] types) {
-        this.nullBitsSizeInBytes = IndexedRow.calculateBitSetWidthInBytes(types.length);
+        this.types = types;
+        this.fieldCount = types.length;
+        this.nullBitsSizeInBytes = calculateBitSetWidthInBytes(fieldCount);
         this.variableColumnLengthListInBytes =
                 IndexedRow.calculateVariableColumnLengthListSize(types);
         this.headerSizeInBytes = nullBitsSizeInBytes + variableColumnLengthListInBytes;
@@ -199,6 +208,40 @@ public class IndexedRowReader {
         return Arrays.copyOfRange(bytes, 0, newLen);
     }
 
+    public InternalArray readArray() {
+        int length = readVarLengthFromVarLengthList();
+        MemorySegment[] segments = new MemorySegment[] {segment};
+        InternalArray array = BinarySegmentUtils.readArrayData(segments, position, length);
+        position += length;
+        return array;
+    }
+
+    public InternalMap readMap() {
+        int length = readVarLengthFromVarLengthList();
+        MemorySegment[] segments = new MemorySegment[] {segment};
+        InternalMap map = BinarySegmentUtils.readMapData(segments, position, length);
+        position += length;
+        return map;
+    }
+
+    public InternalRow readRow() {
+        return readRow(types);
+    }
+
+    public InternalRow readRow(RowType rowType) {
+        return readRow(rowType.getChildren().toArray(new DataType[0]));
+    }
+
+    public InternalRow readRow(DataType[] types) {
+        int length = readVarLengthFromVarLengthList();
+        MemorySegment[] segments = new MemorySegment[] {segment};
+        InternalRow row =
+                BinarySegmentUtils.readIndexedRowData(
+                        segments, fieldCount, position, length, types);
+        position += length;
+        return row;
+    }
+
     /**
      * Creates an accessor for reading elements.
      *
@@ -257,6 +300,18 @@ public class IndexedRowReader {
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
                 final int timestampLtzPrecision = getPrecision(fieldType);
                 fieldReader = (reader, pos) -> reader.readTimestampLtz(timestampLtzPrecision);
+                break;
+            case ARRAY:
+                fieldReader = (reader, pos) -> reader.readArray();
+                break;
+            case MAP:
+            case MULTISET:
+                fieldReader = (reader, pos) -> reader.readMap();
+                break;
+            case ROW:
+                DataType[] fieldTypes =
+                        ((RowType) fieldType).getChildren().toArray(new DataType[0]);
+                fieldReader = (reader, pos) -> reader.readRow(fieldTypes);
                 break;
             default:
                 throw new IllegalArgumentException("Unsupported type for IndexedRow: " + fieldType);

@@ -19,12 +19,22 @@ package com.alibaba.fluss.row.encode.paimon;
 
 import com.alibaba.fluss.memory.MemorySegment;
 import com.alibaba.fluss.record.ChangeType;
+import com.alibaba.fluss.row.BinaryArray;
+import com.alibaba.fluss.row.BinaryMap;
+import com.alibaba.fluss.row.BinaryRow;
 import com.alibaba.fluss.row.BinarySegmentUtils;
 import com.alibaba.fluss.row.BinaryString;
 import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.InternalArray;
+import com.alibaba.fluss.row.InternalMap;
 import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
+import com.alibaba.fluss.row.serializer.InternalArraySerializer;
+import com.alibaba.fluss.row.serializer.InternalMapSerializer;
+import com.alibaba.fluss.row.serializer.InternalRowSerializer;
+import com.alibaba.fluss.row.serializer.InternalSerializers;
+import com.alibaba.fluss.row.serializer.Serializer;
 import com.alibaba.fluss.types.DataType;
 
 import java.io.Serializable;
@@ -61,6 +71,14 @@ class PaimonBinaryRowWriter {
         setBuffer(new byte[fixedSize]);
     }
 
+    public MemorySegment getSegment() {
+        return segment;
+    }
+
+    public int getCursor() {
+        return cursor;
+    }
+
     public void reset() {
         this.cursor = fixedSize;
         for (int i = 0; i < nullBitsSizeInBytes; i += 8) {
@@ -83,27 +101,27 @@ class PaimonBinaryRowWriter {
         BinarySegmentUtils.bitSet(segment, 0, pos + HEADER_SIZE_IN_BITS);
     }
 
-    public void writeChangeType(ChangeType kind) {
-        // convert Fluss changeType to Paimon rowKind byte value
-        byte paimonRowKindByte;
-        switch (kind) {
+    public void writeChangeType(ChangeType changeType) {
+        // convert Fluss changeType to Paimon ChangeType byte value
+        byte paimonChangeTypeByte;
+        switch (changeType) {
             case APPEND_ONLY:
             case INSERT:
-                paimonRowKindByte = 0;
+                paimonChangeTypeByte = 0;
                 break;
             case UPDATE_BEFORE:
-                paimonRowKindByte = 1;
+                paimonChangeTypeByte = 1;
                 break;
             case UPDATE_AFTER:
-                paimonRowKindByte = 2;
+                paimonChangeTypeByte = 2;
                 break;
             case DELETE:
-                paimonRowKindByte = 3;
+                paimonChangeTypeByte = 3;
                 break;
             default:
-                throw new IllegalArgumentException("Unsupported change type: " + kind);
+                throw new IllegalArgumentException("Unsupported change type: " + changeType);
         }
-        segment.put(0, paimonRowKindByte);
+        segment.put(0, paimonChangeTypeByte);
     }
 
     public void writeBoolean(int pos, boolean value) {
@@ -230,6 +248,24 @@ class PaimonBinaryRowWriter {
         }
     }
 
+    public void writeArray(int pos, InternalArray input, InternalArraySerializer serializer) {
+        BinaryArray binary = serializer.toBinaryArray(input);
+        writeSegmentsToVarLenPart(
+                pos, binary.getSegments(), binary.getOffset(), binary.getSizeInBytes());
+    }
+
+    public void writeMap(int pos, InternalMap input, InternalMapSerializer serializer) {
+        BinaryMap binary = serializer.toBinaryMap(input);
+        writeSegmentsToVarLenPart(
+                pos, binary.getSegments(), binary.getOffset(), binary.getSizeInBytes());
+    }
+
+    public void writeRow(int pos, InternalRow input, InternalRowSerializer serializer) {
+        BinaryRow binary = serializer.toBinaryRow(input);
+        writeSegmentsToVarLenPart(
+                pos, binary.getSegments(), binary.getOffset(), binary.getSizeInBytes());
+    }
+
     protected void zeroOutPaddingBytes(int numBytes) {
         if ((numBytes & 0x07) > 0) {
             segment.putLong(cursor + ((numBytes >> 3) << 3), 0L);
@@ -243,8 +279,7 @@ class PaimonBinaryRowWriter {
         }
     }
 
-    private void writeSegmentsToVarLenPart(
-            int pos, MemorySegment[] segments, int offset, int size) {
+    public void writeSegmentsToVarLenPart(int pos, MemorySegment[] segments, int offset, int size) {
         final int roundedSize = roundNumberOfBytesToNearestWord(size);
 
         // grow the global buffer before writing data.
@@ -418,6 +453,35 @@ class PaimonBinaryRowWriter {
                         (writer, pos, value) ->
                                 writer.writeTimestampLtz(
                                         pos, (TimestampLtz) value, timestampLtzPrecision);
+                break;
+            case ARRAY:
+                final Serializer<InternalArray> arraySerializer =
+                        InternalSerializers.create(fieldType);
+                fieldWriter =
+                        (writer, pos, value) ->
+                                writer.writeArray(
+                                        pos,
+                                        (InternalArray) value,
+                                        (InternalArraySerializer) arraySerializer);
+                break;
+            case MULTISET:
+            case MAP:
+                Serializer<InternalMap> mapSerializer = InternalSerializers.create(fieldType);
+                fieldWriter =
+                        (writer, pos, value) ->
+                                writer.writeMap(
+                                        pos,
+                                        (InternalMap) value,
+                                        (InternalMapSerializer) mapSerializer);
+                break;
+            case ROW:
+                Serializer<InternalRow> rowSerializer = InternalSerializers.create(fieldType);
+                fieldWriter =
+                        (writer, pos, value) ->
+                                writer.writeRow(
+                                        pos,
+                                        (InternalRow) value,
+                                        (InternalRowSerializer) rowSerializer);
                 break;
             default:
                 throw new IllegalArgumentException(

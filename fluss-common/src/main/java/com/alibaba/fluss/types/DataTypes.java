@@ -128,6 +128,17 @@ public class DataTypes {
     }
 
     /**
+     * Data type of a variable-length character string {@code VARCHAR(n)} where {@code n} is the
+     * number of code points. {@code n} must have a value between 1 and {@link Integer#MAX_VALUE}
+     * (both inclusive).
+     *
+     * @see VarCharType
+     */
+    public static VarCharType VARCHAR(int length) {
+        return new VarCharType(length);
+    }
+
+    /**
      * Data type of a variable-length character string.
      *
      * @see StringType
@@ -299,6 +310,20 @@ public class DataTypes {
      */
     public static MapType MAP(DataType keyType, DataType valueType) {
         return new MapType(keyType, valueType);
+    }
+
+    /**
+     * Data type of a sequence of elements with same subtype.
+     *
+     * <p>Compared to the SQL standard, the maximum cardinality of an array cannot be specified but
+     * is fixed at {@link Integer#MAX_VALUE}. Also, any valid type is supported as a subtype.
+     *
+     * <p>Note: Fluss currently doesn't support defining nested array in columns.
+     *
+     * @see MultisetType
+     */
+    public static MultisetType MULTISET(DataType elementType) {
+        return new MultisetType(elementType);
     }
 
     /** Field definition with field name and data type. */

@@ -44,7 +44,7 @@ import static com.alibaba.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRES
 import static com.alibaba.fluss.record.TestData.DATA1_ROW_TYPE;
 import static com.alibaba.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static com.alibaba.fluss.record.TestData.DEFAULT_SCHEMA_ID;
-import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordsEqualsWithRowKind;
+import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordsEqualsWithChangeType;
 import static com.alibaba.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -93,7 +93,7 @@ class ArrowWalBuilderTest {
         assertThat(logRecords.batches().iterator().next().isValid()).isTrue();
         // allocate multiple pages
         assertThat(totalPages - memorySegmentPool.freePages()).isGreaterThan(1);
-        assertLogRecordsEqualsWithRowKind(DATA1_ROW_TYPE, logRecords, expectedResult);
+        assertLogRecordsEqualsWithChangeType(DATA1_ROW_TYPE, logRecords, expectedResult);
 
         // consume log records after walBuilder deallocate memory. Even the content in memory
         // segment pool is changed, the log records is still valid. Because the memory of logRecords
@@ -106,7 +106,7 @@ class ArrowWalBuilderTest {
             memorySegment.put(50, (byte) 4);
         }
         assertThat(logRecords.batches().iterator().next().isValid()).isTrue();
-        assertLogRecordsEqualsWithRowKind(DATA1_ROW_TYPE, logRecords, expectedResult);
+        assertLogRecordsEqualsWithChangeType(DATA1_ROW_TYPE, logRecords, expectedResult);
     }
 
     @Test
@@ -135,7 +135,7 @@ class ArrowWalBuilderTest {
         assertThat(logRecords.batches().iterator().next().isValid()).isTrue();
         // allocate one page
         assertThat(totalPages - memorySegmentPool.freePages()).isEqualTo(1);
-        assertLogRecordsEqualsWithRowKind(DATA1_ROW_TYPE, logRecords, expectedResult);
+        assertLogRecordsEqualsWithChangeType(DATA1_ROW_TYPE, logRecords, expectedResult);
 
         // consume log records after walBuilder deallocate memory. While the content in memory
         // segment pool is changed, the log records will be invalid. Because the memory of

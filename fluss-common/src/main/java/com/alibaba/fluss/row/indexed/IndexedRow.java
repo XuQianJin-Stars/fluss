@@ -24,6 +24,8 @@ import com.alibaba.fluss.row.BinaryRow;
 import com.alibaba.fluss.row.BinarySegmentUtils;
 import com.alibaba.fluss.row.BinaryString;
 import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.InternalArray;
+import com.alibaba.fluss.row.InternalMap;
 import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.NullAwareGetters;
 import com.alibaba.fluss.row.TimestampLtz;
@@ -31,9 +33,13 @@ import com.alibaba.fluss.row.TimestampNtz;
 import com.alibaba.fluss.types.BinaryType;
 import com.alibaba.fluss.types.CharType;
 import com.alibaba.fluss.types.DataType;
+import com.alibaba.fluss.types.DataTypeRoot;
 import com.alibaba.fluss.types.DecimalType;
 import com.alibaba.fluss.types.IntType;
+import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.types.StringType;
+import com.alibaba.fluss.types.VarBinaryType;
+import com.alibaba.fluss.types.VarCharType;
 import com.alibaba.fluss.utils.MurmurHashUtils;
 
 import java.util.Arrays;
@@ -78,10 +84,14 @@ public class IndexedRow implements BinaryRow, NullAwareGetters {
     private int sizeInBytes;
     private int[] columnLengths;
 
+    public IndexedRow(RowType rowType) {
+        this(rowType.getChildren().toArray(new DataType[0]));
+    }
+
     public IndexedRow(DataType[] fieldTypes) {
         this.fieldTypes = fieldTypes;
         this.arity = fieldTypes.length;
-        this.nullBitsSizeInBytes = calculateBitSetWidthInBytes(arity);
+        this.nullBitsSizeInBytes = BinaryRow.calculateBitSetWidthInBytes(arity);
         this.headerSizeInBytes =
                 nullBitsSizeInBytes + calculateVariableColumnLengthListSize(fieldTypes);
     }
@@ -109,6 +119,14 @@ public class IndexedRow implements BinaryRow, NullAwareGetters {
     public void pointTo(MemorySegment segment, int offset, int sizeInBytes) {
         this.segment = segment;
         this.segments = new MemorySegment[] {segment};
+        this.offset = offset;
+        this.sizeInBytes = sizeInBytes;
+        this.columnLengths = calculateColumnLengths();
+    }
+
+    public void pointTo(MemorySegment[] segments, int offset, int sizeInBytes) {
+        this.segment = segments[0];
+        this.segments = segments;
         this.offset = offset;
         this.sizeInBytes = sizeInBytes;
         this.columnLengths = calculateColumnLengths();
@@ -236,10 +254,6 @@ public class IndexedRow implements BinaryRow, NullAwareGetters {
         return projectRow;
     }
 
-    public static int calculateBitSetWidthInBytes(int arity) {
-        return (arity + 7) / 8;
-    }
-
     public static boolean isFixedLength(DataType dataType) {
         switch (dataType.getTypeRoot()) {
             case BOOLEAN:
@@ -252,12 +266,18 @@ public class IndexedRow implements BinaryRow, NullAwareGetters {
             case DATE:
             case TIME_WITHOUT_TIME_ZONE:
             case CHAR:
+            case VARCHAR:
             case BINARY:
+            case VARBINARY:
             case TIMESTAMP_WITHOUT_TIME_ZONE:
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
                 return true;
             case STRING:
             case BYTES:
+            case ARRAY:
+            case MAP:
+            case MULTISET:
+            case ROW:
                 return false;
             case DECIMAL:
                 return Decimal.isCompact(((DecimalType) dataType).getPrecision());
@@ -301,8 +321,12 @@ public class IndexedRow implements BinaryRow, NullAwareGetters {
                 }
             case CHAR:
                 return ((CharType) dataType).getLength();
+            case VARCHAR:
+                return ((VarCharType) dataType).getLength();
             case BINARY:
                 return ((BinaryType) dataType).getLength();
+            case VARBINARY:
+                return ((VarBinaryType) dataType).getLength();
             default:
                 throw new IllegalArgumentException(" Data type '%s' is not fixed length type!");
         }
@@ -433,6 +457,37 @@ public class IndexedRow implements BinaryRow, NullAwareGetters {
         byte[] bytes = new byte[length];
         segment.get(getFieldOffset(pos), bytes, 0, length);
         return bytes;
+    }
+
+    @Override
+    public InternalArray getArray(int pos) {
+        assertIndexIsValid(pos);
+        int index = getFieldOffset(pos);
+        int length = columnLengths[pos];
+        return BinarySegmentUtils.readArrayData(segments, index, length);
+    }
+
+    @Override
+    public InternalMap getMap(int pos) {
+        assertIndexIsValid(pos);
+        int index = getFieldOffset(pos);
+        int length = columnLengths[pos];
+        return BinarySegmentUtils.readMapData(segments, index, length);
+    }
+
+    @Override
+    public InternalRow getRow(int pos, int numFields) {
+        assertIndexIsValid(pos);
+        int index = getFieldOffset(pos);
+        int length = columnLengths[pos];
+        final DataType[] dataTypes = getDataTypes(pos);
+        return BinarySegmentUtils.readIndexedRowData(segments, numFields, index, length, dataTypes);
+    }
+
+    private DataType[] getDataTypes(int pos) {
+        return (fieldTypes[pos].getTypeRoot() == DataTypeRoot.ROW)
+                ? fieldTypes[pos].getChildren().toArray(new DataType[0])
+                : fieldTypes;
     }
 
     private void assertIndexIsValid(int index) {

@@ -21,6 +21,7 @@ import com.alibaba.fluss.row.BinaryString;
 import com.alibaba.fluss.row.Decimal;
 import com.alibaba.fluss.types.DataType;
 import com.alibaba.fluss.types.DecimalType;
+import com.alibaba.fluss.types.LocalZonedTimestampType;
 import com.alibaba.fluss.types.TimestampType;
 
 import java.math.BigDecimal;
@@ -62,6 +63,10 @@ public class TypeUtils {
             case TIMESTAMP_WITHOUT_TIME_ZONE:
                 TimestampType timestampType = (TimestampType) type;
                 return BinaryStringUtils.toTimestampNtz(str, timestampType.getPrecision());
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                LocalZonedTimestampType localZonedTimestampType = (LocalZonedTimestampType) type;
+                return BinaryStringUtils.toTimestampLtz(
+                        str, localZonedTimestampType.getPrecision());
             default:
                 throw new UnsupportedOperationException("Unsupported type " + type);
         }

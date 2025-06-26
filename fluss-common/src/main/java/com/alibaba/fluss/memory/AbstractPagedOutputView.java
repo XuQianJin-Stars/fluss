@@ -45,11 +45,17 @@ public abstract class AbstractPagedOutputView implements OutputView, MemorySegme
     /** The list of memory segments that have been fully written and are immutable now. */
     private List<MemorySegmentBytesView> finishedPages;
 
-    /** The current memory segment to write to. */
-    private MemorySegment currentSegment;
+    /** the current memory segment to write to. */
+    protected MemorySegment currentSegment;
 
     /** the offset in the current segment. */
-    private int positionInSegment;
+    protected int positionInSegment;
+
+    /** Flag indicating whether throw BufferExhaustedException or wait for available segment. */
+    protected boolean waitingSegment;
+
+    /** the reusable array for UTF encodings. */
+    protected byte[] utfBuffer;
 
     protected AbstractPagedOutputView(MemorySegment initialSegment, int pageSize) {
         if (initialSegment == null) {
@@ -300,6 +306,21 @@ public abstract class AbstractPagedOutputView implements OutputView, MemorySegme
             writeLong(Double.doubleToLongBits(v));
         }
     }
+
+    @Override
+    public void write(int b) throws IOException {}
+
+    @Override
+    public void writeChar(int v) throws IOException {}
+
+    @Override
+    public void writeBytes(String s) throws IOException {}
+
+    @Override
+    public void writeChars(String s) throws IOException {}
+
+    @Override
+    public void writeUTF(String s) throws IOException {}
 
     @Override
     public void write(MemorySegment segment, int off, int len) throws IOException {

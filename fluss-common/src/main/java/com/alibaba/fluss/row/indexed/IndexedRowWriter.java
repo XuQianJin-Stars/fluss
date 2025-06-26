@@ -21,11 +21,23 @@ import com.alibaba.fluss.annotation.Internal;
 import com.alibaba.fluss.memory.MemorySegment;
 import com.alibaba.fluss.memory.MemorySegmentWritable;
 import com.alibaba.fluss.memory.OutputView;
+import com.alibaba.fluss.row.BinaryArray;
+import com.alibaba.fluss.row.BinaryMap;
+import com.alibaba.fluss.row.BinaryRow;
 import com.alibaba.fluss.row.BinarySegmentUtils;
 import com.alibaba.fluss.row.BinaryString;
+import com.alibaba.fluss.row.BinaryWriter;
 import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.InternalArray;
+import com.alibaba.fluss.row.InternalMap;
+import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
+import com.alibaba.fluss.row.serializer.InternalArraySerializer;
+import com.alibaba.fluss.row.serializer.InternalMapSerializer;
+import com.alibaba.fluss.row.serializer.InternalRowSerializer;
+import com.alibaba.fluss.row.serializer.InternalSerializers;
+import com.alibaba.fluss.row.serializer.Serializer;
 import com.alibaba.fluss.types.DataType;
 import com.alibaba.fluss.types.RowType;
 import com.alibaba.fluss.utils.UnsafeUtils;
@@ -35,12 +47,13 @@ import java.io.OutputStream;
 import java.io.Serializable;
 import java.util.Arrays;
 
+import static com.alibaba.fluss.row.BinaryRow.calculateBitSetWidthInBytes;
 import static com.alibaba.fluss.types.DataTypeChecks.getLength;
 import static com.alibaba.fluss.types.DataTypeChecks.getPrecision;
 
 /** Writer for {@link IndexedRow}. */
 @Internal
-public class IndexedRowWriter extends OutputStream implements MemorySegmentWritable {
+public class IndexedRowWriter extends OutputStream implements BinaryWriter, MemorySegmentWritable {
 
     private final int nullBitsSizeInBytes;
     private final int variableColumnLengthListInBytes;
@@ -57,7 +70,7 @@ public class IndexedRowWriter extends OutputStream implements MemorySegmentWrita
     }
 
     public IndexedRowWriter(DataType[] types) {
-        this.nullBitsSizeInBytes = IndexedRow.calculateBitSetWidthInBytes(types.length);
+        this.nullBitsSizeInBytes = calculateBitSetWidthInBytes(types.length);
         this.variableColumnLengthListInBytes =
                 IndexedRow.calculateVariableColumnLengthListSize(types);
         this.headerSizeInBytes = nullBitsSizeInBytes + variableColumnLengthListInBytes;
@@ -190,6 +203,36 @@ public class IndexedRowWriter extends OutputStream implements MemorySegmentWrita
         }
     }
 
+    public void writeArray(InternalArray value, InternalArraySerializer serializer) {
+        BinaryArray binaryArray = serializer.toBinaryArray(value);
+        MemorySegment[] segments = binaryArray.getSegments();
+        int offset = binaryArray.getOffset();
+        int length = binaryArray.getSizeInBytes();
+
+        write(length, segments, offset);
+    }
+
+    public void writeMap(InternalMap value, InternalMapSerializer serializer) {
+        BinaryMap binaryMap = serializer.toBinaryMap(value);
+        MemorySegment[] segments = binaryMap.getSegments();
+        int offset = binaryMap.getOffset();
+        int length = binaryMap.getSizeInBytes();
+
+        write(length, segments, offset);
+    }
+
+    public void writeRow(InternalRow value, InternalRowSerializer serializer) {
+        BinaryRow binaryRow = serializer.toBinaryRow(value);
+        MemorySegment[] segments = binaryRow.getSegments();
+        int offset = binaryRow.getOffset();
+        int length = binaryRow.getSizeInBytes();
+
+        write(length, segments, offset);
+    }
+
+    @Override
+    public void complete() {}
+
     @Override
     public void write(int b) {
         writeByte((byte) b);
@@ -209,14 +252,36 @@ public class IndexedRowWriter extends OutputStream implements MemorySegmentWrita
         this.position += len;
     }
 
+    /**
+     * write bytes to buffer. Used for complex types such as: array, map, row.
+     *
+     * @param length in bytes.
+     * @param segments memory segments.
+     * @param offset offset in memory segment.
+     */
+    private void write(int length, MemorySegment[] segments, int offset) {
+        // write var length in variable column length list.
+        writeVarLengthToVarLengthList(length);
+
+        if (offset + length <= segments[0].size()) {
+            write(segments[0], offset, length);
+        } else {
+            byte[] bytes = BinarySegmentUtils.allocateReuseBytes(length);
+            BinarySegmentUtils.copyToBytes(segments, offset, bytes, 0, length);
+            write(bytes, 0, length);
+        }
+    }
+
     public byte[] buffer() {
         return buffer;
     }
 
+    @Override
     public MemorySegment segment() {
         return segment;
     }
 
+    @Override
     public int position() {
         return position;
     }
@@ -326,6 +391,30 @@ public class IndexedRowWriter extends OutputStream implements MemorySegmentWrita
                         (writer, pos, value) ->
                                 writer.writeTimestampLtz(
                                         (TimestampLtz) value, timestampLtzPrecision);
+                break;
+            case ARRAY:
+                final Serializer<InternalArray> arraySerializer =
+                        InternalSerializers.create(fieldType);
+                fieldWriter =
+                        (writer, pos, value) ->
+                                writer.writeArray(
+                                        (InternalArray) value,
+                                        (InternalArraySerializer) arraySerializer);
+                break;
+            case MULTISET:
+            case MAP:
+                Serializer<InternalMap> mapSerializer = InternalSerializers.create(fieldType);
+                fieldWriter =
+                        (writer, pos, value) ->
+                                writer.writeMap(
+                                        (InternalMap) value, (InternalMapSerializer) mapSerializer);
+                break;
+            case ROW:
+                Serializer<InternalRow> rowSerializer = IndexedRowSerializer.create(fieldType);
+                fieldWriter =
+                        (writer, pos, value) ->
+                                writer.writeRow(
+                                        (InternalRow) value, (InternalRowSerializer) rowSerializer);
                 break;
             default:
                 throw new IllegalArgumentException("Unsupported type for IndexedRow: " + fieldType);

@@ -20,6 +20,8 @@ package com.alibaba.fluss.row.columnar;
 import com.alibaba.fluss.annotation.PublicEvolving;
 import com.alibaba.fluss.row.BinaryString;
 import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.InternalArray;
+import com.alibaba.fluss.row.InternalMap;
 import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
@@ -129,6 +131,21 @@ public class ColumnarRow implements InternalRow {
     @Override
     public byte[] getBytes(int pos) {
         return vectorizedColumnBatch.getBytes(rowId, pos);
+    }
+
+    @Override
+    public InternalArray getArray(int pos) {
+        return vectorizedColumnBatch.getArray(rowId, pos);
+    }
+
+    @Override
+    public InternalMap getMap(int pos) {
+        return vectorizedColumnBatch.getMap(rowId, pos);
+    }
+
+    @Override
+    public InternalRow getRow(int pos, int numFields) {
+        return vectorizedColumnBatch.getRow(rowId, pos, numFields);
     }
 
     @Override

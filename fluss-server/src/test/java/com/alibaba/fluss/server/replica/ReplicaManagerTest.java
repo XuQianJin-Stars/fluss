@@ -113,11 +113,11 @@ import static com.alibaba.fluss.server.testutils.PartitionMetadataAssert.assertP
 import static com.alibaba.fluss.server.testutils.TableMetadataAssert.assertTableMetadata;
 import static com.alibaba.fluss.server.zk.data.LeaderAndIsr.INITIAL_BUCKET_EPOCH;
 import static com.alibaba.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
-import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordBatchEqualsWithRowKind;
+import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordBatchEqualsWithChangeType;
 import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordsEquals;
-import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordsEqualsWithRowKind;
+import static com.alibaba.fluss.testutils.DataTestUtils.assertLogRecordsEqualsWithChangeType;
 import static com.alibaba.fluss.testutils.DataTestUtils.assertMemoryRecordsEquals;
-import static com.alibaba.fluss.testutils.DataTestUtils.assertMemoryRecordsEqualsWithRowKind;
+import static com.alibaba.fluss.testutils.DataTestUtils.assertMemoryRecordsEqualsWithChangeType;
 import static com.alibaba.fluss.testutils.DataTestUtils.compactedRow;
 import static com.alibaba.fluss.testutils.DataTestUtils.genKvRecordBatch;
 import static com.alibaba.fluss.testutils.DataTestUtils.genKvRecordBatchWithWriterId;
@@ -518,7 +518,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
         FetchLogResultForBucket resultForBucket = future1.get().get(tb);
         assertThat(resultForBucket.getHighWatermark()).isEqualTo(5L);
         LogRecords records = resultForBucket.records();
-        assertMemoryRecordsEqualsWithRowKind(
+        assertMemoryRecordsEqualsWithChangeType(
                 DATA1_ROW_TYPE, records, Collections.singletonList(expectedLogForData1));
 
         // 3. append one batch with wrong batchSequence, which will throw
@@ -556,7 +556,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
         resultForBucket = future1.get().get(tb);
         assertThat(resultForBucket.getHighWatermark()).isEqualTo(5L);
         records = resultForBucket.records();
-        assertMemoryRecordsEqualsWithRowKind(
+        assertMemoryRecordsEqualsWithChangeType(
                 DATA1_ROW_TYPE, records, Collections.singletonList(expectedLogForData1));
 
         // 5. append one new batch with correct batchSequence, the cdc-log will not influence by the
@@ -591,7 +591,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
         resultForBucket = future1.get().get(tb);
         assertThat(resultForBucket.getHighWatermark()).isEqualTo(8L);
         records = resultForBucket.records();
-        assertMemoryRecordsEqualsWithRowKind(
+        assertMemoryRecordsEqualsWithChangeType(
                 DATA1_ROW_TYPE, records, Arrays.asList(expectedLogForData1, expectedLogForData2));
     }
 
@@ -659,7 +659,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
         assertThat(iterator.hasNext()).isTrue();
         LogRecordBatch logRecordBatch = iterator.next();
         assertThat(iterator.hasNext()).isFalse();
-        assertLogRecordBatchEqualsWithRowKind(
+        assertLogRecordBatchEqualsWithChangeType(
                 DATA1_ROW_TYPE, logRecordBatch, EXPECTED_LOG_RESULTS_FOR_DATA_1_WITH_PK);
     }
 
@@ -1424,7 +1424,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
                             Tuple2.of(ChangeType.UPDATE_BEFORE, new Object[] {2, "b" + bucketId}),
                             Tuple2.of(ChangeType.UPDATE_AFTER, new Object[] {2, "bb" + bucketId}));
             FetchLogResultForBucket r = r1.getValue();
-            assertLogRecordsEqualsWithRowKind(DATA1_ROW_TYPE, r.records(), expectedLogResults);
+            assertLogRecordsEqualsWithChangeType(DATA1_ROW_TYPE, r.records(), expectedLogResults);
         }
     }
 

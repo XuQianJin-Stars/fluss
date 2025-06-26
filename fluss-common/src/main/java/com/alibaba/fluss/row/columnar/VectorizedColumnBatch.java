@@ -19,6 +19,9 @@ package com.alibaba.fluss.row.columnar;
 
 import com.alibaba.fluss.annotation.Internal;
 import com.alibaba.fluss.row.Decimal;
+import com.alibaba.fluss.row.InternalArray;
+import com.alibaba.fluss.row.InternalMap;
+import com.alibaba.fluss.row.InternalRow;
 import com.alibaba.fluss.row.TimestampLtz;
 import com.alibaba.fluss.row.TimestampNtz;
 
@@ -101,5 +104,17 @@ public class VectorizedColumnBatch {
 
     public TimestampLtz getTimestampLtz(int rowId, int colId, int precision) {
         return ((TimestampLtzColumnVector) (columns[colId])).getTimestampLtz(rowId, precision);
+    }
+
+    public InternalArray getArray(int rowId, int colId) {
+        return ((ArrayColumnVector) columns[colId]).getArray(rowId);
+    }
+
+    public InternalMap getMap(int rowId, int colId) {
+        return ((MapColumnVector) columns[colId]).getMap(rowId);
+    }
+
+    public InternalRow getRow(int rowId, int colId, int numFields) {
+        return ((RowColumnVector) columns[colId]).getRow(rowId);
     }
 }

@@ -58,6 +58,16 @@ class RocksDBMetadataKvStoreITCase {
             List<byte[]> prefixA = store.scanPrefix(bytes("a/"));
             assertThat(prefixA).containsExactly(valA, valB);
 
+            List<byte[][]> prefixAEntries = store.scanPrefixEntries(bytes("a/"));
+            assertThat(prefixAEntries).hasSize(2);
+            assertThat(prefixAEntries.get(0)[0]).isEqualTo(keyA);
+            assertThat(prefixAEntries.get(0)[1]).isEqualTo(valA);
+            assertThat(prefixAEntries.get(1)[0]).isEqualTo(keyB);
+            assertThat(prefixAEntries.get(1)[1]).isEqualTo(valB);
+            assertThat(store.scanPrefixEntries(bytes("b/"))).hasSize(1);
+            assertThat(store.scanPrefixEntries(bytes("c/"))).isEmpty();
+            assertThat(store.scanPrefixEntries(bytes("a/z"))).isEmpty();
+
             assertThat(store.entries()).hasSize(3);
 
             store.delete(keyB);
@@ -72,6 +82,32 @@ class RocksDBMetadataKvStoreITCase {
             assertThat(reopened.get(keyC)).isEqualTo(valC);
             assertThat(reopened.scanPrefix(bytes("a/"))).containsExactly(valA);
             assertThat(reopened.entries()).hasSize(2);
+        }
+    }
+
+    @Test
+    void testScanPrefixEntriesExcludesNonMatchingKeys() throws Exception {
+        Path raftDir = tempDir.resolve("raft-prefix-entries");
+        try (RocksDBMetadataKvStore store = RocksDBMetadataKvStore.open(raftDir.toFile())) {
+            store.put(bytes("db/alpha"), bytes("1"));
+            store.put(bytes("db/beta"), bytes("2"));
+            store.put(bytes("tbl/alpha"), bytes("3"));
+            store.put(bytes("dc/other"), bytes("4"));
+
+            List<byte[][]> dbEntries = store.scanPrefixEntries(bytes("db/"));
+            assertThat(dbEntries).hasSize(2);
+            assertThat(dbEntries.get(0)[0]).isEqualTo(bytes("db/alpha"));
+            assertThat(dbEntries.get(0)[1]).isEqualTo(bytes("1"));
+            assertThat(dbEntries.get(1)[0]).isEqualTo(bytes("db/beta"));
+            assertThat(dbEntries.get(1)[1]).isEqualTo(bytes("2"));
+
+            List<byte[][]> tblEntries = store.scanPrefixEntries(bytes("tbl/"));
+            assertThat(tblEntries).hasSize(1);
+            assertThat(tblEntries.get(0)[0]).isEqualTo(bytes("tbl/alpha"));
+            assertThat(tblEntries.get(0)[1]).isEqualTo(bytes("3"));
+
+            assertThat(store.scanPrefixEntries(bytes("missing/"))).isEmpty();
+            assertThat(store.scanPrefix(bytes("db/"))).containsExactly(bytes("1"), bytes("2"));
         }
     }
 

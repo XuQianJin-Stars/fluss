@@ -56,12 +56,22 @@ public class InMemoryMetadataKvStore implements MetadataKvStore {
 
     @Override
     public List<byte[]> scanPrefix(byte[] prefix) {
-        List<byte[]> result = new ArrayList<>();
+        List<byte[][]> entries = scanPrefixEntries(prefix);
+        List<byte[]> result = new ArrayList<>(entries.size());
+        for (byte[][] entry : entries) {
+            result.add(entry[1]);
+        }
+        return result;
+    }
+
+    @Override
+    public List<byte[][]> scanPrefixEntries(byte[] prefix) {
+        List<byte[][]> result = new ArrayList<>();
         byte[] end = prefixUpperBound(prefix);
         Map<byte[], byte[]> sub =
                 end == null ? map.tailMap(prefix, true) : map.subMap(prefix, true, end, false);
-        for (byte[] v : sub.values()) {
-            result.add(v.clone());
+        for (Map.Entry<byte[], byte[]> e : sub.entrySet()) {
+            result.add(new byte[][] {e.getKey().clone(), e.getValue().clone()});
         }
         return result;
     }

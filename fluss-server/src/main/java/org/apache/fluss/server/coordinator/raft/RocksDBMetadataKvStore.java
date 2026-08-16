@@ -169,8 +169,18 @@ public class RocksDBMetadataKvStore implements MetadataKvStore {
 
     @Override
     public List<byte[]> scanPrefix(byte[] prefix) {
+        List<byte[][]> entries = scanPrefixEntries(prefix);
+        List<byte[]> result = new ArrayList<>(entries.size());
+        for (byte[][] entry : entries) {
+            result.add(entry[1]);
+        }
+        return result;
+    }
+
+    @Override
+    public List<byte[][]> scanPrefixEntries(byte[] prefix) {
         ensureOpen();
-        List<byte[]> result = new ArrayList<>();
+        List<byte[][]> result = new ArrayList<>();
         try (RocksIterator it = db.newIterator(defaultColumnFamilyHandle)) {
             it.seek(prefix);
             while (it.isValid()) {
@@ -178,7 +188,7 @@ public class RocksDBMetadataKvStore implements MetadataKvStore {
                 if (!startsWith(key, prefix)) {
                     break;
                 }
-                result.add(it.value());
+                result.add(new byte[][] {key, it.value()});
                 it.next();
             }
         }

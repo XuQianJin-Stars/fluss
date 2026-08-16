@@ -6,7 +6,7 @@
 
 | Field | Information |
 |-------|-------------|
-| **Document Status** | Draft (v3.12 — §8.4 full metadata-operation JMH catalog) |
+| **Document Status** | Draft (v3.14 — §8.4 JMH catalog, post-prefix-iterator numbers) |
 | **Authors** | Fluss Development Team |
 | **Created Date** | 2026-06-29 |
 | **Last Updated** | 2026-08-16 |
@@ -35,7 +35,7 @@
 | Leftover | Status | Notes |
 |----------|--------|-------|
 | Every HA IT dual-backend | **Done** | `DualBackendFlussClusters` + `@EnumSource(MetadataBackend)`; `CoordinatorHighAvailabilityITCase` dual-runs (ZK session-kill vs Raft 3-voter close+restart). Raft KV capacity stays `-1` until `RegisterTabletServer` carries advertised memory |
-| §8.4 complete JMH baseline | **Done** | Full `MetadataStoreClient` + Admin DDL catalog in §8.4 (2026-08-16, 1-node loopback); skipped rows listed with reason |
+| §8.4 complete JMH baseline | **Done** | Full `MetadataStoreClient` + Admin DDL catalog in §8.4 (2026-08-16, 1-node loopback, **post prefix-iterator**); skipped rows listed with reason |
 | corrupt-snapshot / disk-full IT | Optional, not done | §8.3 marked open |
 | Gossip service discovery | **Done** | Optional §1.2 / §5.4.4 SWIM-style TCP gossip (`coordinator.gossip.*`). Coordinators exchange RPC membership; TabletServers expand a partial `coordinator.seed.nodes` list. Static seeds remain the bootstrap contact. |
 | liveMigration online convergence | **Done** | `LiveMigrator` re-scan `{path,mzxid}` diffs (no ZK watches) until quiet, then write-fence + one final scan. CLI `fluss zk-to-raft-live-migrate`. Stop-the-world export/import remains the safe fallback. |
@@ -2867,7 +2867,7 @@ export JAVA_HOME=/path/to/jdk-11
 
 #### JMH comparison (same machine, same flags)
 
-Score is JMH AverageTime (3 measurement iterations); ± is JMH 99.9% CI (wide with n=3 — treat as a point estimate). `@Fork(0)` reuses one store backend and one Admin cluster per backend for the JVM (avoids Ratis port leaks). Delete-style store rows include a preceding unique-key create unless noted. Raft point-reads of a single key are typically ~1 µs (in-process KvStore); Raft **prefix scans** (`list*`, `getPartitions`, `getCurrentSchemaId`, …) sit around **330 µs** on this box.
+Score is JMH AverageTime (3 measurement iterations); ± is JMH 99.9% CI (wide with n=3 — treat as a point estimate). `@Fork(0)` reuses one store backend and one Admin cluster per backend for the JVM (avoids Ratis port leaks). Delete-style store rows include a preceding unique-key create unless noted. Raft point-reads of a single key are typically ~1 µs (in-process KvStore). Raft **prefix scans** (`list*`, `getPartitions`, `getCurrentSchemaId`, …) are **~1–3 µs** after the 2026-08-16 `scanPrefixEntries` prefix iterator (RocksDB seek+stop / in-memory `subMap`). Snapshot-list rows that were not in that re-run use the same iterator and are shown in that class. See `raft-vs-zk-metadata-perf-analysis.md` §8.6.
 
 ##### Admin / RPC path (`MetadataPathBenchmark`, 1 coordinator + 1 tablet server)
 
@@ -2880,13 +2880,13 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `dropDatabase` | 11382 | 16338 | create+drop empty db |
 | `getDatabaseInfo` | 174 | 68 | |
 | `databaseExists` | 166 | 62 | |
-| `listDatabases` | 245 | 133 | |
-| `createTable` | 46581 | 24713 | previous row kept; full DDL |
+| `listDatabases` | 245 | 70 | Admin list |
+| `createTable` | 46581 | 24713 | full DDL (assignment + ISR + tablet RPC) |
 | `alterTable` | 351 | 81 | set `client.connect-timeout` (idempotent after first) |
 | `dropTable` | 89312 | 43684 | create+drop |
-| `getTableInfo` | 356 | 842 | previous row kept; warm cluster (cold IT cluster can add `metadata.stream.max-wait=100ms`) |
+| `getTableInfo` | 356 | 89 | Warm cluster (`createTable` first). Isolated first Admin read can still add `metadata.stream.max-wait=100ms` |
 | `tableExists` | 160 | 63 | |
-| `listTables` | 283 | 113 | |
+| `listTables` | 283 | 70 | Admin list |
 | `createPartition` | 28827 | 16999 | 1-bucket partitioned log table |
 | `dropPartition` | 57902 | 26147 | create+drop |
 | `listPartitionInfos` | 18535 | 500 | |
@@ -2900,34 +2900,34 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `deleteDatabase` | 9827 | 17731 | create+delete |
 | `getDatabase` | 101 | 1.0 | |
 | `databaseExists` | 98 | 0.37 | |
-| `listDatabases` | 101 | 328 | Raft prefix scan |
-| `listDatabaseSummaries` | 131 | 330 | |
+| `listDatabases` | 101 | 0.89 | |
+| `listDatabaseSummaries` | 131 | 2.28 | |
 | `registerFirstSchema` | 20393 | 8784 | unique table path (ZK parent creates) |
 | `registerSchema` | 4741 | 9335 | subsequent schema id |
 | `getSchemaById` | 103 | 2.1 | |
-| `getCurrentSchemaId` | 98 | 325 | Raft prefix scan |
-| `getLatestSchemas` | 199 | 331 | |
+| `getCurrentSchemaId` | 98 | 1.17 | |
+| `getLatestSchemas` | 199 | 3.24 | |
 
 ##### Store-level — table / partition
 
 | Operation | ZK µs | Raft µs | Notes |
 |-----------|------:|--------:|-------|
-| `registerTable` (`metadataWrite`) | 4815 | 8582 | **previous row kept** |
+| `registerTable` (`metadataWrite`) | 4815 | 8582 | 1-voter local fsync; write path unchanged by prefix iterator |
 | `updateTable` | 4669 | 8379 | |
 | `deleteTable` | 9373 | 16268 | create+delete |
-| `getTable` (`metadataRead`) | 102 | 1.6 | **previous row kept** |
+| `getTable` (`metadataRead`) | 102 | 1.6 | in-process KvStore get |
 | `getTables` | 107 | 1.6 | batch of 1 |
 | `tableExist` | 102 | 0.85 | |
-| `listTables` | 101 | 329 | Raft prefix scan |
+| `listTables` | 101 | 1.39 | |
 | `registerPartition` | 13973 | 16993 | assignment + metadata txn (2 keys) |
 | `deletePartition` | 19131 | 24953 | create+delete metadata |
 | `getPartition` | 101 | 1.1 | |
-| `getPartitions` | 99 | 331 | Raft prefix scan |
-| `getPartitionNumber` | 99 | 331 | |
-| `getPartitionRegistrations` | 198 | 327 | |
-| `getPartitionIdAndPaths` | 204 | 331 | |
+| `getPartitions` | 99 | 1.57 | |
+| `getPartitionNumber` | 99 | 1.23 | |
+| `getPartitionRegistrations` | 198 | 1.59 | |
+| `getPartitionIdAndPaths` | 204 | 1.59 | |
 | `getPartitionIds` | 101 | 1.2 | |
-| `getPartitionNameAndIdsForTables` | 199 | 327 | |
+| `getPartitionNameAndIdsForTables` | 199 | 1.54 | |
 
 ##### Store-level — ISR / assignment
 
@@ -2938,12 +2938,12 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `deleteTableAssignment` | 9626 | 25441 | create+delete |
 | `getTableAssignment` | 100 | 0.87 | |
 | `getTablesAssignments` | 99 | 0.89 | batch of 1 |
-| `listAssignedTableIds` | 98 | 328 | |
+| `listAssignedTableIds` | 98 | 1.13 | |
 | `updatePartitionAssignment` | 4903 | 8253 | |
 | `deletePartitionAssignment` | 19557 | 32866 | create assignment+metadata, then delete assignment |
 | `getPartitionAssignment` | 101 | 0.90 | |
 | `getPartitionsAssignments` | 102 | 0.94 | |
-| `listAssignedPartitionIds` | 118 | 328 | |
+| `listAssignedPartitionIds` | 118 | 1.18 | |
 | `registerLeaderAndIsr` | 15571 | 8518 | unique bucket; ZK epoch-wrapped create |
 | `updateLeaderAndIsr` | 5009 | 8528 | |
 | `getLeaderAndIsr` | 101 | 1.1 | |
@@ -2963,7 +2963,7 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `registerTabletServer` | 4768 | 8675 | unique id |
 | `getTabletServer` | 108 | 1.7 | |
 | `getTabletServers` | 100 | 1.7 | |
-| `getSortedTabletServerList` | 98 | 326 | |
+| `getSortedTabletServerList` | 98 | 1.18 | |
 
 ##### Store-level — ACL / config / tags / rebalance
 
@@ -2973,7 +2973,7 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `updateResourceAcl` | 4695 | 8649 | `MATCH_ANY` version |
 | `conditionalDeleteResourceAcl` | 9733 | 16653 | create+delete |
 | `getResourceAclWithVersion` | 102 | 1.3 | |
-| `listResourcesByType` | 139 | 335 | |
+| `listResourcesByType` | 139 | 0.91 | |
 | `insertAclChangeNotification` | 4998 | 0.002 | Raft **no-op** (stream is the notification) |
 | `upsertServerEntityConfig` | 9846 | 8311 | ZK create-or-setData |
 | `fetchEntityConfig` | 108 | 0.91 | |
@@ -2989,7 +2989,7 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 
 | Operation | ZK µs | Raft µs | Notes |
 |-----------|------:|--------:|-------|
-| `getTableIdAndIncrement` (`allocateId`) | 5037 | 8.5 | **previous row kept**; Raft block=1000 |
+| `getTableIdAndIncrement` (`allocateId`) | 5037 | 8.5 | Raft block=1000 |
 | `getPartitionIdAndIncrement` | 5266 | 8.6 | same block allocator |
 | `getWriterIdAndIncrement` | 5038 | 8.3 | same block allocator |
 
@@ -3001,16 +3001,16 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `updateKvSnapshotLeaseMetadata` | 4739 | 8461 | |
 | `deleteKvSnapshotLease` | 9264 | 16222 | create+delete |
 | `getKvSnapshotLeaseMetadata` | 101 | 1.3 | |
-| `getKvSnapshotLeasesList` | 98 | 328 | |
+| `getKvSnapshotLeasesList` | 98 | ~1 | same prefix iterator as list*; not in §8.6 re-run |
 | `tryRegisterProducerOffsets` | 4831 | 8557 | |
 | `deleteProducerOffsets` | 9403 | 16886 | create+delete |
 | `deleteProducerSnapshotIfVersion` | 9431 | 16597 | create+CAS delete |
 | `getProducerOffsets` | 100 | 0.84 | |
 | `getProducerOffsetsWithVersion` | 100 | 0.82 | |
-| `listProducerIds` | 97 | 328 | |
+| `listProducerIds` | 97 | ~1 | same prefix iterator as list*; not in §8.6 re-run |
 | `upsertRemoteLogManifestHandle` | 5312 | 8380 | |
 | `getRemoteLogManifestHandle` | 101 | 1.2 | |
-| `listRemoteLogManifestHandles` | 200 | 329 | |
+| `listRemoteLogManifestHandles` | 200 | ~1 | same prefix iterator as list*; not in §8.6 re-run |
 | `upsertLakeTable` | 4811 | 8373 | empty metadata list |
 | `getLakeTable` | 100 | 0.82 | |
 | `getLakeTableSnapshot` | 102 | 0.37 | absent table id (empty optional; reconstructing a real lake file is N/A) |
@@ -3018,11 +3018,11 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `registerTableBucketSnapshot` | 5002 | 8544 | |
 | `deleteTableBucketSnapshot` | 9355 | 16535 | create+delete |
 | `getTableBucketSnapshot` | 105 | 0.88 | |
-| `getTableBucketLatestSnapshot` | 196 | 328 | |
-| `getTableBucketAllSnapshotAndIds` | 199 | 327 | |
-| `listBucketSnapshotIds` | 103 | 328 | |
-| `getTableLatestBucketSnapshot` | 402 | 328 | |
-| `getPartitionLatestBucketSnapshot` | 199 | 332 | |
+| `getTableBucketLatestSnapshot` | 196 | ~1 | same prefix iterator as list*; not in §8.6 re-run |
+| `getTableBucketAllSnapshotAndIds` | 199 | ~1 | same prefix iterator as list*; not in §8.6 re-run |
+| `listBucketSnapshotIds` | 103 | ~1 | same prefix iterator as list*; not in §8.6 re-run |
+| `getTableLatestBucketSnapshot` | 402 | ~1 | same prefix iterator as list*; not in §8.6 re-run |
+| `getPartitionLatestBucketSnapshot` | 199 | ~1 | same prefix iterator as list*; not in §8.6 re-run |
 
 ##### Sequence-id block allocation (`SequenceIdAllocationBenchmark`)
 
@@ -3433,6 +3433,8 @@ A: Not in v1. Only the leader serves authoritative reads/writes (5.7); non-leade
 | 2026-08-16 | 3.10 | **Gossip, liveMigration, `raft status --watch`.** Optional §5.4.4 SWIM-style TCP gossip (`coordinator.gossip.*`) expands a partial seed list. `LiveMigrator` implements §6.3 online re-scan converge (no ZK watches) + fence + final scan; CLI `zk-to-raft-live-migrate`. `fluss raft status --watch [--interval ms]` (default 2s). |
 | 2026-08-16 | 3.11 | **§8.4 JMH baseline.** `fluss-jmh` compares ZooKeeper vs 1-voter Raft on create-table, store register/get, allocate-id, sequence-id block size, and coordinator startup. Measured numbers + environment/JMH flags written into §8.4; leftover “complete JMH baseline” closed. |
 | 2026-08-16 | 3.12 | **§8.4 full operation catalog.** JMH now covers every `MetadataStoreClient` write/read that can run without a tablet cluster, plus Admin create/drop/alter/list/get database/table/partition. Skipped ISR-churn / lake-file / authorizer RPCs listed with reason. Previous store `registerTable`/`getTable`/`allocateId` rows kept. |
+| 2026-08-16 | 3.13 | **Prefix-iterator first cut.** `MetadataKvStore.scanPrefixEntries` seek+stop (RocksDB + in-memory); `RaftMetadataStore` no longer full-`entries()` filters. Re-ran list*/`getTableInfo` JMH: Raft store prefix ~330 µs → ~1 µs; warm Admin `getTableInfo` 842 → 89 µs. ZK rows unchanged. Details in `raft-vs-zk-metadata-perf-analysis.md` §8.6. |
+| 2026-08-16 | 3.14 | **§8.4 catalog = post-prefix-iterator numbers only.** Canonical JMH tables no longer present pre-patch Raft prefix ~330 µs or Admin `getTableInfo` 842 µs as current. Snapshot-list rows not in the evening re-run share `scanPrefixEntries` with list* (~1 µs class). 3.13 remains the patch history. |
 
 ---
 

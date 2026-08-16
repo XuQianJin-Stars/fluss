@@ -21,7 +21,6 @@ import org.apache.fluss.annotation.Internal;
 
 import javax.annotation.Nullable;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -95,28 +94,11 @@ public class RaftMetadataStore {
      * Returns every {@code [key, value]} pair whose key starts with {@code prefix}. Unlike {@link
      * #scanPrefix} (values only) this also exposes the keys, so callers can recover the logical key
      * body encoded after the {@link MetadataKeys} header — e.g. enumerating registered
-     * tablet-server ids for {@code getSortedTabletServerList} (§5.5.3).
+     * tablet-server ids for {@code getSortedTabletServerList} (§5.5.3). Delegates to the KvStore
+     * prefix iterator (seek + stop); does not scan the full store.
      */
     public List<byte[][]> scanPrefixEntries(byte[] prefix) {
-        List<byte[][]> out = new ArrayList<>();
-        for (byte[][] entry : kvStore.entries()) {
-            if (startsWith(entry[0], prefix)) {
-                out.add(entry);
-            }
-        }
-        return out;
-    }
-
-    private static boolean startsWith(byte[] key, byte[] prefix) {
-        if (key.length < prefix.length) {
-            return false;
-        }
-        for (int i = 0; i < prefix.length; i++) {
-            if (key[i] != prefix[i]) {
-                return false;
-            }
-        }
-        return true;
+        return kvStore.scanPrefixEntries(prefix);
     }
 
     // ---- snapshot support (§5.2.5) ----

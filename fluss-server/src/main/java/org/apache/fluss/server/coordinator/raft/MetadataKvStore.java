@@ -58,6 +58,13 @@ public interface MetadataKvStore extends AutoCloseable {
     List<byte[]> scanPrefix(byte[] prefix);
 
     /**
+     * Returns every {@code [key, value]} pair whose key starts with {@code prefix}, in ascending
+     * key order. Implementations must seek to {@code prefix} and stop at the first non-matching key
+     * — they must not scan the whole store and filter.
+     */
+    List<byte[][]> scanPrefixEntries(byte[] prefix);
+
+    /**
      * Returns every entry as a {@code [key, value]} pair, in ascending key order. Used to serialize
      * the full store into a Raft snapshot (§5.2.5).
      */

@@ -118,6 +118,50 @@ class RaftMetadataStoreTest {
     }
 
     @Test
+    void testScanPrefixEntriesDoesNotReturnOtherTypes() {
+        InMemoryMetadataKvStore kv = new InMemoryMetadataKvStore();
+        RaftMetadataStore store = new RaftMetadataStore(kv, new MetadataWatchService());
+        store.apply(new MetadataRecord(MetadataRecord.Type.REGISTER_TABLE, utf8("a"), utf8("ta")));
+        store.apply(new MetadataRecord(MetadataRecord.Type.REGISTER_TABLE, utf8("b"), utf8("tb")));
+        store.apply(
+                new MetadataRecord(MetadataRecord.Type.REGISTER_DATABASE, utf8("a"), utf8("da")));
+        store.apply(
+                new MetadataRecord(
+                        MetadataRecord.Type.REGISTER_TABLET_SERVER, utf8("1"), utf8("ts")));
+
+        byte[] tablePrefix = MetadataKeys.prefixOf(MetadataRecord.Type.REGISTER_TABLE);
+        List<byte[][]> tableEntries = store.scanPrefixEntries(tablePrefix);
+        assertThat(tableEntries).hasSize(2);
+        for (byte[][] entry : tableEntries) {
+            assertThat(startsWith(entry[0], tablePrefix)).isTrue();
+        }
+        assertThat(tableEntries).anySatisfy(e -> assertThat(e[1]).containsExactly(utf8("ta")));
+        assertThat(tableEntries).anySatisfy(e -> assertThat(e[1]).containsExactly(utf8("tb")));
+
+        byte[] dbPrefix = MetadataKeys.prefixOf(MetadataRecord.Type.REGISTER_DATABASE);
+        List<byte[][]> dbEntries = kv.scanPrefixEntries(dbPrefix);
+        assertThat(dbEntries).hasSize(1);
+        assertThat(startsWith(dbEntries.get(0)[0], dbPrefix)).isTrue();
+        assertThat(dbEntries.get(0)[1]).containsExactly(utf8("da"));
+
+        byte[] missing = MetadataKeys.prefixOf(MetadataRecord.Type.REGISTER_PARTITION);
+        assertThat(store.scanPrefixEntries(missing)).isEmpty();
+        assertThat(kv.scanPrefixEntries(missing)).isEmpty();
+    }
+
+    private static boolean startsWith(byte[] key, byte[] prefix) {
+        if (key.length < prefix.length) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++) {
+            if (key[i] != prefix[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Test
     void testDistinctTypesDoNotCollideOnSameLogicalKey() {
         RaftMetadataStore store =
                 new RaftMetadataStore(new InMemoryMetadataKvStore(), new MetadataWatchService());

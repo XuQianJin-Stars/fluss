@@ -18,17 +18,35 @@
 package org.apache.fluss.server.coordinator.raft;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.proto.RaftProtos.LogEntryProto;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.fluss.utils.ExecutorUtils;
+import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
+
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /**
  * Leader-side service that streams committed metadata records to subscribers (TabletServers,
@@ -42,29 +60,40 @@ import java.util.function.Supplier;
  * leader-failover-safe. No in-memory delta buffer is kept.
  *
  * <p>{@link #onApplied(long)} is a pure wakeup signal (fired from the apply loop via {@code
- * MetadataWatchService}); it never carries record content. Long-poll waiters parked at the high
- * watermark are woken to re-read the freshly-appended tail from the log.
+ * MetadataWatchService}); it never carries record content and must not scan the log or complete RPC
+ * futures on the apply thread (§5.6). Long-poll waiters parked at the high watermark are handed off
+ * to the metadata-stream pool, which re-reads the freshly-appended tail from the log.
  *
  * <p>Records too old to be in the log (compacted into a snapshot) are reported via {@link
  * FetchResult#snapshotRequired()} so the subscriber bootstraps from a snapshot (§5.2.5) and then
  * resumes streaming at {@code snapshotOffset + 1}.
  *
- * <p>Thread-safe. Runs on the metadata-stream pool (§5.6); read-only w.r.t. the log.
+ * <p>Thread-safe. Fetch RPC handlers return a {@link CompletableFuture} immediately; caught-up
+ * long-polls are parked with a scheduled timeout on the metadata-stream pool (§5.6), not on Netty
+ * workers. Read-only w.r.t. the log.
  *
  * <p>See {@code zookeeper-removal-design.md} §5.8.
  */
 @Internal
-public class MetadataStreamService implements MetadataStreamGateway {
+public class MetadataStreamService implements MetadataStreamGateway, AutoCloseable {
 
     /** Default cap on records returned per fetch when the caller does not specify one. */
     public static final int DEFAULT_MAX_RECORDS = 1000;
+
+    private static final int STREAM_POOL_SIZE = 2;
 
     private final RaftLog raftLog;
     private final LongSupplier currentEpoch; // Raft leader term (coordinator epoch, §5.1.6)
     // Captures a terminal-state KvStore image + its metadata offset, atomically (§5.8.1 point 4).
     // Null when this service is constructed without snapshot support (fetchSnapshot then throws).
     @Nullable private final Supplier<MetadataSnapshot> snapshotSupplier;
+    private final Executor streamExecutor;
+    private final ScheduledExecutorService timeoutScheduler;
+    private final boolean closeExecutors;
     private final Object wakeupLock = new Object();
+
+    @GuardedBy("wakeupLock")
+    private final List<Waiter> waiters = new ArrayList<>();
 
     // False once this node is no longer the leader; parked long-polls return promptly so
     // subscribers
@@ -90,14 +119,51 @@ public class MetadataStreamService implements MetadataStreamGateway {
             RaftLog raftLog,
             LongSupplier currentEpoch,
             @Nullable Supplier<MetadataSnapshot> snapshotSupplier) {
-        this.raftLog = raftLog;
-        this.currentEpoch = currentEpoch;
+        this(
+                raftLog,
+                currentEpoch,
+                snapshotSupplier,
+                newStreamExecutor(),
+                newTimeoutScheduler(),
+                true);
+    }
+
+    /**
+     * Test constructor that injects the stream pool and timeout scheduler so waiters can be
+     * completed deterministically without blocking the caller.
+     */
+    @VisibleForTesting
+    MetadataStreamService(
+            RaftLog raftLog,
+            LongSupplier currentEpoch,
+            @Nullable Supplier<MetadataSnapshot> snapshotSupplier,
+            Executor streamExecutor,
+            ScheduledExecutorService timeoutScheduler) {
+        this(raftLog, currentEpoch, snapshotSupplier, streamExecutor, timeoutScheduler, false);
+    }
+
+    private MetadataStreamService(
+            RaftLog raftLog,
+            LongSupplier currentEpoch,
+            @Nullable Supplier<MetadataSnapshot> snapshotSupplier,
+            Executor streamExecutor,
+            ScheduledExecutorService timeoutScheduler,
+            boolean closeExecutors) {
+        this.raftLog = checkNotNull(raftLog, "raftLog");
+        this.currentEpoch = checkNotNull(currentEpoch, "currentEpoch");
         this.snapshotSupplier = snapshotSupplier;
+        this.streamExecutor = checkNotNull(streamExecutor, "streamExecutor");
+        this.timeoutScheduler = checkNotNull(timeoutScheduler, "timeoutScheduler");
+        this.closeExecutors = closeExecutors;
     }
 
     /**
      * Fetches an ordered, contiguous run of committed metadata records starting at {@code
      * fromOffset}. Long-polls up to {@code maxWaitMs} when the subscriber is already caught up.
+     *
+     * <p>This is a synchronous wrapper around {@link #fetchAsync} for in-process subscribers and
+     * tests. The FetchMetadata RPC path must use {@link #fetchAsync} so Netty workers are not
+     * blocked.
      *
      * @param fromOffset the next metadata offset (Raft index) the subscriber wants (applied + 1)
      * @param maxRecords maximum records to return ({@code <= 0} uses {@link #DEFAULT_MAX_RECORDS})
@@ -106,40 +172,64 @@ public class MetadataStreamService implements MetadataStreamGateway {
      */
     @Override
     public FetchResult fetch(long fromOffset, int maxRecords, long maxWaitMs) throws IOException {
-        int limit = maxRecords <= 0 ? DEFAULT_MAX_RECORDS : maxRecords;
-        long epoch = currentEpoch.getAsLong();
-
-        // Records at or below the log start were compacted into a snapshot: the subscriber must
-        // bootstrap from a snapshot before it can resume the delta stream (§5.8.1 point 3/4).
-        if (fromOffset < raftLog.getStartIndex()) {
-            return new FetchResult(
-                    epoch,
-                    raftLog.getLastCommittedIndex(),
-                    Collections.emptyList(),
-                    fromOffset,
-                    true);
-        }
-
-        // Caught up: park until a new commit wakes us or the deadline/leadership change fires.
-        if (fromOffset > raftLog.getLastCommittedIndex() && maxWaitMs > 0) {
-            awaitNewData(fromOffset, maxWaitMs);
-        }
-
-        long high = raftLog.getLastCommittedIndex();
-        List<StreamRecord> records = new ArrayList<>();
-        long scannedThrough = fromOffset - 1;
-        for (long index = fromOffset; index <= high && records.size() < limit; index++) {
-            LogEntryProto entry = raftLog.get(index);
-            if (entry.hasStateMachineLogEntry()) {
-                byte[] data = entry.getStateMachineLogEntry().getLogData().toByteArray();
-                records.add(new StreamRecord(index, data));
+        try {
+            return fetchAsync(fromOffset, maxRecords, maxWaitMs).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while fetching metadata stream", e);
+        } catch (CancellationException e) {
+            throw new IOException("Metadata stream fetch was cancelled", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
             }
-            // Non-state-machine entries (Raft config/metadata) carry no metadata record but still
-            // consume an offset; the subscriber advances past them via nextOffset below.
-            scannedThrough = index;
+            throw new IOException("Metadata stream fetch failed", cause);
         }
-        long nextOffset = scannedThrough + 1;
-        return new FetchResult(epoch, high, records, nextOffset, false);
+    }
+
+    /**
+     * Asynchronous fetch that returns immediately. When the subscriber is caught up and {@code
+     * maxWaitMs > 0}, the future completes from the metadata-stream pool when new data is applied,
+     * the wait expires, or leadership is lost — never from the Raft apply thread.
+     *
+     * @param fromOffset the next metadata offset (Raft index) the subscriber wants (applied + 1)
+     * @param maxRecords maximum records to return ({@code <= 0} uses {@link #DEFAULT_MAX_RECORDS})
+     * @param maxWaitMs long-poll budget in millis when no new records are available ({@code <= 0} =
+     *     complete immediately)
+     */
+    public CompletableFuture<FetchResult> fetchAsync(
+            long fromOffset, int maxRecords, long maxWaitMs) {
+        CompletableFuture<FetchResult> future = new CompletableFuture<>();
+        try {
+            if (!needsPark(fromOffset, maxWaitMs)) {
+                future.complete(doFetch(fromOffset, maxRecords));
+                return future;
+            }
+            Waiter waiter = new Waiter(fromOffset, maxRecords, future);
+            synchronized (wakeupLock) {
+                if (!serving) {
+                    future.complete(doFetch(fromOffset, maxRecords));
+                    return future;
+                }
+                waiters.add(waiter);
+            }
+            // Recheck after registering: an apply may have raced in between.
+            if (!needsPark(fromOffset, maxWaitMs)) {
+                completeWaiter(waiter);
+                return future;
+            }
+            try {
+                waiter.timeoutFuture =
+                        timeoutScheduler.schedule(
+                                () -> completeWaiter(waiter), maxWaitMs, TimeUnit.MILLISECONDS);
+            } catch (RejectedExecutionException ignored) {
+                completeWaiter(waiter);
+            }
+        } catch (IOException e) {
+            future.completeExceptionally(e);
+        }
+        return future;
     }
 
     /**
@@ -167,43 +257,174 @@ public class MetadataStreamService implements MetadataStreamGateway {
 
     /**
      * Wakeup hook, called from the apply loop (via {@code MetadataWatchService}) after a record is
-     * committed+applied. Content is NOT passed here — parked waiters re-read the log tail.
+     * committed+applied. Content is NOT passed here — parked waiters re-read the log tail on the
+     * metadata-stream pool. This method only enqueues; it must not scan the log, complete RPC
+     * futures, or block (§5.6).
      */
     public void onApplied(long metadataOffset) {
-        synchronized (wakeupLock) {
-            wakeupLock.notifyAll();
+        try {
+            streamExecutor.execute(this::drainWaiters);
+        } catch (RejectedExecutionException ignored) {
+            // Closed; waiters were already released by {@link #notifyLeadershipLost()}.
         }
     }
 
     /**
-     * Signals that this node lost leadership; wakes all parked long-polls so they return and the
-     * subscribers re-target the new leader (the response epoch will reflect the change).
+     * Signals that this node lost leadership; completes all parked long-polls so they return and
+     * the subscribers re-target the new leader (the response epoch will reflect the change).
      */
     public void notifyLeadershipLost() {
         serving = false;
+        List<Waiter> parked;
         synchronized (wakeupLock) {
-            wakeupLock.notifyAll();
+            parked = new ArrayList<>(waiters);
+            waiters.clear();
+        }
+        for (Waiter waiter : parked) {
+            completeWaiter(waiter);
         }
     }
 
-    private void awaitNewData(long fromOffset, long maxWaitMs) {
-        long deadline = System.currentTimeMillis() + maxWaitMs;
-        long startEpoch = currentEpoch.getAsLong();
+    /**
+     * Releases parked waiters and, when this instance owns the stream pool, shuts the executors
+     * down.
+     */
+    @Override
+    public void close() {
+        notifyLeadershipLost();
+        if (closeExecutors) {
+            timeoutScheduler.shutdownNow();
+            ExecutorUtils.gracefulShutdown(5, TimeUnit.SECONDS, (ExecutorService) streamExecutor);
+        }
+    }
+
+    private boolean needsPark(long fromOffset, long maxWaitMs) {
+        return serving
+                && maxWaitMs > 0
+                && fromOffset >= raftLog.getStartIndex()
+                && fromOffset > raftLog.getLastCommittedIndex();
+    }
+
+    private FetchResult doFetch(long fromOffset, int maxRecords) throws IOException {
+        int limit = maxRecords <= 0 ? DEFAULT_MAX_RECORDS : maxRecords;
+        long epoch = currentEpoch.getAsLong();
+
+        // Records at or below the log start were compacted into a snapshot: the subscriber must
+        // bootstrap from a snapshot before it can resume the delta stream (§5.8.1 point 3/4).
+        if (fromOffset < raftLog.getStartIndex()) {
+            return new FetchResult(
+                    epoch,
+                    raftLog.getLastCommittedIndex(),
+                    Collections.emptyList(),
+                    fromOffset,
+                    true);
+        }
+
+        long high = raftLog.getLastCommittedIndex();
+        List<StreamRecord> records = new ArrayList<>();
+        long scannedThrough = fromOffset - 1;
+        for (long index = fromOffset; index <= high && records.size() < limit; index++) {
+            LogEntryProto entry = raftLog.get(index);
+            if (entry.hasStateMachineLogEntry()) {
+                byte[] data = entry.getStateMachineLogEntry().getLogData().toByteArray();
+                records.add(new StreamRecord(index, data));
+            }
+            // Non-state-machine entries (Raft config/metadata) carry no metadata record but still
+            // consume an offset; the subscriber advances past them via nextOffset below.
+            scannedThrough = index;
+        }
+        long nextOffset = scannedThrough + 1;
+        return new FetchResult(epoch, high, records, nextOffset, false);
+    }
+
+    /**
+     * Claims the waiter (timeout vs apply vs leadership-loss: only one winner) and completes its
+     * future on the stream pool so {@code FlussRequestHandler.whenComplete} never runs on the apply
+     * thread.
+     */
+    private void completeWaiter(Waiter waiter) {
+        if (!waiter.claimed.compareAndSet(false, true)) {
+            return;
+        }
+        cancelTimeout(waiter);
         synchronized (wakeupLock) {
-            while (serving
-                    && fromOffset > raftLog.getLastCommittedIndex()
-                    && currentEpoch.getAsLong() == startEpoch) {
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    return;
+            waiters.remove(waiter);
+        }
+        runOnStreamPool(() -> finishWaiter(waiter));
+    }
+
+    private void drainWaiters() {
+        List<Waiter> ready = new ArrayList<>();
+        synchronized (wakeupLock) {
+            Iterator<Waiter> it = waiters.iterator();
+            while (it.hasNext()) {
+                Waiter waiter = it.next();
+                if (!shouldWake(waiter)) {
+                    continue;
                 }
-                try {
-                    wakeupLock.wait(remaining);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
+                if (waiter.claimed.compareAndSet(false, true)) {
+                    cancelTimeout(waiter);
+                    it.remove();
+                    ready.add(waiter);
                 }
             }
+        }
+        for (Waiter waiter : ready) {
+            finishWaiter(waiter);
+        }
+    }
+
+    private boolean shouldWake(Waiter waiter) {
+        return !serving
+                || waiter.fromOffset < raftLog.getStartIndex()
+                || waiter.fromOffset <= raftLog.getLastCommittedIndex();
+    }
+
+    private void finishWaiter(Waiter waiter) {
+        try {
+            waiter.future.complete(doFetch(waiter.fromOffset, waiter.maxRecords));
+        } catch (Exception e) {
+            waiter.future.completeExceptionally(e);
+        }
+    }
+
+    private void runOnStreamPool(Runnable task) {
+        try {
+            streamExecutor.execute(task);
+        } catch (RejectedExecutionException e) {
+            // Shutting down: complete inline. This is never the apply thread.
+            task.run();
+        }
+    }
+
+    private static void cancelTimeout(Waiter waiter) {
+        ScheduledFuture<?> timeoutFuture = waiter.timeoutFuture;
+        if (timeoutFuture != null) {
+            timeoutFuture.cancel(false);
+        }
+    }
+
+    private static ExecutorService newStreamExecutor() {
+        return Executors.newFixedThreadPool(
+                STREAM_POOL_SIZE, new ExecutorThreadFactory("metadata-stream"));
+    }
+
+    private static ScheduledExecutorService newTimeoutScheduler() {
+        return Executors.newSingleThreadScheduledExecutor(
+                new ExecutorThreadFactory("metadata-stream-timeout"));
+    }
+
+    private static final class Waiter {
+        private final long fromOffset;
+        private final int maxRecords;
+        private final CompletableFuture<FetchResult> future;
+        private final AtomicBoolean claimed = new AtomicBoolean(false);
+        private volatile ScheduledFuture<?> timeoutFuture;
+
+        private Waiter(long fromOffset, int maxRecords, CompletableFuture<FetchResult> future) {
+            this.fromOffset = fromOffset;
+            this.maxRecords = maxRecords;
+            this.future = future;
         }
     }
 

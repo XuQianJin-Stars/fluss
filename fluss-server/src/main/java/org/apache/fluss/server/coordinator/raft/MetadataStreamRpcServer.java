@@ -23,7 +23,6 @@ import org.apache.fluss.rpc.messages.FetchMetadataResponse;
 import org.apache.fluss.rpc.messages.FetchMetadataSnapshotRequest;
 import org.apache.fluss.rpc.messages.FetchMetadataSnapshotResponse;
 
-import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -48,19 +47,17 @@ public class MetadataStreamRpcServer {
         this.streamService = streamService;
     }
 
-    /** Serves {@link org.apache.fluss.rpc.protocol.ApiKeys#FETCH_METADATA}. */
+    /**
+     * Serves {@link org.apache.fluss.rpc.protocol.ApiKeys#FETCH_METADATA}. Returns immediately; a
+     * caught-up long-poll is parked in {@link MetadataStreamService#fetchAsync} so Netty workers
+     * are not blocked.
+     */
     public CompletableFuture<FetchMetadataResponse> fetchMetadata(FetchMetadataRequest request) {
-        CompletableFuture<FetchMetadataResponse> future = new CompletableFuture<>();
-        try {
-            int maxRecords = request.hasMaxRecords() ? request.getMaxRecords() : 0;
-            long maxWaitMs = request.hasMaxWaitMs() ? request.getMaxWaitMs() : 0L;
-            MetadataStreamService.FetchResult result =
-                    streamService.fetch(request.getFromOffset(), maxRecords, maxWaitMs);
-            future.complete(MetadataStreamRpcs.toResponse(result));
-        } catch (IOException e) {
-            future.completeExceptionally(e);
-        }
-        return future;
+        int maxRecords = request.hasMaxRecords() ? request.getMaxRecords() : 0;
+        long maxWaitMs = request.hasMaxWaitMs() ? request.getMaxWaitMs() : 0L;
+        return streamService
+                .fetchAsync(request.getFromOffset(), maxRecords, maxWaitMs)
+                .thenApply(MetadataStreamRpcs::toResponse);
     }
 
     /** Serves {@link org.apache.fluss.rpc.protocol.ApiKeys#FETCH_METADATA_SNAPSHOT}. */

@@ -19,8 +19,8 @@
 
 | 字段 | 内容 |
 |------|------|
-| **性质** | 只读分析报告。**不改生产 / 测试 / JMH Java。** §8 是代码级实现指南（patch sketch），未落地。 |
-| **对照设计文档** | [`zookeeper-removal-design.md`](zookeeper-removal-design.md) **§8.4**（v3.12，2026-08-16 全量 JMH catalog） |
+| **性质** | 分析报告。§8 是代码级实现指南；**8.4 prefix iterator 与 8.3 FetchMetadata 异步停车已落地**，其余仍是 sketch。 |
+| **对照设计文档** | [`zookeeper-removal-design.md`](zookeeper-removal-design.md) **§8.4**（v3.16，2026-08-16 FetchMetadata async JMH 复跑） |
 | **分支** | `feature/zookeeper-removal-raft` |
 | **测量日期** | 2026-08-16 |
 | **结论一句话** | 在 1-voter loopback 上，Raft **单条 durable 写**大约是 ZK TestingServer 的 **1.7–1.8×**（`registerTable` 4815µs vs 8582µs）。这不是「Raft 实现写坏了」，而是 **每条写都走完整 commit-apply 流水线 + 空队列立即 fsync + `.get()` 等到本地 apply**；读路径和 block 分配 ID 反而更快。**不能把这组数字外推到 3 节点跨 AZ 生产集群。** |
@@ -163,7 +163,7 @@ JMH 的 delete 行 **包含前面的 unique-key create**（`MetadataStoreBenchma
 | `createDatabase` | 5379 | 8145 | 1.51× | 接近 store `registerDatabase` |
 | `alterDatabase` | 5838 | 8375 | 1.43× | 接近 store `updateDatabase` |
 | `dropDatabase` | 11382 | 16338 | 1.44× | 接近 store create+delete |
-| **`getTableInfo`** | **356 → 443**（复跑） | **842 → 89**（warm） | **was 2.37×, now 0.20×** | prefix iterator 后 Raft 更快。孤立跑第一条 Admin 读仍可能叠 `metadata.stream.max-wait=100ms`（本次冷跑 104ms，不算优化失败） |
+| **`getTableInfo`** | **421**（warm） | **89**（warm） | **0.21×** | prefix iterator 后 Raft 更快。§8.3 异步停车 **没有**再缩短 warm 路径（仍 89µs）。孤立第一条 Admin 读仍叠夹具 `max-wait=100ms`（本次 **104749µs**） |
 
 Admin 写里，只有「几乎等于一次 metadata store 写」的 database DDL 跟着共识变慢。`createTable` 24.7ms vs 46.6ms 已经不是共识在主导。
 
@@ -195,6 +195,7 @@ Admin 写里，只有「几乎等于一次 metadata store 写」的 database DDL
 | `listDatabases` | 245 | 133 | Admin 层；store 层 list 反而是 Raft 慢 |
 | `tableExists` | 160 | 63 | |
 | `listTables` | 283 | 113 | 同上 |
+| `getTableInfo` | 421 | 89 | warm；孤立冷跑仍 ~105ms，见 §2.4 / §8.7 |
 
 #### Store 点读
 
@@ -527,9 +528,11 @@ Raft Admin 多出来的 ~0.5ms **不能**单用 schema 扫描解释完。更可�
 2. **Coordinator 与 Ratis gRPC / metadata-stream 同进程争用**：1 tablet 的 `TabletServerRaftMetadataFeed` 按 `coordinator.metadata-stream.max-wait` **long-poll**（生产默认 **500ms**，夹具 **100ms**）。Warm JMH 不应把 100ms 加进每次 `getTableInfo`（否则会看到 ~100ms 而不是 842µs），但 long-poll 线程、apply 唤醒、`onApplied` 仍会扰动。  
 3. **冷集群 caveat（§8.4 原文）：** 「cold IT cluster can add `metadata.stream.max-wait=100ms`」。若 Admin 误打到 **tablet** 的 follower 视图、或 cache 尚未追上 leader，一次 miss 可以睡满 long-poll。当前 `FlussAdmin` 已改走 coordinator，**warm JMH 的 842µs 不应再含 100ms**；IT 冷启动 / 旧客户端打 tablet 仍可能。
 
-**2026-08-16 晚更新：** prefix iterator 落地后，warm `getTableInfo` Raft **89µs** vs ZK **443µs**（复跑；catalog 原 ZK 356µs）。store `getCurrentSchemaId` 从 325µs 降到 1.2µs，§3.4 里那笔 ~0.5ms 差消失了。孤立把 `getTableInfo` 当 JVM 里第一条 Admin 读仍可能叠夹具 `max-wait=100ms`（本次冷跑 104ms）——那是 stream 追上问题，不是 scan。
+**2026-08-16 晚更新：** prefix iterator 落地后，warm `getTableInfo` Raft **89µs** vs ZK **443µs**（当时复跑；原 catalog ZK 356µs）。store `getCurrentSchemaId` 从 325µs 降到 1.2µs，§3.4 里那笔 ~0.5ms 差消失了。
 
-**诚实结论（更新后）：** warm 路径上 `getTableInfo` 不再是「Raft 更慢的读」。它和 `registerTable` 慢 3.8ms **从来不是同一个根因**。
+**2026-08-16 FetchMetadata 异步停车后再测：** warm 仍是 ZK **421µs** / Raft **89µs**（§8.4 现用这两列）。孤立把 `getTableInfo` 当 JVM 里第一条 Admin 读仍叠夹具 `max-wait=100ms`（**104749µs**，上次 104475µs）。异步停车 **不缩短** 这次 wait，只是不再占 Netty worker。
+
+**诚实结论：** warm 路径上 `getTableInfo` 不是「Raft 更慢的读」。它和 `registerTable` 慢 3.8ms **从来不是同一个根因**。8.3 也不把它从 ~105ms 冷跑里救出来。
 
 ---
 
@@ -652,7 +655,7 @@ ZK 每个 id 一次 CAS（~5ms）。Raft 一次 `ALLOCATE_ID_RANGE` append（~8m
 1. **Raft 输在「单条 durable 元数据写」和「把 Raft 当 1:1 CAS」。** `registerTable` 4815µs vs 8582µs 是代表性数字；同带上几乎所有单 append 写都是 ~1.7×。  
 2. **根因是设计内的：** 纯 commit-apply、每条写 `awaitApplied`、Ratis 空队列立即 fsync、gRPC 即使 loopback、apply 再写 RocksDB。不是漏了索引或「实现比 ZK 拙劣一截」那么简单。  
 3. **Raft 赢在点读、block ID、以及被 tablet DDL 主导的 `createTable`/`dropTable`。** 用 Admin 建表数字说「Raft 更快」或用 store `registerTable` 说「Raft 不能用」，都是错的层。  
-4. **`getTableInfo` 曾慢是读路径实现（全表 `entries()`），不是 fsync。** prefix iterator 落地后 warm Raft 89µs &lt; ZK 443µs。冷集群 `metadata.stream.max-wait=100ms` 仍是独立 caveat。  
+4. **`getTableInfo` 曾慢是读路径实现（全表 `entries()`），不是 fsync。** prefix iterator 落地后 warm Raft **89µs** &lt; ZK **421µs**。§8.3 异步停车后再测：warm **仍 89µs**（没有变快）；孤立冷跑 **仍 ~105ms**（`metadata.stream.max-wait=100ms`）。停车只是不占 Netty worker，不缩短 wait。  
 5. **1-node JMH 不能验收 §8.4 的 3-voter NVMe 目标（写 p50 &lt;5ms）。** 1-voter 已经 8.6ms；3-voter 同 AZ 若 RTT+fsync 做得好，有可能回到 5ms 附近，**需要另测**；跨 AZ 由物理 RTT 决定。  
 6. **生产 Java 仍未改。** 代码级怎么改见 **§8**（prefix iterator、FetchMetadata 异步停车、writer pipeline、`async-flush`；明确禁止 `unsafe-flush`）。任何一项都有正确性或运维代价。
 
@@ -677,13 +680,13 @@ ZK 每个 id 一次 CAS（~5ms）。Raft 一次 `ALLOCATE_ID_RANGE` append（~8m
 
 ---
 
-## 8. 代码级实现指南（只规划，不改生产 / JMH 代码）
+## 8. 代码级实现指南
 
-本节把 §4 / §7.1 的推论落到 **具体类、方法和可编译的 Java 8 patch sketch**。**本文不落地行为变更**；sketch 仅供评审。验证一律走现有 JMH（`MetadataStoreBenchmark` / `MetadataPathBenchmark`，`@Threads(1)` AverageTime µs/op），并标明哪一行会动、哪一行根本动不了。
+本节把 §4 / §7.1 的推论落到 **具体类、方法和可编译的 Java 8 patch sketch**。**8.4 与 8.3 已落地**；8.1 / 8.2 仍是 sketch。验证走现有 JMH（`MetadataStoreBenchmark` / `MetadataPathBenchmark`，`@Threads(1)` AverageTime µs/op），并标明哪一行会动、哪一行根本动不了。
 
 约束与现有代码一致：源码 Java 8（禁止 `var` / `List.of` / `Stream.toList`）；shaded Ratis 包名 `org.apache.fluss.shaded.ratis.org.apache.ratis.*`；apply 线程规则见设计文档 **§5.6**。
 
-建议落地顺序（若将来开 PR）：**8.4 prefix iterator（S）→ 8.3 FetchMetadata 异步停车（M）→ 8.1 仅 `async-flush` 属性（S）+ 8.2 writer pipeline（M）**。不要先开 `unsafe-flush`。不要先加 `MULTI_OP` 记录类型（见 8.2.3）。
+落地顺序：**8.4 prefix iterator（S，已落地）→ 8.3 FetchMetadata 异步停车（M，已落地）→ 8.1 仅 `async-flush` 属性（S）+ 8.2 writer pipeline（M）**。不要先开 `unsafe-flush`。不要先加 `MULTI_OP` 记录类型（见 8.2.3）。
 
 ---
 
@@ -964,7 +967,9 @@ private void appendAll(List<MetadataRecord> records) throws Exception {
 
 ### 8.3 `FetchMetadata` 不得阻塞 Netty worker
 
-#### 8.3.1 当前调用链：long-poll 发生在 worker 上，不是 selector 上
+**已落地（2026-08-16）。** `MetadataStreamRpcServer.fetchMetadata` 立刻返回 `fetchAsync` 的 future；caught-up long-poll 用 `ScheduledExecutorService` 超时 + waiter CAS；`onApplied` 只 `streamExecutor.execute(drainWaiters)`。`fetch()` 仍是 in-process `.get()` 包装。单测 `MetadataStreamServiceTest`；stream ITs 仍过。**已复跑** `getTableInfo`：warm 仍 89µs；孤立冷跑仍 ~105ms（stream 追上 / `max-wait`，不是 worker `wait()`）。本项不是 `getTableInfo` 的延迟修复。
+
+#### 8.3.1 落地前调用链：long-poll 发生在 worker 上，不是 selector 上
 
 **好消息：** Netty I/O 线程（`fluss-netty-server-selector`）**没有**在 `wait()`。`NettyServerHandler` 解析完请求后 `requestChannel.putRequest(request)`，响应用 `future.whenCompleteAsync(..., ctx.executor())` 写回。
 
@@ -1130,8 +1135,8 @@ Worker 数无需为了本优化去改默认 8；异步之后 long-poll 不再占
 | | |
 |--|--|
 | **工作量** | **M**（waiter 集合、超时、leadership-lost 取消、与现有 `notifyLeadershipLost` 对齐）。不是 L：不改协议。 |
-| **JMH** | **现有 catalog 没有 `fetchMetadata` 行。** 不要用 `metadataWrite` 验收本项。可能的间接影响：`MetadataPathBenchmark.getTableInfo`（842µs）若含 worker 与 1 个 tablet long-poll 的争用，异步后或可掉一点，但 §3.4 主因是 `scanPrefixEntries`，**本项不是 getTableInfo 的主修复**。验收以 IT 为主：`MetadataStreamRpcITCase`、`MetadataStreamServiceITCase`、`MetadataStreamFeedITCase`（long-poll 被新 append 唤醒、超时返回空、leadership lost 立刻返回）。 |
-| **生产风险** | 中。竞态：超时与 `onApplied` 双 complete；apply 误 complete RPC；waiter 泄漏；`notifyLeadershipLost` 必须 `complete` 所有 waiter 否则 tablet 会卡满 `maxWaitMs`。错误地在 apply 上读 log / 写响应 → 延迟抖动或 §5.6 死锁。 |
+| **JMH** | **现有 catalog 没有 `fetchMetadata` 行。** 不要用 `metadataWrite` 验收本项。已复跑 `MetadataPathBenchmark.getTableInfo`：warm **89µs**（与 prefix 后相同）；孤立冷跑 **104749µs**（wait 未缩短）。§3.4 主因曾是 `scanPrefixEntries`，**本项不是 getTableInfo 的延迟修复**。验收以 IT 为主：`MetadataStreamRpcITCase`、`MetadataStreamServiceITCase`、`MetadataStreamFeedITCase`（long-poll 被新 append 唤醒、超时返回空、leadership lost 立刻返回）。 |
+| **生产风险** | 中。竞态：超时与 `onApplied` 双 complete；apply 误 complete RPC；waiter 泄漏；`notifyLeadershipLost` 必须 `complete` 所有 waiter 否则 tablet 会卡满 `maxWaitMs`。错误地在 apply 上读 log / 写响应 → 延迟抖动或 §5.6 死锁。落地后用 `Waiter.claimed` CAS + `CompletableFuture.complete` 单次完成；apply 只 enqueue；leadership lost 走 `close()`/`notifyLeadershipLost` 清 waiter。 |
 
 ---
 
@@ -1227,10 +1232,10 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 | 8.1 属性 | `async-flush=true` | **S** | `metadataWrite` **基本不变** | 低–中 | **`unsafe-flush`**；幻想调 `force.sync.num` 修好串行 `.get()` |
 | 8.1+8.2 writer | `appendAll` pipeline | **M** | `registerPartition` 接近腰斩；`createTable` 掉数 ms；`metadataWrite` 仍单条 | 中（部分失败窗口） | apply 上 `.get()`；未 apply 的 id 外泄 |
 | 8.2 MultiOp 类型 | 新 `Type` + codec | **L** | 与 pipeline 同类，额外原子性 | 高（混版本 / stream） | 当 perf 第一刀 |
-| 8.3 FetchMetadata async | future + scheduler | **M** | **无直接 JMH 行**；`getTableInfo` 最多间接 | 中（双 complete / apply 误 complete） | 在 apply 线程 `complete` RPC 或扫 log |
+| 8.3 FetchMetadata async | future + scheduler | **M** | **无直接 JMH 行**；`getTableInfo` warm 仍 89µs，孤立仍 ~105ms | 中（双 complete / apply 误 complete） | 在 apply 线程 `complete` RPC 或扫 log |
 | 8.4 prefix iterator | `KvStore.scanPrefixEntries` | **S** | 所有 ~330µs prefix 行；`getTableInfo` 主修复 | **低** | 继续用 `entries()` 做 list |
 
-**第一刀已落地（§8.6）：8.4 prefix iterator。** 正确性面最小；store list* 从 ~330µs 降到 ~1µs；warm `getTableInfo` Raft 快于 ZK。第二刀仍是 8.3，避免 tablet 把 8 个 worker long-poll 占满。写路径先 pipeline（8.2）再考虑 `async-flush`（8.1）；**永远不要**为分数打开 `unsafe-flush`。
+**已落地：8.4 prefix iterator（§8.6）+ 8.3 FetchMetadata async（§8.7）。** 8.4 救 store list* / warm `getTableInfo`；8.3 让 tablet long-poll 不再占满 8 个 Netty worker（**不**缩短 `max-wait`，warm `getTableInfo` 仍 89µs）。写路径仍先 pipeline（8.2）再考虑 `async-flush`（8.1）；**永远不要**为分数打开 `unsafe-flush`。
 
 ---
 
@@ -1275,6 +1280,33 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 
 ---
 
+### 8.7 Second-cut：FetchMetadata async park（2026-08-16）
+
+实现：`MetadataStreamService.fetchAsync` + `metadata-stream` 线程池 + `metadata-stream-timeout` scheduler。`Waiter.claimed`（`AtomicBoolean`）保证超时 / `onApplied` / leadership-lost 只完成一次；`doFetch` 与 RPC `complete` 只在 stream pool 上跑。`onApplied` 仅 `execute(drainWaiters)`。`MetadataStreamRpcServer.fetchMetadata` 立刻返回 future（`thenApply(toResponse)`）。同步 `fetch()` 留给 in-process subscriber / 测试。
+
+**JMH（同机同 flags，2026-08-16 复跑）：** catalog 没有 `fetchMetadata` 行。复跑 `MetadataPathBenchmark`（全 class）+ 孤立 `getTableInfo` + 廉价 store 对照（`registerTable` / `getTable` / list*）。
+
+| 操作 | ZK µs | Raft µs | vs 落地前 |
+|------|------:|--------:|-----------|
+| `getTableInfo` warm（共享集群） | **421** | **89** | Raft 与 prefix 后 89µs **相同**；ZK 原 catalog 356、prefix 复跑 443 |
+| `getTableInfo` 孤立（JVM 内第一条 Admin 读） | 434 | **104749** | 仍 ≈ 夹具 `max-wait=100ms`（上次 104475）；**wait 时长未缩短** |
+| store `registerTable` | 4734 | 8416 | vs catalog 4815 / 8582，噪声内 |
+| store `getTable` | 110 | 1.08 | vs catalog 102 / 1.6，噪声内 |
+| store `listDatabases` | 108 | 1.08 | vs §8.6 复跑 107 / 0.89，噪声内 |
+| store `listTables` | 106 | 1.45 | vs §8.6 复跑 107 / 1.39，噪声内 |
+| store `getCurrentSchemaId` | 106 | 1.18 | vs §8.6 复跑 106 / 1.17，噪声内 |
+| store `getPartitions` | 106 | 1.57 | vs §8.6 复跑 112 / 1.57，不变 |
+| store `listDatabaseSummaries` | 130 | 2.22 | vs §8.6 复跑 134 / 2.28，噪声内 |
+| store `listAssignedTableIds` | 125 | 1.18 | vs §8.6 复跑 106 / 1.13，噪声内 |
+| store `getSortedTabletServerList` | 104 | 1.16 | vs §8.6 复跑 105 / 1.18，噪声内 |
+| store `listResourcesByType` | 106 | 1.09 | vs §8.6 复跑 107 / 0.91，噪声内 |
+
+诚实结论：异步停车把 long-poll 从 Netty worker 挪到 metadata-stream 线程池，**不缩短** caught-up 订阅的 `maxWaitMs`，因此孤立冷 `getTableInfo` 仍可叠满 100ms。warm 89µs 是 prefix iterator 的结果，不是本刀。store 行不应、也没有被 FetchMetadata 停车打动。全 class Admin `list*` 会吃 `@Fork(0)` 里 `createTable` 残留表，**不要**拿那次 list 分数覆盖 §8.4 / §8.6。
+
+验收：`MetadataStreamServiceTest`（超时空响应、数据先于超时、apply 线程不扫 log、无双 complete）；`MetadataStreamServiceITCase`、`MetadataStreamRpcITCase`、`MetadataStreamCacheApplierITCase`、`MetadataStreamFeedITCase`、`TabletServerMetadataStreamCacheApplierITCase`、`TabletServerRaftMetadataFeedITCase`。
+
+---
+
 ## 附录：关键代码索引
 
 | 主题 | 位置 |
@@ -1289,6 +1321,6 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 | 启动 wait | `FlussClusterExtension.waitUntilCoordinatorServerElected` |
 | `getTableInfo` | `FlussAdmin.getTableInfo`、`MetadataManager.getTable`、`scanPrefixEntries` |
 | stream max-wait | `ConfigOptions.COORDINATOR_METADATA_STREAM_MAX_WAIT`（默认 500ms；IT/JMH 集群 100ms） |
-| FetchMetadata 阻塞点 | `MetadataStreamRpcServer.fetchMetadata` → `MetadataStreamService.awaitNewData` on `fluss-netty-server-worker`（`netty.server.num-worker-threads` 默认 8） |
+| FetchMetadata 停车（已落地） | `MetadataStreamRpcServer.fetchMetadata` → `MetadataStreamService.fetchAsync`；timeout scheduler + metadata-stream pool；`onApplied` 只 enqueue（§8.7） |
 | Prefix iterator（已落地） | `MetadataKvStore.scanPrefixEntries`；`RaftMetadataStore` 委托；JMH before/after 见 **§8.6** |
-| 实现指南 | 本文 **§8**（8.4 已落地，其余仍是 sketch） |
+| 实现指南 | 本文 **§8**（8.3 / 8.4 已落地，其余仍是 sketch） |

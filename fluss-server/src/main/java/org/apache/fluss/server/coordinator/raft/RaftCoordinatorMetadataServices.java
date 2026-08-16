@@ -234,7 +234,7 @@ public class RaftCoordinatorMetadataServices implements AutoCloseable {
     public void close() {
         // Release parked stream long-polls first so subscribers re-target promptly, then stop the
         // liveness scheduler.
-        streamService.notifyLeadershipLost();
+        streamService.close();
         livenessManager.close();
     }
 }

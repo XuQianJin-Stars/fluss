@@ -6,7 +6,7 @@
 
 | Field | Information |
 |-------|-------------|
-| **Document Status** | Draft (v3.14 — §8.4 JMH catalog, post-prefix-iterator numbers) |
+| **Document Status** | Draft (v3.16 — FetchMetadata async park JMH re-run; §8.4 latest Admin `getTableInfo`) |
 | **Authors** | Fluss Development Team |
 | **Created Date** | 2026-06-29 |
 | **Last Updated** | 2026-08-16 |
@@ -34,6 +34,7 @@
 
 | Leftover | Status | Notes |
 |----------|--------|-------|
+| FetchMetadata async park (analysis §8.3) | **Done** | `fetchAsync` + scheduler; apply thread only enqueues; Netty workers no longer `wait(maxWaitMs)`. JMH re-run: warm `getTableInfo` still **89 µs**; isolated first Admin read still **~105 ms** (wait duration unchanged) |
 | Every HA IT dual-backend | **Done** | `DualBackendFlussClusters` + `@EnumSource(MetadataBackend)`; `CoordinatorHighAvailabilityITCase` dual-runs (ZK session-kill vs Raft 3-voter close+restart). Raft KV capacity stays `-1` until `RegisterTabletServer` carries advertised memory |
 | §8.4 complete JMH baseline | **Done** | Full `MetadataStoreClient` + Admin DDL catalog in §8.4 (2026-08-16, 1-node loopback, **post prefix-iterator**); skipped rows listed with reason |
 | corrupt-snapshot / disk-full IT | Optional, not done | §8.3 marked open |
@@ -2043,10 +2044,13 @@ public class MetadataStreamService {
 
     /** Wakeup hook, called from the apply loop via MetadataWatchService. Content comes from the log. */
     public void onApplied(long metadataOffset) {
-        // complete/advance parked long-poll waiters; they will read the tail from raftLog
+        // APPLY THREAD: enqueue drainWaiters onto the metadata-stream pool only (§5.6).
+        // Do not scan raftLog or complete RPC futures here.
     }
 }
 ```
+
+Long-polls are parked as `CompletableFuture`s with a scheduled timeout (`MetadataStreamService.fetchAsync`); the FetchMetadata RPC returns immediately so Netty workers are not blocked. `onApplied` only hands off to the metadata-stream pool. `notifyLeadershipLost` / `close()` complete remaining waiters.
 
 Note the state machine already exposes `awaitApplied(index)` / `lastAppliedIndex()` (5.1.4); the
 stream service reuses `RaftLog` reads plus these signals, so no additional buffering is introduced.
@@ -2867,7 +2871,7 @@ export JAVA_HOME=/path/to/jdk-11
 
 #### JMH comparison (same machine, same flags)
 
-Score is JMH AverageTime (3 measurement iterations); ± is JMH 99.9% CI (wide with n=3 — treat as a point estimate). `@Fork(0)` reuses one store backend and one Admin cluster per backend for the JVM (avoids Ratis port leaks). Delete-style store rows include a preceding unique-key create unless noted. Raft point-reads of a single key are typically ~1 µs (in-process KvStore). Raft **prefix scans** (`list*`, `getPartitions`, `getCurrentSchemaId`, …) are **~1–3 µs** after the 2026-08-16 `scanPrefixEntries` prefix iterator (RocksDB seek+stop / in-memory `subMap`). Snapshot-list rows that were not in that re-run use the same iterator and are shown in that class. See `raft-vs-zk-metadata-perf-analysis.md` §8.6.
+Score is JMH AverageTime (3 measurement iterations); ± is JMH 99.9% CI (wide with n=3 — treat as a point estimate). `@Fork(0)` reuses one store backend and one Admin cluster per backend for the JVM (avoids Ratis port leaks). Delete-style store rows include a preceding unique-key create unless noted. Raft point-reads of a single key are typically ~1 µs (in-process KvStore). Raft **prefix scans** (`list*`, `getPartitions`, `getCurrentSchemaId`, …) are **~1–3 µs** after the 2026-08-16 `scanPrefixEntries` prefix iterator (RocksDB seek+stop / in-memory `subMap`). Snapshot-list rows that were not in that re-run use the same iterator and are shown in that class. See `raft-vs-zk-metadata-perf-analysis.md` §8.6. FetchMetadata async park (analysis §8.3 / §8.7) was re-measured the same day: it does not change store rows; warm Admin `getTableInfo` stayed **89 µs**.
 
 ##### Admin / RPC path (`MetadataPathBenchmark`, 1 coordinator + 1 tablet server)
 
@@ -2884,7 +2888,7 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `createTable` | 46581 | 24713 | full DDL (assignment + ISR + tablet RPC) |
 | `alterTable` | 351 | 81 | set `client.connect-timeout` (idempotent after first) |
 | `dropTable` | 89312 | 43684 | create+drop |
-| `getTableInfo` | 356 | 89 | Warm cluster (`createTable` first). Isolated first Admin read can still add `metadata.stream.max-wait=100ms` |
+| `getTableInfo` | 421 | 89 | Warm cluster. Isolated first Admin read still **~105 ms** (`metadata.stream.max-wait=100ms`); async park does not shrink that wait |
 | `tableExists` | 160 | 63 | |
 | `listTables` | 283 | 70 | Admin list |
 | `createPartition` | 28827 | 16999 | 1-bucket partitioned log table |
@@ -3435,6 +3439,8 @@ A: Not in v1. Only the leader serves authoritative reads/writes (5.7); non-leade
 | 2026-08-16 | 3.12 | **§8.4 full operation catalog.** JMH now covers every `MetadataStoreClient` write/read that can run without a tablet cluster, plus Admin create/drop/alter/list/get database/table/partition. Skipped ISR-churn / lake-file / authorizer RPCs listed with reason. Previous store `registerTable`/`getTable`/`allocateId` rows kept. |
 | 2026-08-16 | 3.13 | **Prefix-iterator first cut.** `MetadataKvStore.scanPrefixEntries` seek+stop (RocksDB + in-memory); `RaftMetadataStore` no longer full-`entries()` filters. Re-ran list*/`getTableInfo` JMH: Raft store prefix ~330 µs → ~1 µs; warm Admin `getTableInfo` 842 → 89 µs. ZK rows unchanged. Details in `raft-vs-zk-metadata-perf-analysis.md` §8.6. |
 | 2026-08-16 | 3.14 | **§8.4 catalog = post-prefix-iterator numbers only.** Canonical JMH tables no longer present pre-patch Raft prefix ~330 µs or Admin `getTableInfo` 842 µs as current. Snapshot-list rows not in the evening re-run share `scanPrefixEntries` with list* (~1 µs class). 3.13 remains the patch history. |
+| 2026-08-16 | 3.15 | **FetchMetadata async park.** `MetadataStreamService.fetchAsync` + stream pool / timeout scheduler; apply thread only enqueues (`onApplied`). Netty workers no longer `wait(maxWaitMs)`. Analysis §8.3/§8.7. |
+| 2026-08-16 | 3.16 | **§8.4 Admin `getTableInfo` after async-park JMH.** Re-ran `MetadataPathBenchmark` (same short flags). Warm Raft **89 µs** (unchanged vs 3.14); ZK **421 µs** replaces 356. Isolated first Admin read still **~105 ms** — parking unblocks Netty workers, it does not shorten `max-wait`. Store list*/`getTable`/`registerTable` confirmed unchanged. |
 
 ---
 

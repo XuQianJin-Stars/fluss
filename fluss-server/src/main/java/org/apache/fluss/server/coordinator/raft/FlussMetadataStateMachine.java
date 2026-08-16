@@ -84,8 +84,8 @@ public class FlussMetadataStateMachine extends BaseStateMachine {
     // Fired from the apply loop after each mutation advances lastAppliedIndex, carrying the applied
     // metadata offset. MUST be a cheap, non-blocking wakeup only (e.g.
     // MetadataStreamService.onApplied
-    // parking-lot notify) — it runs on the single apply thread and must never block it (§5.6,
-    // §5.8.2).
+    // enqueue onto the metadata-stream pool) — it runs on the single apply thread and must never
+    // block it, scan the Raft log, or complete RPC futures (§5.6, §5.8.2).
     @Nullable private volatile LongConsumer applyListener;
 
     @GuardedBy("this")
@@ -109,8 +109,8 @@ public class FlussMetadataStateMachine extends BaseStateMachine {
      * Registers the apply-loop wakeup listener (typically {@code
      * MetadataStreamService::onApplied}). The listener fires on the single apply thread after each
      * mutation advances the applied offset; it MUST be a cheap, non-blocking notification (§5.8.2)
-     * — it may not synchronously wait on a new append (§5.6). Passing {@code null} detaches the
-     * listener.
+     * — it may not complete RPCs, scan the Raft log, or wait on a new append (§5.6). Passing {@code
+     * null} detaches the listener.
      */
     public void setApplyListener(@Nullable LongConsumer applyListener) {
         this.applyListener = applyListener;

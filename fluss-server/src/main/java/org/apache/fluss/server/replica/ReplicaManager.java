@@ -101,6 +101,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.UserMetrics;
@@ -182,7 +183,7 @@ public class ReplicaManager implements ServerReconfigurable {
     private final Scheduler scheduler;
     private final LogManager logManager;
     private final KvManager kvManager;
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
     protected final int serverId;
     private final AtomicBoolean highWatermarkCheckPointThreadStarted = new AtomicBoolean(false);
     private final Map<File, OffsetCheckpointFile> highWatermarkCheckpoints;
@@ -244,7 +245,7 @@ public class ReplicaManager implements ServerReconfigurable {
             Scheduler scheduler,
             LogManager logManager,
             KvManager kvManager,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             int serverId,
             TabletServerMetadataCache metadataCache,
             RpcClient rpcClient,
@@ -294,7 +295,7 @@ public class ReplicaManager implements ServerReconfigurable {
             Scheduler scheduler,
             LogManager logManager,
             KvManager kvManager,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             int serverId,
             TabletServerMetadataCache metadataCache,
             RpcClient rpcClient,
@@ -350,9 +351,18 @@ public class ReplicaManager implements ServerReconfigurable {
 
         // for kv snapshot
         this.kvSnapshotResource = KvSnapshotResource.create(serverId, conf, ioExecutor);
+        // On the Raft backend a TabletServer holds no leader-capable metadata client, so
+        // bucket-snapshot ids are reserved from the coordinator leader via the AllocateId RPC over
+        // the (leader-following) coordinatorGateway. Null on ZooKeeper (per-bucket znode counter).
         this.kvSnapshotContext =
                 DefaultSnapshotContext.create(
-                        zkClient, completedKvSnapshotCommitter, kvSnapshotResource, conf);
+                        zkClient,
+                        completedKvSnapshotCommitter,
+                        kvSnapshotResource,
+                        conf,
+                        zkClient instanceof ZooKeeperClient
+                                ? null
+                                : (request -> coordinatorGateway.allocateId(request)));
         this.remoteLogManager = remoteLogManager;
         this.serverMetricGroup = serverMetricGroup;
         this.userMetrics = userMetrics;

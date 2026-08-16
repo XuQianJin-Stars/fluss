@@ -23,25 +23,35 @@ import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.messages.AllocateIdRequest;
+import org.apache.fluss.rpc.messages.AllocateIdResponse;
 import org.apache.fluss.server.kv.KvSnapshotResource;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.function.FunctionWithException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Function;
 
 /** A default implementation for {@link SnapshotContext}. */
 public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigurable {
 
     private static final Logger LOG = LoggerFactory.getLogger(DefaultSnapshotContext.class);
 
-    private final ZooKeeperClient zooKeeperClient;
+    private final MetadataStoreClient zooKeeperClient;
     private final CompletedKvSnapshotCommitter completedKvSnapshotCommitter;
+
+    @Nullable
+    private final Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+            allocateIdTransport;
 
     private final ScheduledExecutorService snapshotScheduler;
     private final ExecutorService asyncOperationsThreadPool;
@@ -64,7 +74,7 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
     private final FsPath remoteKvDir;
 
     private DefaultSnapshotContext(
-            ZooKeeperClient zooKeeperClient,
+            MetadataStoreClient zooKeeperClient,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
             ScheduledExecutorService snapshotScheduler,
             ExecutorService asyncOperationsThreadPool,
@@ -76,7 +86,10 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
             int maxFetchLogSizeInRecoverKv,
             int remoteLogPrefetchNumInRecoverKv,
-            int remoteLogDownloadThreadsInRecoverKv) {
+            int remoteLogDownloadThreadsInRecoverKv,
+            @Nullable
+                    Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+                            allocateIdTransport) {
         this.zooKeeperClient = zooKeeperClient;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
         this.snapshotScheduler = snapshotScheduler;
@@ -91,13 +104,25 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
         this.maxFetchLogSizeInRecoverKv = maxFetchLogSizeInRecoverKv;
         this.remoteLogPrefetchNumInRecoverKv = remoteLogPrefetchNumInRecoverKv;
         this.remoteLogDownloadThreadsInRecoverKv = remoteLogDownloadThreadsInRecoverKv;
+        this.allocateIdTransport = allocateIdTransport;
     }
 
     public static DefaultSnapshotContext create(
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
             KvSnapshotResource kvSnapshotResource,
             Configuration conf) {
+        return create(zkClient, completedKvSnapshotCommitter, kvSnapshotResource, conf, null);
+    }
+
+    public static DefaultSnapshotContext create(
+            MetadataStoreClient zkClient,
+            CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
+            KvSnapshotResource kvSnapshotResource,
+            Configuration conf,
+            @Nullable
+                    Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+                            allocateIdTransport) {
         return new DefaultSnapshotContext(
                 zkClient,
                 completedKvSnapshotCommitter,
@@ -111,11 +136,19 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
                 new ZooKeeperCompletedSnapshotHandleStore(zkClient),
                 (int) conf.get(ConfigOptions.KV_RECOVER_LOG_RECORD_BATCH_MAX_SIZE).getBytes(),
                 conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_PREFETCH_NUM),
-                conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS));
+                conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS),
+                allocateIdTransport);
     }
 
-    public ZooKeeperClient getZooKeeperClient() {
+    public MetadataStoreClient getZooKeeperClient() {
         return zooKeeperClient;
+    }
+
+    @Override
+    @Nullable
+    public Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+            getAllocateIdTransport() {
+        return allocateIdTransport;
     }
 
     public ExecutorService getAsyncOperationsThreadPool() {

@@ -25,10 +25,6 @@ import org.apache.fluss.rpc.RpcGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.server.ServerBase;
 import org.apache.fluss.server.ServerITCaseBase;
-import org.apache.fluss.server.utils.AvailablePortExtension;
-import org.apache.fluss.testutils.common.EachCallbackWrapper;
-
-import org.junit.jupiter.api.extension.RegisterExtension;
 
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
 
@@ -37,13 +33,9 @@ public class TabletServerITCase extends ServerITCaseBase {
 
     private static final String HOSTNAME = "localhost";
 
-    @RegisterExtension
-    final EachCallbackWrapper<AvailablePortExtension> portExtension =
-            new EachCallbackWrapper<>(new AvailablePortExtension());
-
     @Override
     protected ServerNode getServerNode() {
-        return new ServerNode(1, HOSTNAME, getPort(), ServerType.TABLET_SERVER, "rack1");
+        return new ServerNode(1, HOSTNAME, 0, ServerType.TABLET_SERVER, "rack1");
     }
 
     @Override
@@ -61,14 +53,10 @@ public class TabletServerITCase extends ServerITCaseBase {
         Configuration conf = new Configuration();
         conf.set(
                 ConfigOptions.BIND_LISTENERS,
-                String.format("%s://%s:%d", DEFAULT_LISTENER_NAME, HOSTNAME, getPort()));
+                String.format("%s://%s:0", DEFAULT_LISTENER_NAME, HOSTNAME));
         conf.set(ConfigOptions.TABLET_SERVER_ID, 1);
         conf.set(ConfigOptions.TABLET_SERVER_RACK, "rack1");
         conf.set(ConfigOptions.REMOTE_DATA_DIR, "/tmp/fluss/remote-data");
         return conf;
-    }
-
-    private int getPort() {
-        return portExtension.getCustomExtension().port();
     }
 }

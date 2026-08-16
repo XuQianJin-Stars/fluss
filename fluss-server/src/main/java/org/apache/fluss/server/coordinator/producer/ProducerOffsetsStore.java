@@ -25,7 +25,7 @@ import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
@@ -68,10 +68,10 @@ public class ProducerOffsetsStore {
     private static final long INITIAL_BACKOFF_MS = 100;
     private static final long MAX_BACKOFF_MS = 1000;
 
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
     private final String remoteDataDir;
 
-    public ProducerOffsetsStore(ZooKeeperClient zkClient, String remoteDataDir) {
+    public ProducerOffsetsStore(MetadataStoreClient zkClient, String remoteDataDir) {
         this.zkClient = zkClient;
         this.remoteDataDir = remoteDataDir;
     }

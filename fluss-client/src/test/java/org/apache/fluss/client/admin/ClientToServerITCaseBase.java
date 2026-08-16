@@ -107,7 +107,16 @@ public abstract class ClientToServerITCaseBase {
         admin.createDatabase(tablePath.getDatabaseName(), DatabaseDescriptor.EMPTY, ignoreIfExists)
                 .get();
         admin.createTable(tablePath, tableDescriptor, ignoreIfExists).get();
-        return admin.getTableInfo(tablePath).get().getTableId();
+        long tableId = admin.getTableInfo(tablePath).get().getTableId();
+        // Raft tablet servers serve client metadata from a follower store that lags the
+        // coordinator. For non-partitioned tables, wait until bucket assignments exist so
+        // getTable() does not hit TableNotExistException on a tablet that has not applied
+        // CREATE_TABLE yet. Partitioned tables have no table-level assignment until
+        // partitions are created, so waitUntilTableReady would time out.
+        if (!tableDescriptor.isPartitioned()) {
+            FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+        }
+        return tableId;
     }
 
     private static Configuration initConfig() {

@@ -32,8 +32,8 @@ import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.utils.ExceptionUtils;
@@ -57,6 +57,7 @@ import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequ
 import static org.apache.fluss.testutils.DataTestUtils.genKvRecords;
 import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.DataTestUtils.toKvRecordBatch;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -104,7 +105,7 @@ class KvRecoverFromRemoteLogITCase {
         int originalLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
 
         // Get the replicas assignment for later use.
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         Optional<TableAssignment> tableAssignmentOpt = zkClient.getTableAssignment(tableId);
         assertThat(tableAssignmentOpt).isPresent();
         List<Integer> replicas = tableAssignmentOpt.get().getBucketAssignment(0).getReplicas();
@@ -315,12 +316,24 @@ class KvRecoverFromRemoteLogITCase {
 
     private void putRecordBatchAndAssertSuccess(
             TableBucket tableBucket, int leaderServer, KvRecordBatch kvRecordBatch) {
-        PutKvResponse response = putRecordBatch(tableBucket, leaderServer, kvRecordBatch).join();
-        assertThat(response.getBucketsRespsList()).hasSize(1);
-        assertThat(response.getBucketsRespAt(0).hasErrorCode())
-                .as(
-                        "PutKv response should not contain bucket error: %s",
-                        response.getBucketsRespAt(0))
-                .isFalse();
+        // Retry: metadata ISR shrink can land before the leader applies NotifyLeaderAndIsr; until
+        // then acks=-1 PutKv fails while offline replicas are still in the leader's in-memory ISR.
+        retry(
+                Duration.ofMinutes(1),
+                () -> {
+                    PutKvResponse response =
+                            putRecordBatch(tableBucket, leaderServer, kvRecordBatch).join();
+                    assertThat(response.getBucketsRespsList()).hasSize(1);
+                    assertThat(response.getBucketsRespAt(0).hasErrorCode())
+                            .as(
+                                    "PutKv response should not contain bucket error: code=%s msg=%s",
+                                    response.getBucketsRespAt(0).hasErrorCode()
+                                            ? response.getBucketsRespAt(0).getErrorCode()
+                                            : -1,
+                                    response.getBucketsRespAt(0).hasErrorMessage()
+                                            ? response.getBucketsRespAt(0).getErrorMessage()
+                                            : "")
+                            .isFalse();
+                });
     }
 }

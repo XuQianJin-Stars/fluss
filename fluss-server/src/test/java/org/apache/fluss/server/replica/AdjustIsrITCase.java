@@ -25,14 +25,16 @@ import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbProduceLogRespForBucket;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
+import org.apache.fluss.server.testutils.DualBackendFlussClusters;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.testutils.RpcMessageTestUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.util.List;
@@ -47,28 +49,31 @@ import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.apache.fluss.utils.function.ThrowingConsumer.unchecked;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** ITCase for adjust isr while ISR change. */
+/** ITCase for adjust isr while ISR change. Runs on ZooKeeper and Raft. */
 public class AdjustIsrITCase {
     @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
-            FlussClusterExtension.builder()
+    public static final DualBackendFlussClusters CLUSTERS =
+            DualBackendFlussClusters.builder()
                     .setNumOfTabletServers(3)
                     .setClusterConf(initConfig())
                     .build();
 
-    private ZooKeeperClient zkClient;
+    private FlussClusterExtension flussClusterExtension;
+    private MetadataStoreClient zkClient;
 
-    @BeforeEach
-    void beforeEach() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+    private void bind(MetadataBackend backend) {
+        flussClusterExtension = CLUSTERS.get(backend);
+        zkClient = flussClusterExtension.metadataStore();
     }
 
     /**
      * The test is used to verify that isr will be changed due to follower lags behind leader and
      * catch up with leader.
      */
-    @Test
-    void testIsrShrinkAndExpand() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testIsrShrinkAndExpand(MetadataBackend backend) throws Exception {
+        bind(backend);
         long tableId = createLogTable();
         TableBucket tb = new TableBucket(tableId, 0);
 
@@ -80,18 +85,18 @@ public class AdjustIsrITCase {
         List<Integer> isr = currentLeaderAndIsr.isr();
         assertThat(isr).containsExactlyInAnyOrder(0, 1, 2);
 
-        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leader = flussClusterExtension.waitAndGetLeader(tb);
         Integer stopFollower = isr.stream().filter(i -> i != leader).findFirst().get();
 
-        FLUSS_CLUSTER_EXTENSION.waitAndGetFollowerReplica(tb, stopFollower);
+        flussClusterExtension.waitAndGetFollowerReplica(tb, stopFollower);
         // stop follower replica for the bucket
-        FLUSS_CLUSTER_EXTENSION.stopReplica(stopFollower, tb, currentLeaderAndIsr.leaderEpoch());
+        flussClusterExtension.stopReplica(stopFollower, tb, currentLeaderAndIsr.leaderEpoch());
 
         isr.remove(stopFollower);
 
         // send one batch data to check the stop follower will become out of sync replica.
         TabletServerGateway leaderGateWay =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+                flussClusterExtension.newTabletServerClientForNode(leader);
         RpcMessageTestUtils.assertProduceLogResponse(
                 leaderGateWay
                         .produceLog(
@@ -121,7 +126,7 @@ public class AdjustIsrITCase {
                 Duration.ofMinutes(1),
                 () ->
                         assertThat(
-                                        FLUSS_CLUSTER_EXTENSION
+                                        flussClusterExtension
                                                 .getTabletServerById(leader)
                                                 .getReplicaManager()
                                                 .getReplicaOrException(tb)
@@ -139,7 +144,7 @@ public class AdjustIsrITCase {
                         currentLeaderAndIsr.coordinatorEpoch(),
                         currentLeaderAndIsr.bucketEpoch());
         isr.add(stopFollower);
-        FLUSS_CLUSTER_EXTENSION.notifyLeaderAndIsr(
+        flussClusterExtension.notifyLeaderAndIsr(
                 stopFollower, DATA1_TABLE_PATH, tb, newLeaderAndIsr, isr);
         // retry until the stop follower add back to ISR.
         retry(
@@ -153,8 +158,10 @@ public class AdjustIsrITCase {
                                                         .containsExactlyInAnyOrderElementsOf(isr)));
     }
 
-    @Test
-    void testIsrSetSizeLessThanMinInSynReplicasNumber() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testIsrSetSizeLessThanMinInSynReplicasNumber(MetadataBackend backend) throws Exception {
+        bind(backend);
         long tableId = createLogTable();
         TableBucket tb = new TableBucket(tableId, 0);
 
@@ -165,12 +172,12 @@ public class AdjustIsrITCase {
                         "Leader and isr not found");
         List<Integer> isr = currentLeaderAndIsr.isr();
         assertThat(isr).containsExactlyInAnyOrder(0, 1, 2);
-        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leader = flussClusterExtension.waitAndGetLeader(tb);
         List<Integer> followerSet =
                 isr.stream().filter(i -> i != leader).collect(Collectors.toList());
-        followerSet.forEach(unchecked(FLUSS_CLUSTER_EXTENSION::stopTabletServer));
+        followerSet.forEach(unchecked(flussClusterExtension::stopTabletServer));
         TabletServerGateway leaderGateWay =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+                flussClusterExtension.newTabletServerClientForNode(leader);
         RpcMessageTestUtils.assertProduceLogResponse(
                 leaderGateWay
                         .produceLog(
@@ -188,7 +195,7 @@ public class AdjustIsrITCase {
                 Duration.ofMinutes(1),
                 () ->
                         assertThat(
-                                        FLUSS_CLUSTER_EXTENSION
+                                        flussClusterExtension
                                                 .getTabletServerById(leader)
                                                 .getReplicaManager()
                                                 .getReplicaOrException(tb)
@@ -196,7 +203,7 @@ public class AdjustIsrITCase {
                                 .containsExactlyInAnyOrder(leader));
         // check leader highWatermark not increase because the isr set < min_isr
         assertThat(
-                        FLUSS_CLUSTER_EXTENSION
+                        flussClusterExtension
                                 .getTabletServerById(leader)
                                 .getReplicaManager()
                                 .getReplicaOrException(tb)
@@ -227,7 +234,7 @@ public class AdjustIsrITCase {
                                 leader, tableId));
         // check again leader highWatermark not increase because the isr set < min_isr
         assertThat(
-                        FLUSS_CLUSTER_EXTENSION
+                        flussClusterExtension
                                 .getTabletServerById(leader)
                                 .getReplicaManager()
                                 .getReplicaOrException(tb)
@@ -241,7 +248,7 @@ public class AdjustIsrITCase {
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder().schema(DATA1_SCHEMA).distributedBy(1, "a").build();
         return RpcMessageTestUtils.createTable(
-                FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, tableDescriptor);
+                flussClusterExtension, DATA1_TABLE_PATH, tableDescriptor);
     }
 
     private static Configuration initConfig() {

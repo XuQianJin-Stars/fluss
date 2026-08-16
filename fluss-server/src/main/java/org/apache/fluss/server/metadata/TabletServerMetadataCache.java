@@ -219,12 +219,17 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                         serverSchemaCache.updateLatestSchema(tableId, (short) schemaId, schema);
 
                         if (tableId == DELETED_TABLE_ID) {
+                            // Legacy path-keyed tombstone (survives RPC). Prefer
+                            // DELETED_TABLE_PATH + real tableId: a late path-keyed delete can wipe
+                            // a
+                            // table recreated at the same path after afterEach cleanup.
                             Long removedTableId = tableIdByPath.remove(tablePath);
                             if (removedTableId != null) {
                                 bucketMetadataMapForTables.remove(removedTableId);
                                 deletedTableIds.add(removedTableId);
                             }
-                        } else if (tablePath == DELETED_TABLE_PATH) {
+                        } else if (DELETED_TABLE_PATH.equals(tablePath)) {
+                            // Id-keyed tombstone (must use equals: paths are rebuilt from RPC).
                             serverMetadataSnapshot
                                     .getTablePath(tableId)
                                     .ifPresent(tableIdByPath::remove);

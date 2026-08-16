@@ -83,10 +83,11 @@ class LakeTieringHeartbeatITCase {
         // firstly, create 4 tables;
         createLakeTables(tableCounts);
 
-        // verify coordinator epoch in response
+        // Coordinator epoch is 0 on ZooKeeper and typically the Raft term (>= 1) on Raft.
         LakeTieringHeartbeatResponse heartbeatResponse =
                 coordinatorGateway.lakeTieringHeartbeat(new LakeTieringHeartbeatRequest()).get();
-        assertThat(heartbeatResponse.getCoordinatorEpoch()).isEqualTo(INITIAL_COORDINATOR_EPOCH);
+        int coordinatorEpoch = heartbeatResponse.getCoordinatorEpoch();
+        assertThat(coordinatorEpoch).isGreaterThanOrEqualTo(INITIAL_COORDINATOR_EPOCH);
 
         for (int i = 0; i < tableCounts; i++) {
             verifyGetTableToTier(i);
@@ -96,7 +97,8 @@ class LakeTieringHeartbeatITCase {
 
         // send heartbeat to mark some table has been finished, and some has been failed
         LakeTieringHeartbeatRequest request =
-                makeTieringHeartbeatRequest(new long[] {0}, new long[] {1, 3}, new long[] {2});
+                makeTieringHeartbeatRequest(
+                        new long[] {0}, new long[] {1, 3}, new long[] {2}, coordinatorEpoch, 1);
         coordinatorGateway.lakeTieringHeartbeat(request).get();
 
         // then, request table via heartbeat, should get the tables has been finished and failed
@@ -114,7 +116,9 @@ class LakeTieringHeartbeatITCase {
         // verify error response for the tables carried in heartbeat request,
         // the tiering epoch for table 0,2,3 in request is 1, but actual is 2, should throw
         // exception
-        request = makeTieringHeartbeatRequest(new long[] {0}, new long[] {1, 2}, new long[] {3});
+        request =
+                makeTieringHeartbeatRequest(
+                        new long[] {0}, new long[] {1, 2}, new long[] {3}, coordinatorEpoch, 1);
         LakeTieringHeartbeatResponse lakeTieringHeartbeatResponse =
                 coordinatorGateway.lakeTieringHeartbeat(request).get();
         // error will only be in finish & failed response
@@ -139,11 +143,7 @@ class LakeTieringHeartbeatITCase {
         // now, let's finish some table and get the table again
         request =
                 makeTieringHeartbeatRequest(
-                        new long[0],
-                        new long[] {1, 2, 3},
-                        new long[0],
-                        INITIAL_COORDINATOR_EPOCH,
-                        2);
+                        new long[0], new long[] {1, 2, 3}, new long[0], coordinatorEpoch, 2);
         coordinatorGateway.lakeTieringHeartbeat(request).get();
 
         expectedTieredTableIds = new HashSet<>(Arrays.asList(1L, 2L, 3L));
@@ -160,11 +160,7 @@ class LakeTieringHeartbeatITCase {
         // when tiering epoch is not match current tiering epoch
         request =
                 makeTieringHeartbeatRequest(
-                        new long[] {1, 2, 3},
-                        new long[0],
-                        new long[0],
-                        INITIAL_COORDINATOR_EPOCH,
-                        2);
+                        new long[] {1, 2, 3}, new long[0], new long[0], coordinatorEpoch, 2);
         lakeTieringHeartbeatResponse = coordinatorGateway.lakeTieringHeartbeat(request).get();
         tieringTableResps = lakeTieringHeartbeatResponse.getTieringTableRespsList();
         assertThat(tieringTableResps).hasSize(3);
@@ -175,7 +171,7 @@ class LakeTieringHeartbeatITCase {
 
         // verify error response for the tables carried in heartbeat request
         // when coordinator epoch is not match current coordinator epoch
-        int invalidEpoch = INITIAL_COORDINATOR_EPOCH + 1;
+        int invalidEpoch = coordinatorEpoch + 1;
         request =
                 makeTieringHeartbeatRequest(
                         new long[] {1}, new long[] {2}, new long[] {3}, invalidEpoch, 2);
@@ -191,9 +187,7 @@ class LakeTieringHeartbeatITCase {
                     Errors.INVALID_COORDINATOR_EXCEPTION.code(),
                     String.format(
                             "The coordinator epoch %s in request is not match current coordinator epoch %d for table %d.",
-                            invalidEpoch,
-                            INITIAL_COORDINATOR_EPOCH,
-                            pbHeartbeatRespForTable.getTableId()));
+                            invalidEpoch, coordinatorEpoch, pbHeartbeatRespForTable.getTableId()));
         }
     }
 
@@ -251,16 +245,6 @@ class LakeTieringHeartbeatITCase {
             ErrorResponse errorResponse, int errorCode, String expectedErrorMessage) {
         assertThat(errorResponse.getErrorCode()).isEqualTo(errorCode);
         assertThat(errorResponse.getErrorMessage()).isEqualTo(expectedErrorMessage);
-    }
-
-    private LakeTieringHeartbeatRequest makeTieringHeartbeatRequest(
-            long[] tieringTables, long[] finishTieringTables, long[] failedTieringTables) {
-        return makeTieringHeartbeatRequest(
-                tieringTables,
-                finishTieringTables,
-                failedTieringTables,
-                INITIAL_COORDINATOR_EPOCH,
-                1);
     }
 
     private LakeTieringHeartbeatRequest makeTieringHeartbeatRequest(

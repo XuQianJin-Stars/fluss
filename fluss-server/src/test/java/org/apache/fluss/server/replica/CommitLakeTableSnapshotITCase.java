@@ -28,9 +28,9 @@ import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
 import org.apache.fluss.rpc.messages.PbLakeTableOffsetForBucket;
 import org.apache.fluss.rpc.messages.PbLakeTableSnapshotInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.testutils.RpcMessageTestUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -60,7 +60,7 @@ class CommitLakeTableSnapshotITCase {
 
     private static final int BUCKET_NUM = 3;
 
-    private static ZooKeeperClient zkClient;
+    private static MetadataStoreClient zkClient;
 
     private static Configuration initConfig() {
         Configuration conf = new Configuration();
@@ -71,7 +71,7 @@ class CommitLakeTableSnapshotITCase {
 
     @BeforeAll
     static void beforeAll() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
     }
 
     @Test

@@ -44,6 +44,7 @@ import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.server.ServerBase;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.authorizer.DefaultAuthorizer;
+import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.coordinator.CoordinatorServer;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
@@ -52,6 +53,8 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.replica.Replica;
@@ -68,7 +71,9 @@ import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.shaded.ratis.org.apache.ratis.util.ExitUtils;
 import org.apache.fluss.utils.FileUtils;
+import org.apache.fluss.utils.NetUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
 
@@ -88,6 +93,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.ConcurrentModificationException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -114,6 +120,9 @@ import static org.assertj.core.api.Assertions.fail;
 /**
  * A Junit {@link Extension} which starts a Fluss Cluster.
  *
+ * <p>Supports both {@link MetadataBackend#RAFT} (default) and {@link MetadataBackend#ZOOKEEPER} via
+ * {@link Builder#setMetadataBackend(MetadataBackend)}.
+ *
  * <p>Note: after each test, it'll always drop all the databases and tables.
  */
 public final class FlussClusterExtension
@@ -121,9 +130,19 @@ public final class FlussClusterExtension
 
     public static final String BUILTIN_DATABASE = "fluss";
 
+    static {
+        // Ratis GrpcService.startImpl() calls ExitUtils.terminate() on bind failure, which
+        // System.exit()s the JVM and deadlocks surefire in ApplicationShutdownHooks. Tests
+        // must fail the method instead of taking down the fork.
+        ExitUtils.disableSystemExit();
+    }
+
     private final int initialNumOfTabletServers;
     private final String tabletServerListeners;
-    private final String coordinatorServerListeners;
+    /** May be rewritten on Raft coordinator stop to pin the bound port across restarts. */
+    private String coordinatorServerListeners;
+
+    private final MetadataBackend metadataBackend;
 
     private CoordinatorServer coordinatorServer;
     private ServerInfo coordinatorServerInfo;
@@ -131,6 +150,12 @@ public final class FlussClusterExtension
     private ZooKeeperClient zooKeeperClient;
     private RpcClient rpcClient;
     private MetadataManager metadataManager;
+    /** Raft seed ({@code host:port} of the coordinator FLUSS listener); null on ZooKeeper. */
+    @Nullable private String raftCoordinatorSeed;
+    /** Cached Raft peer address so coordinator restarts reuse the same port/dir. */
+    @Nullable private String raftPeerAddress;
+    /** File locks for ports reserved by {@link #freePort()} until {@link #close()}. */
+    private final List<NetUtils.Port> heldPorts = new ArrayList<>();
 
     private File tempDir;
 
@@ -153,7 +178,8 @@ public final class FlussClusterExtension
             Configuration clusterConf,
             Clock clock,
             String[] racks,
-            List<String> remoteDirNames) {
+            List<String> remoteDirNames,
+            MetadataBackend metadataBackend) {
         this.initialNumOfTabletServers = numOfTabletServers;
         this.tabletServers = new HashMap<>(numOfTabletServers);
         this.coordinatorServerListeners = coordinatorServerListeners;
@@ -166,6 +192,7 @@ public final class FlussClusterExtension
                 "racks must be not null and have the same length as numOfTabletServers");
         this.racks = racks;
         this.remoteDirNames = remoteDirNames;
+        this.metadataBackend = metadataBackend;
     }
 
     @Override
@@ -204,6 +231,56 @@ public final class FlussClusterExtension
             }
         }
         CompletableFuture.allOf(dropFutures.toArray(new CompletableFuture[0])).join();
+        // Drop RPCs can return before coordinator finishes clearing bucket/replica state.
+        // Wait so the next test does not plan rebalance / metadata against mid-delete leftovers.
+        waitUntilCoordinatorBucketsCleared();
+    }
+
+    /**
+     * Wait until the coordinator context has no remaining user table buckets and no pending table
+     * deletions. Drop RPCs complete when metadata is tombstoned; replica cleanup can still be
+     * in-flight.
+     */
+    public void waitUntilCoordinatorBucketsCleared() {
+        waitUntil(
+                () -> {
+                    try {
+                        CoordinatorContext ctx =
+                                coordinatorServer
+                                        .getCoordinatorEventProcessor()
+                                        .getCoordinatorContext();
+                        Set<TableBucket> buckets = ctx.getAllBuckets();
+                        Set<Long> deleting = ctx.getTablesToBeDeleted();
+                        if (buckets.isEmpty() && deleting.isEmpty()) {
+                            return true;
+                        }
+                        // Drop may finish in the metadata store (and tablets may clean dirs via
+                        // SchemaNotExist) before coordinator context drops assignments. Treat
+                        // leftover buckets whose tables are already gone as cleared.
+                        MetadataStoreClient store = metadataStore();
+                        for (TableBucket bucket : buckets) {
+                            TablePath path = ctx.getTablePathById(bucket.getTableId());
+                            if (path != null && store.tableExist(path)) {
+                                return false;
+                            }
+                        }
+                        for (Long tableId : deleting) {
+                            TablePath path = ctx.getTablePathById(tableId);
+                            if (path != null && store.tableExist(path)) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    } catch (IllegalStateException | ConcurrentModificationException e) {
+                        // Event processor not ready, or coordinator mutating assignment maps
+                        // while we snapshot buckets — retry.
+                        return false;
+                    } catch (Exception e) {
+                        return false;
+                    }
+                },
+                Duration.ofMinutes(2),
+                "Fail to wait coordinator clear all table buckets after drop");
     }
 
     public void start() throws Exception {
@@ -211,6 +288,26 @@ public final class FlussClusterExtension
         Configuration conf = new Configuration();
         setRemoteDataDir(conf);
         setRemoteDataDirs(conf);
+
+        rpcClient =
+                RpcClient.create(
+                        conf,
+                        new ClientMetricGroup(
+                                MetricRegistry.create(conf, null), "fluss-cluster-extension"));
+
+        if (metadataBackend == MetadataBackend.RAFT) {
+            startCoordinatorServer();
+            MetadataStoreClient metaClient = coordinatorServer.getMetadataStoreClient();
+            metadataManager =
+                    new MetadataManager(
+                            metaClient,
+                            clusterConf,
+                            new LakeCatalogDynamicLoader(clusterConf, null, true));
+            startTabletServers();
+            waitUntilAllGatewayHasSameMetadata();
+            return;
+        }
+
         zooKeeperServer = ZooKeeperTestUtils.createAndStartZookeeperTestingServer();
         zooKeeperClient =
                 createZooKeeperClient(
@@ -220,12 +317,6 @@ public final class FlussClusterExtension
                         zooKeeperClient,
                         clusterConf,
                         new LakeCatalogDynamicLoader(clusterConf, null, true));
-
-        rpcClient =
-                RpcClient.create(
-                        conf,
-                        new ClientMetricGroup(
-                                MetricRegistry.create(conf, null), "fluss-cluster-extension"));
         startCoordinatorServer();
         startTabletServers();
         // wait coordinator knows all tablet servers to make cluster
@@ -259,6 +350,13 @@ public final class FlussClusterExtension
             FileUtils.deleteDirectoryQuietly(tempDir);
             tempDir = null;
         }
+        for (NetUtils.Port port : heldPorts) {
+            try {
+                port.close();
+            } catch (Exception ignored) {
+            }
+        }
+        heldPorts.clear();
     }
 
     /** Start a coordinator server. start a new one if no coordinator server exists. */
@@ -266,13 +364,26 @@ public final class FlussClusterExtension
         if (coordinatorServer == null) {
             // if no coordinator server exists, create a new coordinator server and start
             Configuration conf = new Configuration(clusterConf);
-            conf.setString(ConfigOptions.ZOOKEEPER_ADDRESS, zooKeeperServer.getConnectString());
             conf.setString(ConfigOptions.BIND_LISTENERS, coordinatorServerListeners);
             setRemoteDataDir(conf);
             setRemoteDataDirs(conf);
+            if (metadataBackend == MetadataBackend.RAFT) {
+                applyRaftCoordinatorConfig(conf);
+            } else {
+                conf.setString(ConfigOptions.ZOOKEEPER_ADDRESS, zooKeeperServer.getConnectString());
+            }
             coordinatorServer = new CoordinatorServer(conf, clock);
             coordinatorServer.start();
             waitUntilCoordinatorServerElected();
+            if (metadataBackend == MetadataBackend.RAFT) {
+                raftCoordinatorSeed = internalFlussSeed(coordinatorServer);
+                // afterEach cleanup uses this MetadataManager; refresh after coordinator recreate.
+                metadataManager =
+                        new MetadataManager(
+                                coordinatorServer.getMetadataStoreClient(),
+                                clusterConf,
+                                new LakeCatalogDynamicLoader(clusterConf, null, true));
+            }
             coordinatorServerInfo =
                     // TODO, Currently, we use 0 as coordinator server id.
                     new ServerInfo(
@@ -284,6 +395,14 @@ public final class FlussClusterExtension
             // start the existing coordinator server
             coordinatorServer.start();
             waitUntilCoordinatorServerElected();
+            if (metadataBackend == MetadataBackend.RAFT) {
+                raftCoordinatorSeed = internalFlussSeed(coordinatorServer);
+                metadataManager =
+                        new MetadataManager(
+                                coordinatorServer.getMetadataStoreClient(),
+                                clusterConf,
+                                new LakeCatalogDynamicLoader(clusterConf, null, true));
+            }
             coordinatorServerInfo =
                     new ServerInfo(
                             0,
@@ -293,7 +412,56 @@ public final class FlussClusterExtension
         }
     }
 
+    private void applyRaftCoordinatorConfig(Configuration conf) throws Exception {
+        if (raftPeerAddress == null) {
+            int raftPort = freePort();
+            raftPeerAddress = "127.0.0.1:" + raftPort;
+        }
+        conf.setString(ConfigOptions.COORDINATOR_SEED_NODES, raftPeerAddress);
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_VOTERS, raftPeerAddress);
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_NODE_ID, raftPeerAddress);
+        conf.setString(
+                ConfigOptions.COORDINATOR_RAFT_DIR, new File(tempDir, "raft").getAbsolutePath());
+        conf.set(ConfigOptions.COORDINATOR_RAFT_ELECTION_TIMEOUT, Duration.ofMillis(500));
+        conf.set(ConfigOptions.COORDINATOR_RAFT_FIRST_ELECTION_TIMEOUT, Duration.ofMillis(150));
+        conf.set(ConfigOptions.COORDINATOR_RAFT_HEARTBEAT_INTERVAL, Duration.ofMillis(150));
+        conf.set(ConfigOptions.COORDINATOR_TABLET_SERVER_SESSION_TIMEOUT, Duration.ofMillis(5_000));
+        conf.set(ConfigOptions.COORDINATOR_METADATA_STREAM_MAX_WAIT, Duration.ofMillis(100));
+    }
+
+    private String internalFlussSeed(CoordinatorServer coordinator) {
+        String listenerName = clusterConf.get(ConfigOptions.INTERNAL_LISTENER_NAME);
+        Endpoint internal =
+                coordinator.getRpcServer().getBindEndpoints().stream()
+                        .filter(e -> e.getListenerName().equals(listenerName))
+                        .findFirst()
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "No internal listener "
+                                                        + listenerName
+                                                        + " bound on coordinator"));
+        return internal.getHost() + ":" + internal.getPort();
+    }
+
+    private int freePort() throws Exception {
+        NetUtils.Port port = NetUtils.getAvailablePort();
+        heldPorts.add(port);
+        return port.getPort();
+    }
+
     public void stopCoordinatorServer() throws Exception {
+        if (coordinatorServer == null) {
+            return;
+        }
+        // Port-0 binds get a fresh random port on every recreate. Pin the listeners to the
+        // currently bound endpoints so a Raft restart keeps the same seed address tablet
+        // servers already hold in COORDINATOR_SEED_NODES / their metadata cache.
+        if (metadataBackend == MetadataBackend.RAFT && coordinatorServer.getRpcServer() != null) {
+            coordinatorServerListeners =
+                    Endpoint.toListenersString(coordinatorServer.getRpcServer().getBindEndpoints());
+            raftCoordinatorSeed = internalFlussSeed(coordinatorServer);
+        }
         coordinatorServer.close();
         coordinatorServer = null;
     }
@@ -334,10 +502,22 @@ public final class FlussClusterExtension
         tabletServerConf.set(ConfigOptions.TABLET_SERVER_ID, serverId);
         tabletServerConf.set(ConfigOptions.TABLET_SERVER_RACK, rackName);
         tabletServerConf.set(ConfigOptions.DATA_DIR, dataDir);
-        tabletServerConf.setString(
-                ConfigOptions.ZOOKEEPER_ADDRESS, zooKeeperServer.getConnectString());
         tabletServerConf.setString(ConfigOptions.BIND_LISTENERS, tabletServerListeners);
         tabletServerConf.setDouble(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 1.0);
+        if (metadataBackend == MetadataBackend.RAFT) {
+            checkArgument(
+                    raftCoordinatorSeed != null,
+                    "Raft coordinator seed must be set before starting tablet servers");
+            tabletServerConf.setString(ConfigOptions.COORDINATOR_SEED_NODES, raftCoordinatorSeed);
+            tabletServerConf.set(
+                    ConfigOptions.COORDINATOR_TABLET_SERVER_SESSION_TIMEOUT,
+                    Duration.ofMillis(5_000));
+            tabletServerConf.set(
+                    ConfigOptions.COORDINATOR_METADATA_STREAM_MAX_WAIT, Duration.ofMillis(100));
+        } else {
+            tabletServerConf.setString(
+                    ConfigOptions.ZOOKEEPER_ADDRESS, zooKeeperServer.getConnectString());
+        }
         if (overwriteConfig != null) {
             tabletServerConf.addAll(overwriteConfig);
         }
@@ -496,7 +676,30 @@ public final class FlussClusterExtension
     }
 
     public ZooKeeperClient getZooKeeperClient() {
+        checkArgument(
+                metadataBackend == MetadataBackend.ZOOKEEPER,
+                "getZooKeeperClient() is only available on the ZooKeeper metadata backend");
         return zooKeeperClient;
+    }
+
+    /**
+     * Backend-neutral metadata store used by wait helpers. Prefer this over {@link
+     * #getZooKeeperClient()} so extension waits work on Raft as well as ZooKeeper.
+     */
+    public MetadataStoreClient metadataStore() {
+        if (metadataBackend == MetadataBackend.ZOOKEEPER) {
+            return zooKeeperClient;
+        }
+        if (coordinatorServer == null) {
+            throw new IllegalStateException(
+                    "CoordinatorServer is not running; Raft metadataStore is unavailable until "
+                            + "startCoordinatorServer().");
+        }
+        return coordinatorServer.getMetadataStoreClient();
+    }
+
+    public MetadataBackend getMetadataBackend() {
+        return metadataBackend;
     }
 
     public RebalanceManager getRebalanceManager() {
@@ -568,7 +771,7 @@ public final class FlussClusterExtension
 
     /** Wait until all the table assignments buckets are ready for table. */
     public void waitUntilTableReady(long tableId) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         retry(
                 Duration.ofMinutes(1),
                 () -> {
@@ -614,7 +817,7 @@ public final class FlussClusterExtension
     }
 
     public void waitUntilTablePartitionReady(long tableId, long partitionId) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         retry(
                 Duration.ofMinutes(1),
                 () -> {
@@ -627,7 +830,7 @@ public final class FlussClusterExtension
     }
 
     private void waitReplicaInAssignmentReady(
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             TableAssignment tableAssignment,
             long tableId,
             Long partitionId)
@@ -648,7 +851,7 @@ public final class FlussClusterExtension
 
     /** Wait until the input replica is kicked out of isr. */
     public void waitUntilReplicaShrinkFromIsr(TableBucket tableBucket, int replicaId) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         retry(
                 Duration.ofMinutes(1),
                 () -> {
@@ -657,11 +860,29 @@ public final class FlussClusterExtension
                     List<Integer> isr = leaderAndIsrOpt.get().isr();
                     assertThat(isr.contains(replicaId)).isFalse();
                 });
+        // Metadata-store ISR shrink can race ahead of the leader applying NotifyLeaderAndIsr.
+        // Wait for the leader's in-memory ISR too so acks=-1 writes / HW advances are unblocked.
+        waitUntilLeaderReplicaIsrExcludes(tableBucket, replicaId);
+    }
+
+    /**
+     * Wait until the current leader replica's in-memory ISR no longer contains {@code replicaId}.
+     *
+     * <p>Needed after Raft/ZK ISR shrink: the metadata store can update before the leader applies
+     * {@code NotifyLeaderAndIsr}, during which HW stays stuck and acks=-1 writes fail.
+     */
+    public void waitUntilLeaderReplicaIsrExcludes(TableBucket tableBucket, int replicaId) {
+        retry(
+                Duration.ofMinutes(1),
+                () -> {
+                    Replica leaderReplica = waitAndGetLeaderReplica(tableBucket);
+                    assertThat(leaderReplica.getIsr()).doesNotContain(replicaId);
+                });
     }
 
     /** Wait until the input replica is expended into isr. */
     public void waitUntilReplicaExpandToIsr(TableBucket tableBucket, int replicaId) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         retry(
                 Duration.ofMinutes(1),
                 () -> {
@@ -674,7 +895,7 @@ public final class FlussClusterExtension
 
     /** Wait until all the replicas are ready if we have multi replica for one table bucket. */
     public void waitUntilAllReplicaReady(TableBucket tableBucket) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         retry(
                 Duration.ofMinutes(1),
                 () -> {
@@ -708,7 +929,7 @@ public final class FlussClusterExtension
      * have been copied to remote.
      */
     public void waitUntilSomeLogSegmentsCopyToRemote(TableBucket tableBucket) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         retry(
                 Duration.ofMinutes(2),
                 () -> {
@@ -719,7 +940,7 @@ public final class FlussClusterExtension
     }
 
     public void triggerAndWaitSnapshot(TablePath tablePath) throws Exception {
-        Optional<TableRegistration> table = zooKeeperClient.getTable(tablePath);
+        Optional<TableRegistration> table = metadataStore().getTable(tablePath);
         //noinspection SimplifyOptionalCallChains (Java 8 compatibility)
         if (!table.isPresent()) {
             throw new IllegalStateException("Table not found for table path " + tablePath);
@@ -736,7 +957,7 @@ public final class FlussClusterExtension
             }
         } else {
             Map<String, PartitionRegistration> partitions =
-                    zooKeeperClient.getPartitionRegistrations(tablePath);
+                    metadataStore().getPartitionRegistrations(tablePath);
             for (PartitionRegistration partition : partitions.values()) {
                 for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
                     tableBuckets.add(
@@ -753,24 +974,40 @@ public final class FlussClusterExtension
         Map<TableBucket, Long> snapshotMap = new HashMap<>();
         for (TableBucket tableBucket : tableBuckets) {
             Long snapshotId = triggerSnapshot(tableBucket);
+            if (snapshotId == null) {
+                // putKv / produce may complete before the KV flushed log offset advances, so
+                // the first trigger can be a no-op. Retry briefly; empty buckets (no keys
+                // hashed here) never snapshot and must not fail the wait.
+                long deadline = System.currentTimeMillis() + Duration.ofSeconds(10).toMillis();
+                while (snapshotId == null && System.currentTimeMillis() < deadline) {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    snapshotId = triggerSnapshot(tableBucket);
+                }
+            }
             if (snapshotId != null) {
                 snapshotMap.put(tableBucket, snapshotId);
             }
         }
-        // wait all snapshots finished
+        // wait all newly triggered snapshots finished
         for (Map.Entry<TableBucket, Long> entry : snapshotMap.entrySet()) {
             waitUntilSnapshotFinished(entry.getKey(), entry.getValue());
         }
     }
 
     public CompletedSnapshot triggerAndWaitSnapshot(TableBucket tableBucket) {
-        Long snapshotId = triggerSnapshot(tableBucket);
-        if (snapshotId != null) {
-            return waitUntilSnapshotFinished(tableBucket, snapshotId);
-        } else {
-            fail("No new snapshot triggered for table bucket " + tableBucket);
-            return null;
-        }
+        // putKv / produce may complete before the KV flushed log offset advances, so the first
+        // trigger can be a no-op. Retry until a new snapshot id is allocated.
+        Long snapshotId =
+                waitValue(
+                        () -> Optional.ofNullable(triggerSnapshot(tableBucket)),
+                        Duration.ofSeconds(30),
+                        "No new snapshot triggered for table bucket " + tableBucket);
+        return waitUntilSnapshotFinished(tableBucket, snapshotId);
     }
 
     private Long triggerSnapshot(TableBucket tableBucket) {
@@ -799,7 +1036,7 @@ public final class FlussClusterExtension
     }
 
     public CompletedSnapshot waitUntilSnapshotFinished(TableBucket tableBucket, long snapshotId) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         return waitValue(
                 () -> {
                     Optional<BucketSnapshot> optSnapshot =
@@ -816,7 +1053,7 @@ public final class FlussClusterExtension
     }
 
     public Replica waitAndGetLeaderReplica(TableBucket tableBucket) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         return waitValue(
                 () -> {
                     Optional<LeaderAndIsr> leaderAndIsrOpt = zkClient.getLeaderAndIsr(tableBucket);
@@ -838,6 +1075,14 @@ public final class FlussClusterExtension
                 "Fail to wait " + replica + " ready");
     }
 
+    /**
+     * Current coordinator epoch. On ZooKeeper this starts at {@code 0}; on Raft it is the Raft term
+     * (typically {@code >= 1}).
+     */
+    public int getCoordinatorEpoch() {
+        return coordinatorServer.getCoordinatorService().getCoordinatorEpoch();
+    }
+
     public void stopReplica(int tabletServerId, TableBucket tableBucket, int leaderEpoch)
             throws Exception {
         TabletServerGateway followerGateway = newTabletServerClientForNode(tabletServerId);
@@ -845,7 +1090,7 @@ public final class FlussClusterExtension
         followerGateway
                 .stopReplica(
                         new StopReplicaRequest()
-                                .setCoordinatorEpoch(0)
+                                .setCoordinatorEpoch(getCoordinatorEpoch())
                                 .addAllStopReplicasReqs(
                                         Collections.singleton(
                                                 makeStopBucketReplica(
@@ -869,7 +1114,7 @@ public final class FlussClusterExtension
                                 leaderAndIsr));
         NotifyLeaderAndIsrRequest notifyLeaderAndIsrRequest =
                 ServerRpcMessageUtils.makeNotifyLeaderAndIsrRequest(
-                        0, Collections.singletonList(reqForBucket));
+                        getCoordinatorEpoch(), Collections.singletonList(reqForBucket));
         followerGateway.notifyLeaderAndIsr(notifyLeaderAndIsrRequest);
     }
 
@@ -910,7 +1155,7 @@ public final class FlussClusterExtension
         return waitValue(
                 () -> {
                     Map<String, PartitionRegistration> partitions =
-                            zooKeeperClient.getPartitionRegistrations(tablePath);
+                            metadataStore().getPartitionRegistrations(tablePath);
                     Map<String, Long> partitionIdAndNames =
                             partitions.entrySet().stream()
                                     .collect(
@@ -931,7 +1176,7 @@ public final class FlussClusterExtension
         waitUntil(
                 () -> {
                     Map<String, PartitionRegistration> partitions =
-                            zooKeeperClient.getPartitionRegistrations(tablePath);
+                            metadataStore().getPartitionRegistrations(tablePath);
                     for (String droppedPartition : droppedPartitions) {
                         if (partitions.containsKey(droppedPartition)) {
                             return false;
@@ -966,7 +1211,7 @@ public final class FlussClusterExtension
     }
 
     public LeaderAndIsr waitLeaderAndIsrReady(TableBucket tb) {
-        ZooKeeperClient zkClient = getZooKeeperClient();
+        MetadataStoreClient zkClient = metadataStore();
         return waitValue(
                 () -> zkClient.getLeaderAndIsr(tb), Duration.ofMinutes(1), "leader is not ready");
     }
@@ -987,6 +1232,33 @@ public final class FlussClusterExtension
     }
 
     private void waitUntilCoordinatorServerElected() {
+        if (metadataBackend == MetadataBackend.RAFT) {
+            waitUntil(
+                    () -> {
+                        try {
+                            MetadataStoreClient meta = coordinatorServer.getMetadataStoreClient();
+                            // isLeader() flips true as soon as Raft elects; initCoordinatorLeader
+                            // (event processor + RPC leadership) finishes later. Wait for both so
+                            // metadata RPCs do not hit "CoordinatorEventProcessor is not
+                            // initialized yet".
+                            try {
+                                coordinatorServer.getCoordinatorEventProcessor();
+                            } catch (IllegalStateException e) {
+                                return false;
+                            }
+                            return coordinatorServer.isLeader()
+                                    && meta != null
+                                    && meta.getCoordinatorLeaderAddress().isPresent()
+                                    && meta.listDatabases()
+                                            .contains(CoordinatorServer.DEFAULT_DATABASE);
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    },
+                    Duration.ofSeconds(60),
+                    "Fail to wait Raft coordinator server elected");
+            return;
+        }
         waitUntil(
                 () -> zooKeeperClient.getCoordinatorLeaderAddress().isPresent(),
                 Duration.ofSeconds(10),
@@ -1009,6 +1281,7 @@ public final class FlussClusterExtension
         private Clock clock = SystemClock.getInstance();
         private String[] racks = new String[] {"rack-0"};
         private List<String> remoteDirNames = Collections.emptyList();
+        private MetadataBackend metadataBackend = MetadataBackend.RAFT;
 
         private final Configuration clusterConf = new Configuration();
 
@@ -1025,12 +1298,22 @@ public final class FlussClusterExtension
                     ConfigOptions.COORDINATOR_LIFECYCLE_THROTTLER_TIMEOUT_CHECK_INTERVAL,
                     Duration.ofSeconds(1));
             // Set a high data disk write limit ratio to avoid disk write limit when testing
-            clusterConf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 0.99);
+            clusterConf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 1.0);
         }
 
         /** Sets the number of tablet servers. */
         public Builder setNumOfTabletServers(int numOfTabletServers) {
             this.numOfTabletServers = numOfTabletServers;
+            return this;
+        }
+
+        /**
+         * Selects the metadata/coordination backend for the cluster. Defaults to {@link
+         * MetadataBackend#RAFT}. Tests that call {@link #getZooKeeperClient()} must set {@link
+         * MetadataBackend#ZOOKEEPER} explicitly.
+         */
+        public Builder setMetadataBackend(MetadataBackend metadataBackend) {
+            this.metadataBackend = metadataBackend;
             return this;
         }
 
@@ -1085,7 +1368,8 @@ public final class FlussClusterExtension
                     clusterConf,
                     clock,
                     racks,
-                    remoteDirNames);
+                    remoteDirNames,
+                    metadataBackend);
         }
     }
 }

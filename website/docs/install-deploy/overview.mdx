@@ -85,18 +85,23 @@ We have listed them in the table below the figure.
             </td>
         </tr>
             <tr>
-                <td>ZooKeeper</td>
+                <td>Metadata / coordination</td>
                     <td>
-                        :::warning
-                        ZooKeeper will be removed to simplify deployment in the near future. For more details, please checkout [Roadmap](/roadmap/).
-                        :::
                         <p>
-                        Fluss leverages ZooKeeper for distributed coordination between all running CoordinatorServer instances and for metadata management.
+                        Fluss stores cluster metadata and coordinates servers with an
+                        <b>embedded Raft</b> quorum by default (no external ZooKeeper required).
+                        See <a href="install-deploy/deploying-with-raft.md">Deploying with Raft</a>.
                         </p>
+                        :::warning
+                        ZooKeeper mode is <b>deprecated</b> but still supported for migration.
+                        It will be removed in a future major release. Migrate with
+                        <a href="install-deploy/migrate-zk-to-raft.md">Migrate from ZooKeeper to Raft</a>.
+                        :::
                     </td>
                     <td>
                         <ul>
-                            <li><a href="https://zookeeper.apache.org/">ZooKeeper</a></li>
+                            <li><a href="install-deploy/deploying-with-raft.md">Raft (default)</a></li>
+                            <li><a href="https://zookeeper.apache.org/">ZooKeeper (deprecated)</a></li>
                         </ul>
                     </td>
                 </tr>
@@ -142,10 +147,13 @@ We have listed them in the table below the figure.
 
 ## How to deploy Fluss
 
-Fluss can be deployed in three different ways:
+Fluss can be deployed in several ways:
+- [Deploying with Raft (default)](install-deploy/deploying-with-raft.md)
 - [Local Cluster](install-deploy/deploying-local-cluster.md)
 - [Distributed Cluster](install-deploy/deploying-distributed-cluster.md)
 - [Docker run / Docker Compose](install-deploy/deploying-with-docker.md)
+- [Migrate from ZooKeeper to Raft](install-deploy/migrate-zk-to-raft.md)
 
 **NOTE**:
 - Local Cluster is for testing purpose only.
+- Raft is the default metadata backend; ZooKeeper is deprecated.

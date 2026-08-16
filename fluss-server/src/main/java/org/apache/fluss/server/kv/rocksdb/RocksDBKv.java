@@ -245,6 +245,24 @@ public class RocksDBKv implements AutoCloseable {
         return pkList;
     }
 
+    /** Exact key count via full RocksDB iteration (used only during KV recovery). */
+    public long countKeys() {
+        ReadOptions readOptions = new ReadOptions();
+        RocksIterator iterator = db.newIterator(defaultColumnFamilyHandle, readOptions);
+        long count = 0L;
+        try {
+            iterator.seekToFirst();
+            while (iterator.isValid()) {
+                count++;
+                iterator.next();
+            }
+        } finally {
+            readOptions.close();
+            iterator.close();
+        }
+        return count;
+    }
+
     public void put(byte[] key, byte[] value) throws IOException {
         try {
             db.put(writeOptions, key, value);

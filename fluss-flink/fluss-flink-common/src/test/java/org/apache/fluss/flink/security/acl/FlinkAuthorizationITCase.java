@@ -300,7 +300,7 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
                     String.format(
                             "alter table %s add partition (dt='2022-01-01');",
                             tablePath.getTableName()));
-            waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath, 1);
+            waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath, 1);
             dropAcl(Resource.database(tablePath.getDatabaseName()), WRITE);
         }
 

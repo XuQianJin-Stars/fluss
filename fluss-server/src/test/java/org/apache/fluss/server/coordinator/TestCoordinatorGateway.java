@@ -24,10 +24,14 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.AddRaftVoterRequest;
+import org.apache.fluss.rpc.messages.AddRaftVoterResponse;
 import org.apache.fluss.rpc.messages.AddServerTagRequest;
 import org.apache.fluss.rpc.messages.AddServerTagResponse;
 import org.apache.fluss.rpc.messages.AdjustIsrRequest;
 import org.apache.fluss.rpc.messages.AdjustIsrResponse;
+import org.apache.fluss.rpc.messages.AllocateIdRequest;
+import org.apache.fluss.rpc.messages.AllocateIdResponse;
 import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.AlterClusterConfigsResponse;
 import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
@@ -70,8 +74,14 @@ import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.DropPartitionResponse;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.FetchMetadataRequest;
+import org.apache.fluss.rpc.messages.FetchMetadataResponse;
+import org.apache.fluss.rpc.messages.FetchMetadataSnapshotRequest;
+import org.apache.fluss.rpc.messages.FetchMetadataSnapshotResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusRequest;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusResponse;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenRequest;
@@ -112,12 +122,18 @@ import org.apache.fluss.rpc.messages.RebalanceRequest;
 import org.apache.fluss.rpc.messages.RebalanceResponse;
 import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.RegisterProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.RegisterTabletServerRequest;
+import org.apache.fluss.rpc.messages.RegisterTabletServerResponse;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.RemoveRaftVoterRequest;
+import org.apache.fluss.rpc.messages.RemoveRaftVoterResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
 import org.apache.fluss.rpc.messages.TableExistsRequest;
 import org.apache.fluss.rpc.messages.TableExistsResponse;
+import org.apache.fluss.rpc.messages.TabletServerHeartbeatRequest;
+import org.apache.fluss.rpc.messages.TabletServerHeartbeatResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.server.entity.AdjustIsrResultForBucket;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
@@ -192,6 +208,34 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
 
     @Override
     public CompletableFuture<DropTableResponse> dropTable(DropTableRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<FetchMetadataResponse> fetchMetadata(FetchMetadataRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<FetchMetadataSnapshotResponse> fetchMetadataSnapshot(
+            FetchMetadataSnapshotRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<RegisterTabletServerResponse> registerTabletServer(
+            RegisterTabletServerRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<TabletServerHeartbeatResponse> tabletServerHeartbeat(
+            TabletServerHeartbeatRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<AllocateIdResponse> allocateId(AllocateIdRequest request) {
         throw new UnsupportedOperationException();
     }
 
@@ -482,6 +526,23 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
     @Override
     public CompletableFuture<GetClusterHealthResponse> getClusterHealth(
             GetClusterHealthRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<GetCoordinatorRaftStatusResponse> getCoordinatorRaftStatus(
+            GetCoordinatorRaftStatusRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<AddRaftVoterResponse> addRaftVoter(AddRaftVoterRequest request) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CompletableFuture<RemoveRaftVoterResponse> removeRaftVoter(
+            RemoveRaftVoterRequest request) {
         throw new UnsupportedOperationException();
     }
 

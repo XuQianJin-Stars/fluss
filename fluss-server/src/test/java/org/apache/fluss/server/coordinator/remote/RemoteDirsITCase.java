@@ -24,9 +24,9 @@ import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.testutils.RpcMessageTestUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.types.DataTypes;
@@ -84,7 +84,7 @@ class RemoteDirsITCase {
                     .setRemoteDirNames(REMOTE_DIR_NAMES)
                     .build();
 
-    private ZooKeeperClient zkClient;
+    private MetadataStoreClient zkClient;
 
     private static Configuration initConfig() {
         Configuration conf = new Configuration();
@@ -96,7 +96,7 @@ class RemoteDirsITCase {
 
     @BeforeEach
     void setup() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
     }
 
     @ParameterizedTest

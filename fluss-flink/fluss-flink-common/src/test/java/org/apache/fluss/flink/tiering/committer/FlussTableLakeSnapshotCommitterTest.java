@@ -26,11 +26,7 @@ import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
-import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
-import org.apache.fluss.server.zk.data.lake.LakeTableSnapshotLegacyJsonSerde;
-import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.AfterEach;
@@ -201,12 +197,16 @@ class FlussTableLakeSnapshotCommitterTest extends FlinkTestBase {
                 .commitLakeTableSnapshot(commitLakeTableSnapshotRequest)
                 .get();
 
-        // make sure it can be deserialized with v1
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        byte[] jsonBytes = zkClient.getOrEmpty(ZkData.LakeTableZNode.path(tableId)).get();
-
+        // Verify the committed snapshot is readable via the backend-neutral metadata store
+        // (Raft or ZK). This asserts the old committer request path still persists correctly.
         LakeTableSnapshot lakeTableSnapshot =
-                JsonSerdeUtils.readValue(jsonBytes, LakeTableSnapshotLegacyJsonSerde.INSTANCE);
+                FLUSS_CLUSTER_EXTENSION
+                        .metadataStore()
+                        .getLakeTableSnapshot(tableId, snapshotId)
+                        .orElseThrow(
+                                () ->
+                                        new AssertionError(
+                                                "lake table snapshot not found after legacy commit"));
         assertThat(lakeTableSnapshot.getSnapshotId()).isEqualTo(snapshotId);
         assertThat(lakeTableSnapshot.getBucketLogEndOffset()).isEqualTo(logEndOffsets);
     }

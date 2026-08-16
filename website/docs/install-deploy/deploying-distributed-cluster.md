@@ -22,9 +22,15 @@ Before you start to set up the system, make sure you have installed **Java 11** 
 Java 8 is not supported as the released binary is compiled with Java 11.
 While Fluss can run on Java 11, **Java 17 or higher is strongly recommended** for better performance.
 
-Additionally, you need a running **ZooKeeper** cluster with version 3.6.0 or higher. 
-We do not recommend to use ZooKeeper versions below 3.6.0.
-For further information how to deploy a distributed ZooKeeper cluster, see [Running Replicated ZooKeeper](https://zookeeper.apache.org/doc/r3.6.0/zookeeperStarted.html#sc_RunningReplicatedZooKeeper).
+**Metadata backend (default: Raft).** Prefer the embedded Raft quorum — no external ZooKeeper is
+required. See [Deploying with Raft](install-deploy/deploying-with-raft.md). Configure
+`coordinator.seed.nodes` / `coordinator.raft.voters` and omit `zookeeper.address`.
+
+:::warning
+ZooKeeper is **deprecated**. If you must keep a ZooKeeper-backed cluster temporarily, use ZooKeeper
+3.6.0 or higher and plan migration with
+[Migrate from ZooKeeper to Raft](install-deploy/migrate-zk-to-raft.md).
+:::
 
 If your cluster does not fulfill these software requirements, you will need to install/upgrade them.
 
@@ -45,7 +51,12 @@ Node0 will deploy a CoordinatorServer instance. Node1, Node2 and Node3 will depl
 
 ### Preparation
 
-1. Make sure ZooKeeper has been deployed. We assume that ZooKeeper listens on `192.168.10.199:2181`.
+1. Decide the metadata backend. **Recommended:** Raft (no ZooKeeper). For Raft, pick an odd number
+   of coordinator hosts and empty `coordinator.raft.dir` paths, then run
+   `./bin/fluss raft bootstrap --config conf` once per voter before start.
+   **Legacy:** If you still use ZooKeeper, deploy it first (example below assumes
+   `192.168.10.199:2181`). Prefer migrating soon —
+   [Migrate from ZooKeeper to Raft](install-deploy/migrate-zk-to-raft.md).
 
 2. Download Fluss
 
@@ -63,7 +74,25 @@ After having extracted the archived files, you need to configure Fluss for a dis
 We will use the _default config file_ (`conf/server.yaml`) to configure Fluss.
 Adapt the `server.yaml` on each node as follows.
 
-**Node0**
+**Node0 (Raft — recommended)**
+
+```yaml title="server.yaml"
+# coordinator server
+bind.listeners: FLUSS://192.168.10.100:9123
+advertised.listeners: FLUSS://192.168.10.100:9123
+
+coordinator.seed.nodes: 192.168.10.100:9123
+coordinator.raft.voters: 192.168.10.100:9124
+coordinator.raft.node.id: 192.168.10.100:9124
+coordinator.raft.dir: /data/fluss/raft
+
+# When running in distributed mode, be sure to point to a remote path—
+# e.g. oss://bucket/path for OSS or hdfs://namenode:port/path for HDFS.
+# Otherwise, queries will fail with a “No such file or directory” error.
+remote.data.dir: hdfs://namenode:port/tmp/fluss-remote-data
+```
+
+**Node0 (ZooKeeper — deprecated)**
 
 ```yaml title="server.yaml"
 # coordinator server
@@ -78,56 +107,38 @@ zookeeper.path.root: /fluss
 remote.data.dir: hdfs://namenode:port/tmp/fluss-remote-data
 ```
 
-**Node1**
+**Node1 / Node2 / Node3 (Raft tablets — recommended)**
+
+Use the same pattern on each tablet host (change `tablet-server.id` and bind address):
 
 ```yaml title="server.yaml"
 # tablet server
-bind.listeners: FLUSS://192.168.10.101:9123 # alternatively, setting the port to 0 assigns a random port
+bind.listeners: FLUSS://192.168.10.101:9123 # change host per node
+advertised.listeners: FLUSS://192.168.10.101:9123
+tablet-server.id: 1
+
+coordinator.seed.nodes: 192.168.10.100:9123
+
+remote.data.dir: hdfs://namenode:port/tmp/fluss-remote-data
+```
+
+**Node1 / Node2 / Node3 (ZooKeeper tablets — deprecated)**
+
+```yaml title="server.yaml"
+# tablet server
+bind.listeners: FLUSS://192.168.10.101:9123
 tablet-server.id: 1
 
 zookeeper.address: 192.168.10.199:2181
 zookeeper.path.root: /fluss
 
-# When running in distributed mode, be sure to point to a remote path—
-# e.g. oss://bucket/path for OSS or hdfs://namenode:port/path for HDFS.
-# Otherwise, queries will fail with a “No such file or directory” error.
-remote.data.dir: hdfs://namenode:port/tmp/fluss-remote-data
-```
-
-**Node2**
-
-```yaml title="server.yaml"
-# tablet server
-bind.listeners: FLUSS://192.168.10.102:9123 # alternatively, setting the port to 0 assigns a random port
-tablet-server.id: 2
-
-zookeeper.address: 192.168.10.199:2181
-zookeeper.path.root: /fluss
-
-# When running in distributed mode, be sure to point to a remote path—
-# e.g. oss://bucket/path for OSS or hdfs://namenode:port/path for HDFS.
-# Otherwise, queries will fail with a “No such file or directory” error.
-remote.data.dir: hdfs://namenode:port/tmp/fluss-remote-data
-```
-
-**Node3**
-```yaml title="server.yaml"
-# tablet server
-bind.listeners: FLUSS://192.168.10.103:9123 # alternatively, setting the port to 0 assigns a random port
-tablet-server.id: 3
-
-zookeeper.address: 192.168.10.199:2181
-zookeeper.path.root: /fluss
-
-# When running in distributed mode, be sure to point to a remote path—
-# e.g. oss://bucket/path for OSS or hdfs://namenode:port/path for HDFS.
-# Otherwise, queries will fail with a “No such file or directory” error.
 remote.data.dir: hdfs://namenode:port/tmp/fluss-remote-data
 ```
 
 :::note
 - `tablet-server.id` is the unique id of the TabletServer. If you have multiple TabletServers, you should set a different id for each TabletServer.
 - In this example, we only set the mandatory properties. For additional properties, you can refer to [Configuration](maintenance/configuration.md) for more details.
+- For Raft, run `./bin/fluss raft bootstrap --config conf` on the coordinator before the first start.
   :::
 
 ### Starting Fluss

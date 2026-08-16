@@ -36,12 +36,17 @@ import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.rpc.messages.AllocateIdRequest;
+import org.apache.fluss.rpc.messages.AllocateIdResponse;
 import org.apache.fluss.server.TabletManagerBase;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
+import org.apache.fluss.server.kv.autoinc.RaftSequenceGeneratorFactory;
+import org.apache.fluss.server.kv.autoinc.SequenceGeneratorFactory;
 import org.apache.fluss.server.kv.autoinc.ZkSequenceGeneratorFactory;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -67,7 +72,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
@@ -118,7 +125,16 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
     private final TabletServerMetricGroup serverMetricGroup;
 
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
+
+    /**
+     * Raft-backend transport for reserving kv auto-increment column id ranges from the coordinator
+     * leader via the {@code AllocateId} RPC. {@code null} on the ZooKeeper backend (per-column
+     * {@code ZkSequenceIDCounter} znode is used instead).
+     */
+    @Nullable
+    private final Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+            allocateIdTransport;
 
     private final Map<TableBucket, KvTablet> currentKvs = new ConcurrentHashMap<>();
 
@@ -150,10 +166,13 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     private KvManager(
             LocalDiskManager localDiskManager,
             Configuration conf,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             int recoveryThreadsPerDataDir,
             LogManager logManager,
             TabletServerMetricGroup tabletServerMetricGroup,
+            @Nullable
+                    Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+                            allocateIdTransport,
             @Nullable KvFlushScheduler kvFlushScheduler)
             throws IOException {
         super(TabletType.KV, localDiskManager.dataDirs(), conf, recoveryThreadsPerDataDir);
@@ -162,6 +181,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         this.arrowBufferAllocator = BufferAllocatorUtil.createBufferAllocator(null);
         this.memorySegmentPool = LazyMemorySegmentPool.createServerBufferPool(conf);
         this.zkClient = zkClient;
+        this.allocateIdTransport = allocateIdTransport;
         this.remoteKvDir = FlussPaths.remoteKvDir(conf);
         this.remoteFileSystem = remoteKvDir.getFileSystem();
         this.serverMetricGroup = tabletServerMetricGroup;
@@ -192,12 +212,45 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
     public static KvManager create(
             Configuration conf,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             LogManager logManager,
             TabletServerMetricGroup tabletServerMetricGroup,
             LocalDiskManager localDiskManager)
             throws IOException {
-        return create(conf, zkClient, logManager, tabletServerMetricGroup, localDiskManager, null);
+        return new KvManager(
+                localDiskManager,
+                conf,
+                zkClient,
+                conf.getInt(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS),
+                logManager,
+                tabletServerMetricGroup,
+                null,
+                null);
+    }
+
+    /**
+     * Creates a KvManager with a Raft AllocateId transport for auto-increment column id ranges.
+     * Pass {@code null} on the ZooKeeper backend.
+     */
+    public static KvManager create(
+            Configuration conf,
+            MetadataStoreClient zkClient,
+            LogManager logManager,
+            TabletServerMetricGroup tabletServerMetricGroup,
+            LocalDiskManager localDiskManager,
+            @Nullable
+                    Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+                            allocateIdTransport)
+            throws IOException {
+        return new KvManager(
+                localDiskManager,
+                conf,
+                zkClient,
+                conf.getInt(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS),
+                logManager,
+                tabletServerMetricGroup,
+                allocateIdTransport,
+                null);
     }
 
     /**
@@ -208,7 +261,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     @VisibleForTesting
     public static KvManager create(
             Configuration conf,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             LogManager logManager,
             TabletServerMetricGroup tabletServerMetricGroup,
             LocalDiskManager localDiskManager,
@@ -221,11 +274,33 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                 conf.getInt(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS),
                 logManager,
                 tabletServerMetricGroup,
+                null,
                 kvFlushScheduler);
     }
 
     public void startup() {
         // should do nothing now
+    }
+
+    /**
+     * Builds the backend-specific {@link SequenceGeneratorFactory} for kv auto-increment columns.
+     *
+     * <p>On the ZooKeeper backend this is the per-column {@link ZkSequenceGeneratorFactory}. On the
+     * Raft backend a TabletServer is not a Raft voter and holds no leader-capable metadata client,
+     * so id allocation is routed to the coordinator leader via the {@code AllocateId} RPC ({@link
+     * RaftSequenceGeneratorFactory} over the injected transport, §5.3). If neither is available the
+     * Raft path fails fast rather than silently misbehaving.
+     */
+    private SequenceGeneratorFactory createSequenceGeneratorFactory() {
+        if (zkClient instanceof ZooKeeperClient) {
+            return new ZkSequenceGeneratorFactory((ZooKeeperClient) zkClient);
+        }
+        if (allocateIdTransport != null) {
+            return new RaftSequenceGeneratorFactory(allocateIdTransport);
+        }
+        throw new UnsupportedOperationException(
+                "The Raft metadata backend requires an AllocateId transport for TabletServer-side "
+                        + "kv auto-increment id allocation (see zookeeper-removal-design.md §5.3).");
     }
 
     public void shutdown() {
@@ -300,7 +375,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     schemaGetter,
                                     tablePath.getTablePath(),
                                     tableConfig,
-                                    new ZkSequenceGeneratorFactory(zkClient));
+                                    createSequenceGeneratorFactory());
 
                     KvTablet tablet =
                             KvTablet.create(
@@ -420,10 +495,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                 RowMerger.create(tableConfig, tableConfig.getKvFormat(), schemaGetter);
         AutoIncrementManager autoIncrementManager =
                 new AutoIncrementManager(
-                        schemaGetter,
-                        tablePath,
-                        tableConfig,
-                        new ZkSequenceGeneratorFactory(zkClient));
+                        schemaGetter, tablePath, tableConfig, createSequenceGeneratorFactory());
         KvTablet kvTablet =
                 KvTablet.create(
                         physicalTablePath,

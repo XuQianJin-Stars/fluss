@@ -30,8 +30,8 @@ import org.apache.fluss.server.kv.snapshot.CompletedSnapshotStore;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotStore.SnapshotInUseChecker;
 import org.apache.fluss.server.kv.snapshot.SharedKvFileRegistry;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metrics.group.CoordinatorMetricGroup;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,11 +63,11 @@ public class CompletedSnapshotStoreManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(CompletedSnapshotStoreManager.class);
     private final int maxNumberOfSnapshotsToRetain;
-    private final ZooKeeperClient zooKeeperClient;
+    private final MetadataStoreClient zooKeeperClient;
     private final ConcurrentHashMap<TableBucket, CompletedSnapshotStore>
             bucketCompletedSnapshotStores;
     private final Executor ioExecutor;
-    private final Function<ZooKeeperClient, CompletedSnapshotHandleStore>
+    private final Function<MetadataStoreClient, CompletedSnapshotHandleStore>
             makeZookeeperCompletedSnapshotHandleStore;
     private final SnapshotInUseChecker snapshotInUseChecker;
     private final CoordinatorMetricGroup coordinatorMetricGroup;
@@ -75,7 +75,7 @@ public class CompletedSnapshotStoreManager {
     public CompletedSnapshotStoreManager(
             int maxNumberOfSnapshotsToRetain,
             Executor ioExecutor,
-            ZooKeeperClient zooKeeperClient,
+            MetadataStoreClient zooKeeperClient,
             CoordinatorMetricGroup coordinatorMetricGroup,
             SnapshotInUseChecker snapshotInUseChecker) {
         this(
@@ -91,8 +91,8 @@ public class CompletedSnapshotStoreManager {
     CompletedSnapshotStoreManager(
             int maxNumberOfSnapshotsToRetain,
             Executor ioExecutor,
-            ZooKeeperClient zooKeeperClient,
-            Function<ZooKeeperClient, CompletedSnapshotHandleStore>
+            MetadataStoreClient zooKeeperClient,
+            Function<MetadataStoreClient, CompletedSnapshotHandleStore>
                     makeZookeeperCompletedSnapshotHandleStore,
             CoordinatorMetricGroup coordinatorMetricGroup,
             SnapshotInUseChecker snapshotInUseChecker) {

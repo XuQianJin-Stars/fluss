@@ -117,6 +117,27 @@ The logging-related environment options (`env.log.dir`, `env.log.level`, `env.lo
 | zookeeper.client.config-path                    | String   | (None)  | The file path from which the ZooKeeper client reads its configuration. This allows each ZooKeeper client instance to load its own configuration file, instead of relying on shared JVM-level environment settings. This enables fine-grained control over ZooKeeper client behavior.                                                                                                                                                                                                                                            |
 | zookeeper.client.max-inflight-requests          | String   | 100     | The maximum number of unacknowledged requests the client will send to ZooKeeper before blocking.                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
+## Coordinator Raft (default metadata backend)
+
+Raft is the default when neither `zookeeper.address` nor `coordinator.seed.nodes`
+is set. Prefer setting the Raft keys explicitly. ZooKeeper remains available by
+setting `zookeeper.address` and omitting seed nodes (setting both is rejected).
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| coordinator.seed.nodes | String | (None) | Comma-separated coordinator `host:port` seed list for TabletServers and clients. |
+| coordinator.raft.voters | String | (None) | Static voter set (`host:port`) forming the coordinator Raft quorum. |
+| coordinator.raft.node.id | String | (None) | This node's Raft peer id; defaults to the coordinator server id / local voter address. |
+| coordinator.raft.port | Integer | 9124 | Dedicated Raft transport port (separate from client RPC). |
+| coordinator.raft.dir | String | (None) | Local directory for the Raft log and metadata KvStore. |
+| coordinator.gossip.enabled | Boolean | false | Optional SWIM-style TCP gossip to expand a partial `coordinator.seed.nodes` list. Does not replace Raft voters. |
+| coordinator.gossip.port | Integer | 9125 | TCP port for gossip membership exchange. Seeds are contacted at `seed-host:coordinator.gossip.port`. |
+| coordinator.gossip.interval | Duration | 1s | How often a coordinator runs one gossip push-pull round. |
+| coordinator.gossip.failure-timeout | Duration | 10s | Drop a gossip member that has not been refreshed within this timeout. |
+
+Use `./bin/fluss raft bootstrap|status|leader` for lifecycle and observability.
+`raft status --watch [--interval ms]` polls until interrupted (default 2s).
+
 ## Netty
 
 | Option                           | Type       | Default | Description                                                                                                                                                                                                   |

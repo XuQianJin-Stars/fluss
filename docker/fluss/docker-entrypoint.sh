@@ -19,6 +19,10 @@
 
 CONF_FILE="${FLUSS_HOME}/conf/server.yaml"
 
+# Dual-support: FLUSS_PROPERTIES may set either zookeeper.address (default) or
+# coordinator.seed.nodes + coordinator.raft.* for the Raft metadata backend.
+# Do not set both; MetadataBackend.from(Configuration) rejects the combination.
+
 prepare_configuration() {
     # backward compatability: allow to use old [coordinator|tablet-server].host option in FLUSS_PROPERTIES
     sed -i '/bind.listeners:/d' "${CONF_FILE}"

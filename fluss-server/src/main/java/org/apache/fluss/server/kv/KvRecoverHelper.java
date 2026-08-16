@@ -38,7 +38,7 @@ import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogTablet;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.RowType;
@@ -115,10 +115,9 @@ public class KvRecoverHelper {
         Schema schema = schemaGetter.getLatestSchemaInfo().getSchema();
 
         long nextLogOffset = recoverPointOffset;
-        RowCountUpdater rowCountUpdater =
-                recoverPointRowCount != null
-                        ? new RowCountUpdaterImpl(recoverPointRowCount)
-                        : new NoOpRowCountUpdater();
+        // Row count is rebuilt from RocksDB after HW apply (snapshot row_count is optional and can
+        // be missing after upgrade / metadata quirks). Log replay still needs a no-op updater.
+        RowCountUpdater rowCountUpdater = new NoOpRowCountUpdater();
         AutoIncIDRangeUpdater autoIncIdRangeUpdater =
                 autoIncRange != null
                         ? new AutoIncIDRangeUpdaterImpl(
@@ -152,14 +151,17 @@ public class KvRecoverHelper {
 
         // the all data up to nextLogOffset has been flush into kv
         kvTablet.setFlushedLogOffset(nextLogOffset);
-        // if we have valid row count (means this table supports row count),
-        // update the row count in kv tablet
-        if (recoverPointRowCount != null) {
-            kvTablet.setRowCount(rowCountUpdater.getRowCount());
+        if (kvTablet.isRowCountEnabled()) {
+            // Always rebuild from RocksDB after materializing HW data. Prefer this over the
+            // optional snapshot row_count field so GetTableStats stays correct across failover.
+            long counted = kvTablet.countKeysInRocksDb();
+            kvTablet.setRowCount(counted);
             LOG.info(
-                    "Updated row count to {} for tablet '{}' after recovering from log",
-                    rowCountUpdater.getRowCount(),
-                    kvTablet.getTableBucket());
+                    "Set row count to {} from RocksDB for tablet '{}' after recovering from log"
+                            + " (recoverPointRowCount={})",
+                    counted,
+                    kvTablet.getTableBucket(),
+                    recoverPointRowCount);
         } else {
             LOG.info(
                     "Skipping row count update after recovering from log, because this table '{}' doesn't support row count.",
@@ -358,11 +360,11 @@ public class KvRecoverHelper {
 
         private final TablePath tablePath;
 
-        private final ZooKeeperClient zkClient;
+        private final MetadataStoreClient zkClient;
         private final int maxFetchLogSizeInRecoverKv;
 
         public KvRecoverContext(
-                TablePath tablePath, ZooKeeperClient zkClient, int maxFetchLogSizeInRecoverKv) {
+                TablePath tablePath, MetadataStoreClient zkClient, int maxFetchLogSizeInRecoverKv) {
             this.tablePath = tablePath;
             this.zkClient = zkClient;
             this.maxFetchLogSizeInRecoverKv = maxFetchLogSizeInRecoverKv;

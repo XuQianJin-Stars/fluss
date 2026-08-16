@@ -508,7 +508,9 @@ class ReplicaManagerTest extends ReplicaTestBase {
         TableBucket tb = new TableBucket(DATA1_TABLE_ID, 1);
         makeLogTableAsLeader(tb.getBucket());
 
-        // simulate disk usage breaching the write-limit ratio (default 0.85)
+        // ReplicaTestBase disables disk protection (limit 1.0). Re-enable the default
+        // 0.85/0.80 hysteresis so injected usage can lock writes.
+        replicaManager.getDiskUsageMonitor().updateWriteLimitConfig(0.85, 0.80);
         replicaManager.getDiskUsageMonitor().update(0.95);
         assertThat(replicaManager.isDiskWriteLocked()).isTrue();
 
@@ -543,6 +545,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
         TableBucket tb = new TableBucket(DATA1_TABLE_ID_PK, 1);
         makeKvTableAsLeader(DATA1_TABLE_ID_PK, DATA1_TABLE_PATH_PK, tb.getBucket());
 
+        replicaManager.getDiskUsageMonitor().updateWriteLimitConfig(0.85, 0.80);
         replicaManager.getDiskUsageMonitor().update(0.99);
         assertThat(replicaManager.isDiskWriteLocked()).isTrue();
 
@@ -568,6 +571,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
         TableBucket kvTb = new TableBucket(DATA1_TABLE_ID_PK, 1);
         TableBucket logTb = new TableBucket(DATA1_TABLE_ID, 1);
 
+        replicaManager.getDiskUsageMonitor().updateWriteLimitConfig(0.85, 0.80);
         replicaManager.getDiskUsageMonitor().update(0.99);
         assertThat(replicaManager.isDiskWriteLocked()).isTrue();
 

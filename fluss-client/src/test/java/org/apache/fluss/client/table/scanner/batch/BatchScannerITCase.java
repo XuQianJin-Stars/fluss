@@ -37,7 +37,7 @@ import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseHandler;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseMetadataManager;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotTableLease;
 import org.apache.fluss.types.DataTypes;
 
@@ -56,6 +56,7 @@ import java.util.Optional;
 import static org.apache.fluss.client.table.scanner.batch.BatchScanUtils.collectRows;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT Case for {@link BatchScanner}. */
@@ -202,12 +203,12 @@ class BatchScannerITCase extends ClientToServerITCaseBase {
         // wait snapshot finish
         FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshots(expectedRowByBuckets.keySet());
 
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient metadataStore = FLUSS_CLUSTER_EXTENSION.metadataStore();
         String remoteDataDir = FLUSS_CLUSTER_EXTENSION.getRemoteDataDir();
         KvSnapshotLeaseMetadataManager metadataManager =
-                new KvSnapshotLeaseMetadataManager(zkClient, remoteDataDir);
+                new KvSnapshotLeaseMetadataManager(metadataStore, remoteDataDir);
 
-        assertThat(zkClient.getKvSnapshotLeasesList()).isEmpty();
+        assertThat(metadataStore.getKvSnapshotLeasesList()).isEmpty();
 
         // test register kv snapshot lease for snapshot 0.
         Map<TableBucket, Long> consumeBuckets = new HashMap<>();
@@ -242,8 +243,8 @@ class BatchScannerITCase extends ClientToServerITCaseBase {
                 metadataManager, kvSnapshotLeaseId2, tableId, new Long[] {1L, 1L, 1L});
         // check even snapshot1 is generated, snapshot0 also retained as lease exists.
         for (TableBucket tb : expectedRowByBuckets.keySet()) {
-            assertThat(zkClient.getTableBucketSnapshot(tb, 0L).isPresent()).isTrue();
-            assertThat(zkClient.getTableBucketSnapshot(tb, 1L).isPresent()).isTrue();
+            assertThat(metadataStore.getTableBucketSnapshot(tb, 0L).isPresent()).isTrue();
+            assertThat(metadataStore.getTableBucketSnapshot(tb, 1L).isPresent()).isTrue();
         }
 
         expectedRowByBuckets = putRows(tableId, tablePath, 10);
@@ -257,21 +258,29 @@ class BatchScannerITCase extends ClientToServerITCaseBase {
 
         // release lease2.
         kvSnapshotLease2.releaseSnapshots(consumeBuckets.keySet()).get();
-        assertThat(zkClient.getKvSnapshotLeasesList()).doesNotContain(kvSnapshotLeaseId2);
+        assertThat(metadataStore.getKvSnapshotLeasesList()).doesNotContain(kvSnapshotLeaseId2);
 
         // release all kv snapshot lease of lease1
         kvSnapshotLease1.dropLease().get();
-        assertThat(zkClient.getKvSnapshotLeasesList()).isEmpty();
+        assertThat(metadataStore.getKvSnapshotLeasesList()).isEmpty();
 
         expectedRowByBuckets = putRows(tableId, tablePath, 10);
         // wait snapshot2 finish
         FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshots(expectedRowByBuckets.keySet());
         // as all leases are dropped, and new snapshot is generated, all old snapshot are
-        // cleared.
-        for (TableBucket tb : expectedRowByBuckets.keySet()) {
-            assertThat(zkClient.getTableBucketSnapshot(tb, 0L).isPresent()).isFalse();
-            assertThat(zkClient.getTableBucketSnapshot(tb, 1L).isPresent()).isFalse();
-        }
+        // cleared. Subsume of snapshot 0/1 is a second metadata-store write after the new
+        // snapshot becomes visible, so wait for the deletes to apply.
+        final Map<TableBucket, List<InternalRow>> bucketsAfterLastSnapshot = expectedRowByBuckets;
+        retry(
+                Duration.ofMinutes(1),
+                () -> {
+                    for (TableBucket tb : bucketsAfterLastSnapshot.keySet()) {
+                        assertThat(metadataStore.getTableBucketSnapshot(tb, 0L).isPresent())
+                                .isFalse();
+                        assertThat(metadataStore.getTableBucketSnapshot(tb, 1L).isPresent())
+                                .isFalse();
+                    }
+                });
 
         // drop no exist lease, no exception.
         admin.createKvSnapshotLease("no-exist-lease", Duration.ofDays(1).toMillis())

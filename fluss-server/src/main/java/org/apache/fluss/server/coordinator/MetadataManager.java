@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.coordinator;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.DatabaseAlreadyExistException;
@@ -49,8 +50,8 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.security.acl.FlussPrincipal;
 import org.apache.fluss.server.entity.DatabasePropertyChanges;
 import org.apache.fluss.server.entity.TablePropertyChanges;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.utils.TableDescriptorValidation;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.DatabaseRegistration;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
@@ -78,16 +79,12 @@ import java.util.function.BiConsumer;
 
 import static org.apache.fluss.server.utils.TableDescriptorValidation.validateAlterTableProperties;
 import static org.apache.fluss.server.utils.TableDescriptorValidation.validateAlterTableSchema;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** A manager for metadata. */
 public class MetadataManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(MetadataManager.class);
-
-    private final ZooKeeperClient zookeeperClient;
-    private final int maxPartitionNum;
-    private final int maxBucketNum;
-    private final LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
 
     public static final Set<String> SENSITIVE_TABLE_OPTIONS = new HashSet<>();
 
@@ -97,20 +94,42 @@ public class MetadataManager {
         SENSITIVE_TABLE_OPTIONS.add("key");
     }
 
+    private final MetadataStoreClient zookeeperClient;
+    private final int maxPartitionNum;
+    private final int maxBucketNum;
+    private final LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
+
+    /**
+     * When set, the next {@link #dropPartition} throws this failure instead of contacting the
+     * metadata store. Used by ITs to cover the historical-partition disable orphan path on both
+     * ZooKeeper and Raft.
+     */
+    @Nullable private volatile Exception nextDropPartitionFailure;
+
     /**
      * Creates a new metadata manager.
      *
-     * @param zookeeperClient the zookeeper client
+     * @param zookeeperClient the backend-neutral metadata store client (a {@code ZooKeeperClient}
+     *     on the ZooKeeper backend, a {@code RaftMetadataClient} on the Raft backend)
      * @param conf the cluster configuration
      */
     public MetadataManager(
-            ZooKeeperClient zookeeperClient,
+            MetadataStoreClient zookeeperClient,
             Configuration conf,
             LakeCatalogDynamicLoader lakeCatalogDynamicLoader) {
         this.zookeeperClient = zookeeperClient;
         this.maxPartitionNum = conf.get(ConfigOptions.MAX_PARTITION_NUM);
         this.maxBucketNum = conf.get(ConfigOptions.MAX_BUCKET_NUM);
         this.lakeCatalogDynamicLoader = lakeCatalogDynamicLoader;
+    }
+
+    /**
+     * Makes the next {@link #dropPartition} fail with {@code failure} instead of writing to the
+     * metadata store. Consumed once.
+     */
+    @VisibleForTesting
+    void failNextDropPartition(Exception failure) {
+        this.nextDropPartitionFailure = checkNotNull(failure, "failure");
     }
 
     /** Validates the table descriptor. */
@@ -330,6 +349,14 @@ public class MetadataManager {
         }
         if (!cascade && !listTables(name).isEmpty()) {
             throw new DatabaseNotEmptyException("Database " + name + " is not empty.");
+        }
+
+        // Explicitly drop tables first. ZooKeeper's deleteDatabase recursively removes child
+        // table znodes; Raft stores tables as separate keys, so cascade must delete them here.
+        if (cascade) {
+            for (String tableName : listTables(name)) {
+                dropTable(TablePath.of(name, tableName), true);
+            }
         }
 
         uncheck(() -> zookeeperClient.deleteDatabase(name), "Fail to drop database: " + name);
@@ -824,6 +851,11 @@ public class MetadataManager {
             ResolvedPartitionSpec partition,
             boolean ignoreIfExists) {
         String partitionName = partition.getPartitionName();
+        TableRegistration tableRegistration = getTableRegistration(tablePath);
+        if (tableRegistration.tableId != tableId) {
+            throw new TableNotExistException(
+                    String.format("Table %s does not exist with id %s.", tablePath, tableId));
+        }
         Optional<PartitionRegistration> optionalPartitionRegistration =
                 getOptionalPartitionRegistration(tablePath, partitionName);
         if (optionalPartitionRegistration.isPresent()) {
@@ -907,6 +939,11 @@ public class MetadataManager {
         }
 
         try {
+            Exception injected = nextDropPartitionFailure;
+            if (injected != null) {
+                nextDropPartitionFailure = null;
+                throw injected;
+            }
             zookeeperClient.deletePartition(tablePath, partitionName);
         } catch (Exception e) {
             throw new FlussRuntimeException(

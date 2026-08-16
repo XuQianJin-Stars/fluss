@@ -23,8 +23,8 @@ import org.apache.fluss.metadata.TableBucketSnapshot;
 import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metrics.group.CoordinatorMetricGroup;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotTableLease;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
@@ -84,7 +84,7 @@ public class KvSnapshotLeaseManager {
 
     public KvSnapshotLeaseManager(
             long leaseExpirationCheckInterval,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             String remoteDataDir,
             Clock clock,
             CoordinatorMetricGroup coordinatorMetricGroup) {
@@ -104,7 +104,7 @@ public class KvSnapshotLeaseManager {
     @VisibleForTesting
     public KvSnapshotLeaseManager(
             long leaseExpirationCheckInterval,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             String remoteDataDir,
             ScheduledExecutorService scheduledExecutor,
             Clock clock,
@@ -120,33 +120,72 @@ public class KvSnapshotLeaseManager {
     public void start() {
         LOG.info("kv snapshot lease manager has been started.");
 
-        List<String> leasesList = new ArrayList<>();
-        try {
-            leasesList = metadataManager.getLeasesList();
-        } catch (Exception e) {
-            LOG.error("Failed to get leases list from zookeeper.", e);
-        }
-
-        for (String leaseId : leasesList) {
-            Optional<KvSnapshotLeaseHandler> kvSnapshotLeaseOpt = Optional.empty();
-            try {
-                kvSnapshotLeaseOpt = metadataManager.getLease(leaseId);
-            } catch (Exception e) {
-                LOG.error("Failed to get kv snapshot lease from zookeeper.", e);
-            }
-
-            if (kvSnapshotLeaseOpt.isPresent()) {
-                KvSnapshotLeaseHandler kvSnapshotLeasehandle = kvSnapshotLeaseOpt.get();
-                this.kvSnapshotLeaseMap.put(leaseId, kvSnapshotLeasehandle);
-
-                initializeRefCount(kvSnapshotLeasehandle);
-
-                leasedBucketCount.addAndGet(kvSnapshotLeasehandle.getLeasedSnapshotCount());
-            }
-        }
+        // On Raft, this may run before leadership (requireLeader fails). Leases are reloaded again
+        // from initCoordinatorLeader once this node is a serving leader.
+        reloadLeasesFromStore();
 
         scheduledExecutor.scheduleWithFixedDelay(
                 this::expireLeases, 0L, leaseExpirationCheckInterval, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Loads persisted leases into the in-memory map. Safe to call multiple times (e.g. on each
+     * leadership gain): existing entries are replaced from the store.
+     */
+    public void reloadLeasesFromStore() {
+        inWriteLock(
+                managerLock,
+                () -> {
+                    List<String> leasesList = new ArrayList<>();
+                    try {
+                        leasesList = metadataManager.getLeasesList();
+                    } catch (Exception e) {
+                        LOG.error("Failed to get leases list from metadata store.", e);
+                        return;
+                    }
+
+                    // Reset in-memory state so a re-election does not keep leases that were dropped
+                    // while we were standby (or duplicate ref counts from a prior load).
+                    kvSnapshotLeaseMap.clear();
+                    refCount.clear();
+                    leasedBucketCount.set(0);
+
+                    for (String leaseId : leasesList) {
+                        Optional<KvSnapshotLeaseHandler> kvSnapshotLeaseOpt = Optional.empty();
+                        try {
+                            kvSnapshotLeaseOpt = metadataManager.getLease(leaseId);
+                        } catch (Exception e) {
+                            LOG.error(
+                                    "Failed to get kv snapshot lease '{}' from metadata store.",
+                                    leaseId,
+                                    e);
+                        }
+
+                        if (kvSnapshotLeaseOpt.isPresent()) {
+                            KvSnapshotLeaseHandler kvSnapshotLeasehandle = kvSnapshotLeaseOpt.get();
+                            this.kvSnapshotLeaseMap.put(leaseId, kvSnapshotLeasehandle);
+
+                            initializeRefCount(kvSnapshotLeasehandle);
+
+                            leasedBucketCount.addAndGet(
+                                    kvSnapshotLeasehandle.getLeasedSnapshotCount());
+                        }
+                    }
+                    LOG.info(
+                            "Loaded {} kv snapshot lease(s) from metadata store.",
+                            kvSnapshotLeaseMap.size());
+                });
+    }
+
+    /** Clears in-memory leases when this coordinator loses leadership. */
+    public void clearInMemoryLeases() {
+        inWriteLock(
+                managerLock,
+                () -> {
+                    kvSnapshotLeaseMap.clear();
+                    refCount.clear();
+                    leasedBucketCount.set(0);
+                });
     }
 
     public boolean snapshotLeaseExist(CompletedSnapshot snapshot) {
@@ -262,7 +301,7 @@ public class KvSnapshotLeaseManager {
         inWriteLock(
                 managerLock,
                 () -> {
-                    KvSnapshotLeaseHandler lease = kvSnapshotLeaseMap.get(leaseId);
+                    KvSnapshotLeaseHandler lease = getOrLoadLeaseLocked(leaseId);
                     if (lease == null) {
                         return;
                     }
@@ -276,7 +315,7 @@ public class KvSnapshotLeaseManager {
                     }
 
                     if (lease.isEmpty()) {
-                        dropLease(leaseId);
+                        dropLeaseLocked(leaseId);
                     } else {
                         metadataManager.updateLease(leaseId, lease);
                     }
@@ -300,21 +339,49 @@ public class KvSnapshotLeaseManager {
      * @return true if clear success, false if lease not exist
      */
     public boolean dropLease(String leaseId) throws Exception {
-        return inWriteLock(
-                managerLock,
-                () -> {
-                    KvSnapshotLeaseHandler kvSnapshotLeasehandle =
-                            kvSnapshotLeaseMap.remove(leaseId);
-                    if (kvSnapshotLeasehandle == null) {
-                        return false;
-                    }
+        return inWriteLock(managerLock, () -> dropLeaseLocked(leaseId));
+    }
 
-                    clearRefCount(kvSnapshotLeasehandle);
-                    metadataManager.deleteLease(leaseId);
+    @GuardedBy("managerLock")
+    private boolean dropLeaseLocked(String leaseId) throws Exception {
+        KvSnapshotLeaseHandler kvSnapshotLeasehandle = getOrLoadLeaseLocked(leaseId);
+        if (kvSnapshotLeasehandle == null) {
+            // Still try to delete any residual metadata (e.g. empty map after failed reload).
+            try {
+                metadataManager.deleteLease(leaseId);
+            } catch (Exception e) {
+                LOG.debug("No kv snapshot lease '{}' metadata to delete.", leaseId, e);
+            }
+            return false;
+        }
+        kvSnapshotLeaseMap.remove(leaseId);
+        clearRefCount(kvSnapshotLeasehandle);
+        metadataManager.deleteLease(leaseId);
 
-                    LOG.info("kv snapshots of lease '{}' has been all released.", leaseId);
-                    return true;
-                });
+        LOG.info("kv snapshots of lease '{}' has been all released.", leaseId);
+        return true;
+    }
+
+    /**
+     * Returns the in-memory lease, loading it from the metadata store once if missing (Raft
+     * leadership gain / CS restart before {@link #reloadLeasesFromStore} completed).
+     */
+    @GuardedBy("managerLock")
+    @Nullable
+    private KvSnapshotLeaseHandler getOrLoadLeaseLocked(String leaseId) throws Exception {
+        KvSnapshotLeaseHandler lease = kvSnapshotLeaseMap.get(leaseId);
+        if (lease != null) {
+            return lease;
+        }
+        Optional<KvSnapshotLeaseHandler> loaded = metadataManager.getLease(leaseId);
+        if (!loaded.isPresent()) {
+            return null;
+        }
+        lease = loaded.get();
+        kvSnapshotLeaseMap.put(leaseId, lease);
+        initializeRefCount(lease);
+        leasedBucketCount.addAndGet(lease.getLeasedSnapshotCount());
+        return lease;
     }
 
     /**

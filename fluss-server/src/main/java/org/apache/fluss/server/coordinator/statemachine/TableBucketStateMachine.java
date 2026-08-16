@@ -28,7 +28,7 @@ import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.De
 import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ReassignmentLeaderElection;
 import org.apache.fluss.server.entity.BatchRegisterLeadAndIsr;
 import org.apache.fluss.server.entity.RegisterTableBucketLeadAndIsrInfo;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.Sets;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
@@ -60,12 +60,12 @@ public class TableBucketStateMachine {
 
     private final CoordinatorContext coordinatorContext;
     private final CoordinatorRequestBatch coordinatorRequestBatch;
-    private final ZooKeeperClient zooKeeperClient;
+    private final MetadataStoreClient zooKeeperClient;
 
     public TableBucketStateMachine(
             CoordinatorContext coordinatorContext,
             CoordinatorRequestBatch coordinatorRequestBatch,
-            ZooKeeperClient zooKeeperClient) {
+            MetadataStoreClient zooKeeperClient) {
         this.coordinatorContext = coordinatorContext;
         this.coordinatorRequestBatch = coordinatorRequestBatch;
         this.zooKeeperClient = zooKeeperClient;

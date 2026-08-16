@@ -47,6 +47,19 @@ You can start Fluss local cluster by running the following command:
 
 After that, the Fluss local cluster is started.
 
+## Raft metadata backend (default)
+
+By default the local cluster uses the embedded Raft metadata backend. Ensure
+`conf/server.yaml` has `coordinator.seed.nodes` / `coordinator.raft.*` set and
+`zookeeper.address` unset, then:
+
+1. Format once: `./bin/fluss raft bootstrap --config conf`
+2. Start: `./bin/local-cluster.sh start` (ZooKeeper is skipped)
+3. Inspect: `./bin/fluss raft status --coordinator localhost:9123` (add `--watch` to poll)
+
+To use ZooKeeper instead, set `zookeeper.address` and remove the Raft seed/voters
+keys (both backends configured together is rejected).
+
 ## Interacting with Fluss
 
 After Fluss local cluster is started, you can use **Fluss Client** (Currently, only support Flink SQL Client) to interact with Fluss.

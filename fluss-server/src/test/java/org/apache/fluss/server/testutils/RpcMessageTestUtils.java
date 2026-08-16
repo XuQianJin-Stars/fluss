@@ -57,6 +57,7 @@ import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForTable;
 import org.apache.fluss.rpc.messages.PbKeyValue;
 import org.apache.fluss.rpc.messages.PbLookupReqForBucket;
+import org.apache.fluss.rpc.messages.PbPartitionSpec;
 import org.apache.fluss.rpc.messages.PbPrefixLookupReqForBucket;
 import org.apache.fluss.rpc.messages.PbProduceLogReqForBucket;
 import org.apache.fluss.rpc.messages.PbProduceLogRespForBucket;
@@ -77,6 +78,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
@@ -385,12 +387,38 @@ public class RpcMessageTestUtils {
         request.setTablePath()
                 .setDatabaseName(tablePath.getDatabaseName())
                 .setTableName(tablePath.getTableName());
+        // Do not use get(0): list order is not defined across metadata backends. Match the
+        // partition we just created by PartitionSpec.
         return coordinatorGateway
                 .listPartitionInfos(request)
                 .get()
                 .getPartitionsInfosList()
-                .get(0)
+                .stream()
+                .filter(info -> partitionSpecMatches(info.getPartitionSpec(), partitionSpec))
+                .findFirst()
+                .orElseThrow(
+                        () ->
+                                new IllegalStateException(
+                                        "Created partition not found in listPartitionInfos for "
+                                                + tablePath
+                                                + " spec="
+                                                + partitionSpec))
                 .getPartitionId();
+    }
+
+    private static boolean partitionSpecMatches(
+            PbPartitionSpec pbSpec, PartitionSpec partitionSpec) {
+        Map<String, String> expected = partitionSpec.getSpecMap();
+        if (pbSpec.getPartitionKeyValuesCount() != expected.size()) {
+            return false;
+        }
+        for (PbKeyValue kv : pbSpec.getPartitionKeyValuesList()) {
+            if (!expected.containsKey(kv.getKey())
+                    || !Objects.equals(expected.get(kv.getKey()), kv.getValue())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public static long createTable(

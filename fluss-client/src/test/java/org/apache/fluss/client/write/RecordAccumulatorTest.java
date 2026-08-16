@@ -77,6 +77,8 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_INFO;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
+import static org.apache.fluss.record.TestData.PARTITION_TABLE_INFO;
+import static org.apache.fluss.record.TestData.PARTITION_TABLE_PATH;
 import static org.apache.fluss.testutils.DataTestUtils.indexedRow;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -529,6 +531,68 @@ class RecordAccumulatorTest {
         assertThat(accum.flushInProgress()).isTrue();
         delayedInterrupt(Thread.currentThread(), 1000L);
         assertThatThrownBy(accum::awaitFlushCompletion).isInstanceOf(InterruptedException.class);
+    }
+
+    @Test
+    void testAbortExpiredBatches() throws Exception {
+        IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
+        RecordAccumulator accum = createTestRecordAccumulator(4 * 1024, 64 * 1024);
+        PhysicalTablePath pendingPartition =
+                PhysicalTablePath.of(PARTITION_TABLE_PATH, "not-yet-created");
+        WriteRecord pendingRecord =
+                WriteRecord.forIndexedAppend(PARTITION_TABLE_INFO, pendingPartition, row, null);
+        accum.append(pendingRecord, writeCallback, cluster, 0, false);
+        accum.append(createRecord(row), writeCallback, cluster, 0, false);
+        assertThat(accum.hasIncomplete()).isTrue();
+
+        accum.abortExpiredBatches(60_000L);
+        assertThat(accum.hasIncomplete()).isTrue();
+
+        clock.advanceTime(Duration.ofSeconds(2));
+        accum.abortExpiredBatches(1_000L);
+        assertThat(accum.hasIncomplete()).isFalse();
+        assertThat(accum.hasUnDrained()).isFalse();
+    }
+
+    @Test
+    void testAbortExpiredBatchesSkipsInFlight() throws Exception {
+        IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
+        long batchSize = getTestBatchSize(row);
+        RecordAccumulator accum =
+                createTestRecordAccumulator(0, (int) batchSize, 256, Integer.MAX_VALUE);
+        accum.append(createRecord(row), writeCallback, cluster, 0, false);
+
+        Map<Integer, List<ReadyWriteBatch>> drained =
+                accum.drain(cluster, Collections.singleton(node1.id()), Integer.MAX_VALUE);
+        assertThat(drained).isNotEmpty();
+        assertThat(accum.hasUnDrained()).isFalse();
+        assertThat(accum.hasIncomplete()).isTrue();
+
+        clock.advanceTime(Duration.ofSeconds(2));
+        accum.abortExpiredBatches(1_000L);
+        assertThat(accum.hasIncomplete()).isTrue();
+    }
+
+    @Test
+    void testAbortExpiredBatchesResetsClockOnReEnqueue() throws Exception {
+        IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
+        long batchSize = getTestBatchSize(row);
+        RecordAccumulator accum =
+                createTestRecordAccumulator(0, (int) batchSize, 256, Integer.MAX_VALUE);
+        accum.append(createRecord(row), writeCallback, cluster, 0, false);
+
+        Map<Integer, List<ReadyWriteBatch>> drained =
+                accum.drain(cluster, Collections.singleton(node1.id()), Integer.MAX_VALUE);
+        ReadyWriteBatch ready = drained.get(node1.id()).get(0);
+
+        clock.advanceTime(Duration.ofSeconds(2));
+        accum.reEnqueue(ready);
+        accum.abortExpiredBatches(1_000L);
+        assertThat(accum.hasIncomplete()).isTrue();
+
+        clock.advanceTime(Duration.ofSeconds(2));
+        accum.abortExpiredBatches(1_000L);
+        assertThat(accum.hasIncomplete()).isFalse();
     }
 
     @Test

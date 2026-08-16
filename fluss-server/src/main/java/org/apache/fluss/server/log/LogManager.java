@@ -34,9 +34,9 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.TabletManagerBase;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.storage.LocalDiskManager;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FileUtils;
@@ -100,7 +100,7 @@ public final class LogManager extends TabletManagerBase implements ServerReconfi
      */
     static final String CLEAN_SHUTDOWN_FILE = ".fluss_cleanshutdown";
 
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
     private final Scheduler scheduler;
     private final Clock clock;
     private final TabletServerMetricGroup serverMetricGroup;
@@ -118,7 +118,7 @@ public final class LogManager extends TabletManagerBase implements ServerReconfi
     private LogManager(
             LocalDiskManager localDiskManager,
             Configuration conf,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             int recoveryThreadsPerDataDir,
             Scheduler scheduler,
             Clock clock,
@@ -139,7 +139,7 @@ public final class LogManager extends TabletManagerBase implements ServerReconfi
 
     public static LogManager create(
             Configuration conf,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             Scheduler scheduler,
             Clock clock,
             TabletServerMetricGroup serverMetricGroup,

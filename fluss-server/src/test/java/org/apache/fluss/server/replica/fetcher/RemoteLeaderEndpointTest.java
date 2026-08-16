@@ -26,10 +26,10 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.replica.fetcher.LeaderEndpoint.FetchData;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.testutils.RpcMessageTestUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -60,11 +60,11 @@ public class RemoteLeaderEndpointTest {
                     .setClusterConf(initConfig())
                     .build();
 
-    private ZooKeeperClient zkClient;
+    private MetadataStoreClient zkClient;
 
     @BeforeEach
     void beforeEach() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
     }
 
     @Test

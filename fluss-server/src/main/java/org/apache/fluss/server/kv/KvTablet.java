@@ -446,6 +446,19 @@ public final class KvTablet {
         this.rowCount = rowCount;
     }
 
+    /** Whether row-count tracking is enabled for this tablet (not WAL / pre-0.9 disabled). */
+    public boolean isRowCountEnabled() {
+        return rowCount != ROW_COUNT_DISABLED;
+    }
+
+    /**
+     * Count keys currently visible in RocksDB. Used to rebuild {@link #rowCount} after recovery
+     * when a completed snapshot omitted the row_count field.
+     */
+    public long countKeysInRocksDb() {
+        return rocksDBKv.countKeys();
+    }
+
     // row_count is volatile, so it's safe to read without lock
     public long getRowCount() {
         if (rowCount == ROW_COUNT_DISABLED) {

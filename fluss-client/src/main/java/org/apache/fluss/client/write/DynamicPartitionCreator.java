@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.concurrent.ThreadSafe;
 
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -52,18 +53,27 @@ public class DynamicPartitionCreator {
     private final boolean dynamicPartitionEnabled;
     private final Admin admin;
     private final Consumer<Throwable> fatalErrorHandler;
+    private final Runnable senderWakeup;
 
     private final Set<PhysicalTablePath> inflightPartitionsToCreate = ConcurrentHashMap.newKeySet();
+    /**
+     * Partitions whose create RPC succeeded but which are not yet visible in client metadata. The
+     * sender retries these without putting not-yet-created partitions on the unknown-leader path
+     * (that path issues 30s metadata RPCs in a tight loop).
+     */
+    private final Set<PhysicalTablePath> pendingMetadataRefresh = ConcurrentHashMap.newKeySet();
 
     public DynamicPartitionCreator(
             MetadataUpdater metadataUpdater,
             Admin admin,
             boolean dynamicPartitionEnabled,
-            Consumer<Throwable> fatalErrorHandler) {
+            Consumer<Throwable> fatalErrorHandler,
+            Runnable senderWakeup) {
         this.metadataUpdater = metadataUpdater;
         this.admin = admin;
         this.dynamicPartitionEnabled = dynamicPartitionEnabled;
         this.fatalErrorHandler = fatalErrorHandler;
+        this.senderWakeup = senderWakeup;
     }
 
     public void checkAndCreatePartitionAsync(
@@ -159,9 +169,42 @@ public class DynamicPartitionCreator {
 
     private void onPartitionCreationSuccess(PhysicalTablePath physicalTablePath) {
         inflightPartitionsToCreate.remove(physicalTablePath);
-        // TODO: trigger to update metadata here when metadataUpdater supports async update
-        // metadataUpdater.checkAndUpdatePartitionMetadata(physicalTablePath);
+        pendingMetadataRefresh.add(physicalTablePath);
+        tryRefreshPartitionMetadata(physicalTablePath);
+        senderWakeup.run();
         LOG.info("Successfully created partition {}", physicalTablePath);
+    }
+
+    /**
+     * Retry metadata lookup for partitions that have been created but are not yet in the client
+     * cluster view. Called on the sender thread so it must not block for request-timeout.
+     */
+    void refreshPendingCreatedPartitions() {
+        if (pendingMetadataRefresh.isEmpty()) {
+            return;
+        }
+        Iterator<PhysicalTablePath> it = pendingMetadataRefresh.iterator();
+        while (it.hasNext()) {
+            tryRefreshPartitionMetadata(it.next());
+        }
+    }
+
+    private void tryRefreshPartitionMetadata(PhysicalTablePath physicalTablePath) {
+        try {
+            if (metadataUpdater.checkAndUpdatePartitionMetadata(physicalTablePath)) {
+                pendingMetadataRefresh.remove(physicalTablePath);
+            }
+        } catch (PartitionNotExistException e) {
+            LOG.debug(
+                    "Partition {} created, but not yet visible in metadata: {}",
+                    physicalTablePath,
+                    e.toString());
+        } catch (Exception e) {
+            LOG.info(
+                    "Partition {} created, but metadata refresh has not observed it yet: {}",
+                    physicalTablePath,
+                    e.toString());
+        }
     }
 
     private void onPartitionCreationFailed(

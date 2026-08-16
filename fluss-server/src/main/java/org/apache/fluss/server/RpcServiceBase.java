@@ -86,13 +86,13 @@ import org.apache.fluss.server.coordinator.CoordinatorService;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.metadata.MetadataProvider;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metadata.PartitionMetadata;
 import org.apache.fluss.server.metadata.PartitionNegativeCache;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
 import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.tablet.TabletService;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
@@ -142,7 +142,7 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
     private final FileSystem remoteFileSystem;
     private final ServerType provider;
     private final ApiManager apiManager;
-    protected final ZooKeeperClient zkClient;
+    protected final MetadataStoreClient zkClient;
     protected final MetadataManager metadataManager;
     protected final @Nullable Authorizer authorizer;
     protected final DynamicConfigManager dynamicConfigManager;
@@ -156,7 +156,7 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
     public RpcServiceBase(
             FileSystem remoteFileSystem,
             ServerType provider,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             MetadataManager metadataManager,
             @Nullable Authorizer authorizer,
             DynamicConfigManager dynamicConfigManager,

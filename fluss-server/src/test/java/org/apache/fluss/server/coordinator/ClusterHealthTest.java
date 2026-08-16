@@ -336,6 +336,35 @@ class ClusterHealthTest {
                 .isEqualTo(0 /* GREEN */);
     }
 
+    @Test
+    void testDeletingTableBucketsDoNotAffectHealth() {
+        TableBucket live = new TableBucket(1L, 0);
+        ctx.updateBucketReplicaAssignment(live, Arrays.asList(0, 1, 2));
+        ctx.putBucketLeaderAndIsr(
+                live,
+                new LeaderAndIsr(0, 1, Arrays.asList(0, 1, 2), Collections.emptyList(), 0, 1));
+
+        TableBucket deleting = new TableBucket(2L, 0);
+        ctx.updateBucketReplicaAssignment(deleting, Arrays.asList(0, 1, 2));
+        ctx.putBucketLeaderAndIsr(
+                deleting,
+                new LeaderAndIsr(
+                        LeaderAndIsr.NO_LEADER,
+                        1,
+                        Collections.singletonList(0),
+                        Collections.emptyList(),
+                        0,
+                        1));
+        ctx.queueTableDeletion(Collections.singleton(2L));
+
+        GetClusterHealthResponse resp = CoordinatorService.computeClusterHealth(ctx);
+        assertThat(resp.getNumReplicas()).isEqualTo(3);
+        assertThat(resp.getInSyncReplicas()).isEqualTo(3);
+        assertThat(resp.getNumLeaderReplicas()).isEqualTo(1);
+        assertThat(resp.getActiveLeaderReplicas()).isEqualTo(1);
+        assertThat(resp.getStatus()).isEqualTo(0 /* GREEN */);
+    }
+
     private static ServerInfo makeServerInfo(int id) {
         return new ServerInfo(
                 id,

@@ -77,8 +77,7 @@ class KvReplicaRestoreITCase {
     @BeforeEach
     void beforeEach() {
         completedSnapshotHandleStore =
-                new ZooKeeperCompletedSnapshotHandleStore(
-                        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient());
+                new ZooKeeperCompletedSnapshotHandleStore(FLUSS_CLUSTER_EXTENSION.metadataStore());
     }
 
     @Test

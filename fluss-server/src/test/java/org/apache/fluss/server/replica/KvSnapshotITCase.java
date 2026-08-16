@@ -76,8 +76,7 @@ class KvSnapshotITCase {
     @BeforeEach
     void beforeEach() {
         completedSnapshotHandleStore =
-                new ZooKeeperCompletedSnapshotHandleStore(
-                        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient());
+                new ZooKeeperCompletedSnapshotHandleStore(FLUSS_CLUSTER_EXTENSION.metadataStore());
         this.coordinatorService =
                 FLUSS_CLUSTER_EXTENSION.getCoordinatorServer().getCoordinatorService();
         remoteDataDir = FLUSS_CLUSTER_EXTENSION.getRemoteDataDir();

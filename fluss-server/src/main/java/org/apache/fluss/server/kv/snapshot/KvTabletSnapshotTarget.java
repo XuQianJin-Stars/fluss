@@ -24,7 +24,7 @@ import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.SequenceIDCounter;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.ExceptionUtils;
@@ -59,7 +59,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
 
     private final CompletedKvSnapshotCommitter completedKvSnapshotCommitter;
 
-    private final ZooKeeperClient zooKeeperClient;
+    private final MetadataStoreClient zooKeeperClient;
 
     private final RocksIncrementalSnapshot rocksIncrementalSnapshot;
     private final FsPath remoteKvTabletDir;
@@ -88,7 +88,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     KvTabletSnapshotTarget(
             TableBucket tableBucket,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
-            ZooKeeperClient zooKeeperClient,
+            MetadataStoreClient zooKeeperClient,
             RocksIncrementalSnapshot rocksIncrementalSnapshot,
             FsPath remoteKvTabletDir,
             Executor ioExecutor,
@@ -122,7 +122,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     public KvTabletSnapshotTarget(
             TableBucket tableBucket,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
-            @Nonnull ZooKeeperClient zooKeeperClient,
+            @Nonnull MetadataStoreClient zooKeeperClient,
             RocksIncrementalSnapshot rocksIncrementalSnapshot,
             FsPath remoteKvTabletDir,
             int snapshotWriteBufferSize,

@@ -28,19 +28,21 @@ import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.ErrorMessage;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.log.LogSegment;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
+import org.apache.fluss.server.testutils.DualBackendFlussClusters;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 
@@ -54,16 +56,24 @@ import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObje
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** The ITCase for tabletServer shutdown (controlled shutdown). */
+/** The ITCase for tabletServer shutdown (controlled shutdown). Runs on ZooKeeper and Raft. */
 public class TabletServerShutdownITCase {
     @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
-            FlussClusterExtension.builder().setNumOfTabletServers(3).build();
+    public static final DualBackendFlussClusters CLUSTERS =
+            DualBackendFlussClusters.builder().setNumOfTabletServers(3).build();
+
+    private FlussClusterExtension flussClusterExtension;
+
+    private void bind(MetadataBackend backend) {
+        flussClusterExtension = CLUSTERS.get(backend);
+    }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testIOExceptionShouldStopTabletServer(boolean isLogTable) throws Exception {
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+    @MethodSource("org.apache.fluss.server.testutils.DualBackendFlussClusters#backendsAndBooleans")
+    void testIOExceptionShouldStopTabletServer(MetadataBackend backend, boolean isLogTable)
+            throws Exception {
+        bind(backend);
+        flussClusterExtension.assertHasTabletServerNumber(3);
         Schema schema =
                 isLogTable
                         ? Schema.newBuilder()
@@ -85,21 +95,18 @@ public class TabletServerShutdownITCase {
         TablePath tablePath =
                 TablePath.of(
                         "test_failover", "test_ioexception_table_" + (isLogTable ? "log" : "pk"));
-        long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+        long tableId = createTable(flussClusterExtension, tablePath, tableDescriptor);
         TableBucket tb = new TableBucket(tableId, 0);
 
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        flussClusterExtension.waitUntilAllReplicaReady(tb);
 
-        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leader = flussClusterExtension.waitAndGetLeader(tb);
         TabletServerGateway leaderGateWay =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+                flussClusterExtension.newTabletServerClientForNode(leader);
 
         // delete the active segment, which will cause IOException when append log/changelog
         LogSegment logSegment =
-                FLUSS_CLUSTER_EXTENSION
-                        .waitAndGetLeaderReplica(tb)
-                        .getLogTablet()
-                        .activeLogSegment();
+                flussClusterExtension.waitAndGetLeaderReplica(tb).getLogTablet().activeLogSegment();
         logSegment.deleteIfExists();
 
         ErrorMessage errorResponse = null;
@@ -110,16 +117,16 @@ public class TabletServerShutdownITCase {
             requestFailure = e;
         }
 
-        TabletServer leaderServer = FLUSS_CLUSTER_EXTENSION.getTabletServerById(leader);
+        TabletServer leaderServer = flussClusterExtension.getTabletServerById(leader);
         try {
             // The storage IOException should trigger the fatal error handler and stop the leader
             // server. The failed request may either receive the storage error response or fail when
             // the RPC connection is closed, depending on which completes first.
-            FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(2);
+            flussClusterExtension.assertHasTabletServerNumber(2);
         } finally {
             // Wait for the fatal shutdown to finish before reusing the same server ID and data dir.
             leaderServer.closeAsync().get();
-            FLUSS_CLUSTER_EXTENSION.startTabletServer(leader, true);
+            flussClusterExtension.startTabletServer(leader, true);
         }
 
         if (requestFailure != null) {
@@ -164,9 +171,11 @@ public class TabletServerShutdownITCase {
                 .isEqualTo(2000L);
     }
 
-    @Test
-    void testControlledShutdown() throws Exception {
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testControlledShutdown(MetadataBackend backend) throws Exception {
+        bind(backend);
+        flussClusterExtension.assertHasTabletServerNumber(3);
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder()
                         .schema(Schema.newBuilder().column("a", DataTypes.INT()).build())
@@ -174,15 +183,15 @@ public class TabletServerShutdownITCase {
                         .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 3)
                         .build();
         TablePath tablePath = TablePath.of("test_shutdown", "test_controlled_shutdown");
-        long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+        long tableId = createTable(flussClusterExtension, tablePath, tableDescriptor);
         TableBucket tb = new TableBucket(tableId, 0);
 
-        LeaderAndIsr leaderAndIsr = FLUSS_CLUSTER_EXTENSION.waitLeaderAndIsrReady(tb);
+        LeaderAndIsr leaderAndIsr = flussClusterExtension.waitLeaderAndIsrReady(tb);
         int leader = leaderAndIsr.leader();
 
         // test kill the tabletServers with leader on.
-        FLUSS_CLUSTER_EXTENSION.stopTabletServer(leader);
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        flussClusterExtension.stopTabletServer(leader);
+        MetadataStoreClient zkClient = flussClusterExtension.metadataStore();
 
         // the leader should be removed from isr, and new leader should be elected.
         retry(
@@ -193,15 +202,17 @@ public class TabletServerShutdownITCase {
                                 .isNotEqualTo(leader));
 
         // restart the shutdown server
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(leader, true);
+        flussClusterExtension.startTabletServer(leader, true);
     }
 
-    @Test
-    void testControlledShutdownRetriesFailover() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testControlledShutdownRetriesFailover(MetadataBackend backend) throws Exception {
+        bind(backend);
         // This case is to test the scenario that the controlled shutdown request is retried and
         // failed by cannot elect any new leader. In this case the controlled shutdown will finally
         // go uncontrolled shutdown.
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+        flussClusterExtension.assertHasTabletServerNumber(3);
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder()
                         .schema(Schema.newBuilder().column("a", DataTypes.INT()).build())
@@ -209,51 +220,48 @@ public class TabletServerShutdownITCase {
                         .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 2)
                         .build();
         TablePath tablePath = TablePath.of("test_failover", "test_controlled_shutdown_failed");
-        long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+        long tableId = createTable(flussClusterExtension, tablePath, tableDescriptor);
         TableBucket tb = new TableBucket(tableId, 0);
 
-        LeaderAndIsr leaderAndIsr = FLUSS_CLUSTER_EXTENSION.waitLeaderAndIsrReady(tb);
+        LeaderAndIsr leaderAndIsr = flussClusterExtension.waitLeaderAndIsrReady(tb);
         List<Integer> isr = new ArrayList<>(leaderAndIsr.isr());
         int leader = leaderAndIsr.leader();
         isr.remove(Integer.valueOf(leader));
         int follower = isr.get(0);
 
         // Let's kil follower. Will go controlled shutdown.
-        FLUSS_CLUSTER_EXTENSION.stopTabletServer(follower);
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        flussClusterExtension.stopTabletServer(follower);
+        MetadataStoreClient zkClient = flussClusterExtension.metadataStore();
 
-        // the follower should be removed from isr
-        LeaderAndIsr expectedLeaderAndIsr1 =
-                leaderAndIsr.newLeaderAndIsr(Collections.singletonList(leader));
+        // Follower leaves ISR. Do not pin bucketEpoch: Raft may record extra LeaderAndIsr
+        // writes (epoch 3 vs 1) for the same ISR shrink.
         retry(
                 Duration.ofMinutes(1),
-                () ->
-                        assertThat(zkClient.getLeaderAndIsr(tb).get())
-                                .isEqualTo(expectedLeaderAndIsr1));
+                () -> {
+                    LeaderAndIsr actual = zkClient.getLeaderAndIsr(tb).get();
+                    assertThat(actual.leader()).isEqualTo(leader);
+                    assertThat(actual.isr()).containsExactly(leader);
+                });
 
         // kill the leader. As we only have 1 replica, no leader can be elected as we send the
         // controlled shutdown request to the leader. So the controlled shutdown will finally go
         // uncontrolled shutdown.
-        FLUSS_CLUSTER_EXTENSION.stopTabletServer(leader);
+        flussClusterExtension.stopTabletServer(leader);
 
-        // should be no leader
-        LeaderAndIsr expectedLeaderAndIsr2 =
-                expectedLeaderAndIsr1.newLeaderAndIsr(
-                        LeaderAndIsr.NO_LEADER,
-                        Collections.singletonList(leader),
-                        Collections.emptyList());
         retry(
                 Duration.ofMinutes(1),
-                () ->
-                        assertThat(zkClient.getLeaderAndIsr(tb).get())
-                                .isEqualTo(expectedLeaderAndIsr2));
+                () -> {
+                    LeaderAndIsr actual = zkClient.getLeaderAndIsr(tb).get();
+                    assertThat(actual.leader()).isEqualTo(LeaderAndIsr.NO_LEADER);
+                    assertThat(actual.isr()).containsExactly(leader);
+                });
 
         // start the follower
         // should still be no leader since the follower is out of isr, should be elected as leader
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(follower);
+        flussClusterExtension.startTabletServer(follower);
 
         // start the leader server, the leader should be the previous leader server
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(leader);
+        flussClusterExtension.startTabletServer(leader);
         retry(
                 Duration.ofMinutes(1),
                 () -> assertThat(zkClient.getLeaderAndIsr(tb).get().leader()).isEqualTo(leader));

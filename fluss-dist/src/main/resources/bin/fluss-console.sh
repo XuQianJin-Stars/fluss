@@ -40,6 +40,7 @@ case $SERVICE in
     ;;
 
     (zookeeper)
+        # Dual-support: only used when the cluster runs with zookeeper.address configured.
         CLASS_TO_RUN=org.apache.zookeeper.server.quorum.QuorumPeerMain
     ;;
 

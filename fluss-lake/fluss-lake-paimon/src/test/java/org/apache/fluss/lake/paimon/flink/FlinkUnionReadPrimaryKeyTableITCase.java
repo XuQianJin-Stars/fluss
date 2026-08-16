@@ -1261,7 +1261,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
 
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
         Map<Long, String> partitionNameById =
-                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath);
+                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath);
         Iterator<String> partitionIterator =
                 partitionNameById.values().stream().sorted().iterator();
         String partition1 = partitionIterator.next();

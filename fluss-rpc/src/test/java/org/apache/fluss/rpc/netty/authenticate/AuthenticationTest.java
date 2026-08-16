@@ -33,7 +33,6 @@ import org.apache.fluss.rpc.netty.client.NettyClient;
 import org.apache.fluss.rpc.netty.server.NettyServer;
 import org.apache.fluss.rpc.netty.server.RequestsMetrics;
 import org.apache.fluss.rpc.protocol.ApiKeys;
-import org.apache.fluss.utils.NetUtils;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -43,7 +42,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
 
-import static org.apache.fluss.utils.NetUtils.getAvailablePort;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -249,27 +247,29 @@ public class AuthenticationTest {
         configuration.setString(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS.key(), "3");
         MetricGroup metricGroup = NOPMetricsGroup.newInstance();
         TestingAuthenticateGatewayService service = new TestingAuthenticateGatewayService();
-        try (NetUtils.Port availablePort1 = getAvailablePort();
-                NetUtils.Port availablePort2 = getAvailablePort()) {
-            this.nettyServer =
-                    new NettyServer(
-                            configuration,
-                            Arrays.asList(
-                                    new Endpoint("localhost", availablePort1.getPort(), "CLIENT1"),
-                                    new Endpoint("localhost", availablePort2.getPort(), "CLIENT2")),
-                            service,
-                            metricGroup,
-                            RequestsMetrics.createCoordinatorServerRequestMetrics(metricGroup));
-            nettyServer.start();
+        this.nettyServer =
+                new NettyServer(
+                        configuration,
+                        Arrays.asList(
+                                new Endpoint("localhost", 0, "CLIENT1"),
+                                new Endpoint("localhost", 0, "CLIENT2")),
+                        service,
+                        metricGroup,
+                        RequestsMetrics.createCoordinatorServerRequestMetrics(metricGroup));
+        nettyServer.start();
 
-            // use client listener to connect to server
-            mutualAuthServerNode =
-                    new ServerNode(
-                            1, "localhost", availablePort1.getPort(), ServerType.TABLET_SERVER);
-            usernamePasswordServerNode =
-                    new ServerNode(
-                            2, "localhost", availablePort2.getPort(), ServerType.TABLET_SERVER);
+        int mutualPort = -1;
+        int usernamePasswordPort = -1;
+        for (Endpoint endpoint : nettyServer.getBindEndpoints()) {
+            if ("CLIENT1".equals(endpoint.getListenerName())) {
+                mutualPort = endpoint.getPort();
+            } else if ("CLIENT2".equals(endpoint.getListenerName())) {
+                usernamePasswordPort = endpoint.getPort();
+            }
         }
+        mutualAuthServerNode = new ServerNode(1, "localhost", mutualPort, ServerType.TABLET_SERVER);
+        usernamePasswordServerNode =
+                new ServerNode(2, "localhost", usernamePasswordPort, ServerType.TABLET_SERVER);
     }
 
     /**

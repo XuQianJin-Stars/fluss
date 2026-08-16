@@ -31,8 +31,8 @@ import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.testutils.common.MultiVersionTest;
 
@@ -595,7 +595,7 @@ public abstract class FlinkProcedureITCase {
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void testAddAndRemoveServerTag(boolean upperCase) throws Exception {
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         assertThat(zkClient.getServerTags()).isNotPresent();
 
         String addServerTag =
@@ -740,7 +740,7 @@ public abstract class FlinkProcedureITCase {
         }
 
         // delete rebalance plan to avoid conflict with other tests.
-        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient().deleteRebalanceTask();
+        FLUSS_CLUSTER_EXTENSION.metadataStore().deleteRebalanceTask();
     }
 
     @Test
@@ -1046,7 +1046,7 @@ public abstract class FlinkProcedureITCase {
         assertResultsIgnoreOrder(rowIter, expectedRows, false);
 
         // Lease will not be dropped automatically as the checkpoint not trigger.
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         assertThat(zkClient.getKvSnapshotLeaseMetadata(leaseId)).isPresent();
         tEnv.executeSql(
                         String.format(

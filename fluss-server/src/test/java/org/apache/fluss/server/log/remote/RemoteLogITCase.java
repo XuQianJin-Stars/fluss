@@ -131,10 +131,20 @@ public class RemoteLogITCase {
         RemoteLogManager remoteLogManager = tabletServer.getReplicaManager().getRemoteLogManager();
         RemoteLogTablet remoteLogTablet = remoteLogManager.remoteLogTablet(tb);
 
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        assertThat(
+                                        remoteLogManager
+                                                .remoteLogTablet(tb)
+                                                .currentManifest()
+                                                .getRemoteLogSegmentList()
+                                                .size())
+                                .isGreaterThan(0));
+
         RemoteLogManifest manifest = remoteLogTablet.currentManifest();
         assertThat(manifest.getPhysicalTablePath().getTablePath()).isEqualTo(DATA1_TABLE_PATH);
         assertThat(manifest.getTableBucket()).isEqualTo(tb);
-        assertThat(manifest.getRemoteLogSegmentList().size()).isGreaterThan(0);
 
         // test create: verify remote log created
         FsPath fsPath =
@@ -194,34 +204,61 @@ public class RemoteLogITCase {
             }
         }
         // kill follower, and restart after some segments in leader has been copied to remote.
+        // Always restart in finally so a failed remote-copy wait does not leave the shared
+        // cluster with only 2 tablet servers for subsequent tests.
         FLUSS_CLUSTER_EXTENSION.stopTabletServer(follower);
+        boolean followerRestarted = false;
+        try {
+            // ManualClock is frozen for TTL tests. Until time advances past
+            // log.replica.max-lag-time, maybeIncrementLeaderHW still treats lagging / stopped
+            // followers as "caught up" and clamps HW to their LEO (often 0). Advance past the
+            // configured max lag (5s). Sleep briefly afterward so live servers' heartbeats refresh
+            // lastContact at the new clock (TabletServerLivenessManager shares this ManualClock).
+            MANUAL_CLOCK.advanceTime(Duration.ofSeconds(6));
+            Thread.sleep(2000);
 
-        TabletServerGateway leaderGateWay =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
-        // produce many records to trigger remote log copy.
-        for (int i = 0; i < 10; i++) {
-            assertProduceLogResponse(
-                    leaderGateWay
-                            .produceLog(
-                                    newProduceLogRequest(
-                                            tableId,
-                                            0,
-                                            1,
-                                            withWriterId
-                                                    ? genMemoryLogRecordsWithWriterId(
-                                                            DATA1, 100, i, 0L)
-                                                    : genMemoryLogRecordsByObject(DATA1)))
-                            .get(),
-                    0,
-                    i * 10L);
+            TabletServerGateway leaderGateWay =
+                    FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+            // produce many records to trigger remote log copy.
+            for (int i = 0; i < 10; i++) {
+                assertProduceLogResponse(
+                        leaderGateWay
+                                .produceLog(
+                                        newProduceLogRequest(
+                                                tableId,
+                                                0,
+                                                1,
+                                                withWriterId
+                                                        ? genMemoryLogRecordsWithWriterId(
+                                                                DATA1, 100, i, 0L)
+                                                        : genMemoryLogRecordsByObject(DATA1)))
+                                .get(),
+                        0,
+                        i * 10L);
+            }
+
+            FLUSS_CLUSTER_EXTENSION.waitUntilReplicaShrinkFromIsr(tb, follower);
+            retry(
+                    Duration.ofMinutes(1),
+                    () ->
+                            assertThat(
+                                            FLUSS_CLUSTER_EXTENSION
+                                                    .waitAndGetLeaderReplica(tb)
+                                                    .getLogTablet()
+                                                    .getHighWatermark())
+                                    .isGreaterThan(0L));
+            FLUSS_CLUSTER_EXTENSION.waitUntilSomeLogSegmentsCopyToRemote(tb);
+
+            // restart follower
+            FLUSS_CLUSTER_EXTENSION.startTabletServer(follower);
+            followerRestarted = true;
+            FLUSS_CLUSTER_EXTENSION.waitUntilReplicaExpandToIsr(tb, follower);
+        } finally {
+            if (!followerRestarted) {
+                FLUSS_CLUSTER_EXTENSION.startTabletServer(follower);
+                FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+            }
         }
-
-        FLUSS_CLUSTER_EXTENSION.waitUntilReplicaShrinkFromIsr(tb, follower);
-        FLUSS_CLUSTER_EXTENSION.waitUntilSomeLogSegmentsCopyToRemote(tb);
-
-        // restart follower
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(follower);
-        FLUSS_CLUSTER_EXTENSION.waitUntilReplicaExpandToIsr(tb, follower);
     }
 
     @Test
@@ -285,11 +322,15 @@ public class RemoteLogITCase {
                 .get();
         retry(Duration.ofMinutes(1), () -> assertThat(logTablet.isDataLakeEnabled()).isTrue());
 
-        // Produce new data after enabling lake (baseOffset = 100 from Stage A)
+        // Produce new data after enabling lake (baseOffset = 100 from Stage A).
+        // Stage C needs >= 2 remote segments for partial lake-offset cleanup; waiting only
+        // for "some" segments can proceed after the first remote copy and flake.
         produceRecordsAndWaitRemoteLogCopy(leaderGateway, tb, 100L);
         retry(
                 Duration.ofMinutes(2),
-                () -> assertThat(remoteLogTablet.allRemoteLogSegments().size()).isGreaterThan(0));
+                () ->
+                        assertThat(remoteLogTablet.allRemoteLogSegments().size())
+                                .isGreaterThanOrEqualTo(2));
         int stageBSegmentCount = remoteLogTablet.allRemoteLogSegments().size();
         long stageBRemoteLogEndOffset = remoteLogTablet.getRemoteLogEndOffset().orElse(-1L);
         assertThat(stageBRemoteLogEndOffset).isGreaterThan(0L);

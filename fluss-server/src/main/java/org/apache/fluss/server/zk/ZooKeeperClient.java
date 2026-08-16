@@ -35,10 +35,13 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.security.acl.AccessControlEntry;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.security.acl.ResourceType;
-import org.apache.fluss.server.authorizer.DefaultAuthorizer.VersionedAcls;
+import org.apache.fluss.server.authorizer.VersionedAcls;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
+import org.apache.fluss.server.coordinator.CoordinatorLeaderElection;
+import org.apache.fluss.server.coordinator.LeaderElection;
 import org.apache.fluss.server.entity.RegisterTableBucketLeadAndIsrInfo;
 import org.apache.fluss.server.metadata.BucketMetadata;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.ZkAsyncRequest.ZkCheckExistsRequest;
 import org.apache.fluss.server.zk.ZkAsyncRequest.ZkGetChildrenRequest;
 import org.apache.fluss.server.zk.ZkAsyncRequest.ZkGetDataRequest;
@@ -56,6 +59,7 @@ import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.ResourceAcl;
 import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableBucketAndManifest;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 import org.apache.fluss.server.zk.data.ZkData;
@@ -175,7 +179,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * </ul>
  */
 @Internal
-public class ZooKeeperClient implements AutoCloseable {
+public class ZooKeeperClient implements MetadataStoreClient {
 
     private static final Logger LOG = LoggerFactory.getLogger(ZooKeeperClient.class);
     public static final int UNKNOWN_VERSION = -2;
@@ -238,6 +242,17 @@ public class ZooKeeperClient implements AutoCloseable {
                 .withMode(CreateMode.EPHEMERAL)
                 .forPath(path, ZkData.CoordinatorIdZNode.encode(coordinatorAddress));
         LOG.info("Registered Coordinator server {} at path {}.", coordinatorAddress, path);
+    }
+
+    /**
+     * Creates the ZooKeeper-backed coordinator {@link LeaderElection} (Curator {@code
+     * LeaderLatch}). This is the object {@code CoordinatorServer} builds today, now produced behind
+     * the {@link MetadataStoreClient} contract so the leader-election creation is backend-agnostic
+     * (§5.5.2).
+     */
+    @Override
+    public LeaderElection newLeaderSelector(String serverId) {
+        return new CoordinatorLeaderElection(this, serverId);
     }
 
     /**
@@ -1400,26 +1415,6 @@ public class ZooKeeperClient implements AutoCloseable {
         return result;
     }
 
-    /** Tuple of a table bucket and its current remote log manifest handle. */
-    public static final class TableBucketAndManifest {
-        private final TableBucket tableBucket;
-        private final RemoteLogManifestHandle manifestHandle;
-
-        public TableBucketAndManifest(
-                TableBucket tableBucket, RemoteLogManifestHandle manifestHandle) {
-            this.tableBucket = tableBucket;
-            this.manifestHandle = manifestHandle;
-        }
-
-        public TableBucket getTableBucket() {
-            return tableBucket;
-        }
-
-        public RemoteLogManifestHandle getManifestHandle() {
-            return manifestHandle;
-        }
-    }
-
     /**
      * Lists the snapshot ids of all completed bucket snapshots for the given {@link TableBucket}.
      * Reads only the {@code BucketSnapshotsZNode} children — the per-snapshot payload is not
@@ -1649,6 +1644,20 @@ public class ZooKeeperClient implements AutoCloseable {
         return getOrEmpty(path).map(ServerTagsZNode::decode);
     }
 
+    /** Lists the ids of all tables that currently have a bucket assignment. */
+    public List<Long> listAssignedTableIds() throws Exception {
+        return getChildren(ZkData.TableIdsZNode.path()).stream()
+                .map(Long::parseLong)
+                .collect(Collectors.toList());
+    }
+
+    /** Lists the ids of all partitions that currently have a bucket assignment. */
+    public List<Long> listAssignedPartitionIds() throws Exception {
+        return getChildren(ZkData.PartitionIdsZNode.path()).stream()
+                .map(Long::parseLong)
+                .collect(Collectors.toList());
+    }
+
     public void deleteServerTags() throws Exception {
         deletePath(ServerTagsZNode.path());
     }
@@ -1671,8 +1680,8 @@ public class ZooKeeperClient implements AutoCloseable {
         return getOrEmpty(path).map(RebalanceZNode::decode);
     }
 
-    /** Deletes the rebalance task from ZooKeeper. Only for testing propose now */
-    @VisibleForTesting
+    /** Deletes the rebalance task from ZooKeeper. */
+    @Override
     public void deleteRebalanceTask() throws Exception {
         deletePath(RebalanceZNode.path());
     }

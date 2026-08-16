@@ -192,6 +192,9 @@ public class ReplicaTestBase {
     @BeforeEach
     public void setup(TestInfo testInfo) throws Exception {
         conf = getServerConf();
+        // Host disks over the default 0.85 write-limit (common on developer machines)
+        // must not reject replica writes. Disk-lock tests re-enable the limit explicitly.
+        conf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 1.0);
         conf.set(ConfigOptions.TABLET_SERVER_ID, TABLET_SERVER_ID);
         if (testInfo != null && testInfo.getTags().contains(ServerTestTags.JBOD_MULTI_DIR_TAG)) {
             conf.set(
@@ -418,6 +421,10 @@ public class ReplicaTestBase {
         if (ioExecutor != null) {
             ioExecutor.shutdown();
         }
+
+        // TestingMetricGroups.TABLET_SERVER_METRICS is a static singleton; drop table/bucket
+        // subgroups so gauges (e.g. localLogSize) do not leak into the next test.
+        TestingMetricGroups.TABLET_SERVER_METRICS.clearTableMetricGroups();
 
         // clear zk environment.
         ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupRoot();

@@ -20,7 +20,6 @@ package org.apache.fluss.server.metadata;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.MetadataManager;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 
 import java.util.Collection;
 import java.util.List;
@@ -58,7 +57,7 @@ public class TabletServerMetadataProvider extends ZkBasedMetadataProvider {
      * @param metadataCache the local metadata cache for efficient metadata access
      */
     public TabletServerMetadataProvider(
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             MetadataManager metadataManager,
             TabletServerMetadataCache metadataCache) {
         super(zkClient, metadataManager);

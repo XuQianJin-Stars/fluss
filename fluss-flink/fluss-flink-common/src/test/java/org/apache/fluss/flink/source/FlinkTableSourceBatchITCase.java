@@ -156,7 +156,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         String tableName = prepareSourceTable(new String[] {"id", "dt"}, "dt");
         TablePath tablePath = TablePath.of(databaseName, tableName);
         Map<Long, String> partitionNameById =
-                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath);
+                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath);
         Iterator<String> partitionIterator =
                 partitionNameById.values().stream().sorted().iterator();
         String partition1 = partitionIterator.next();
@@ -210,7 +210,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
 
         TablePath srcTablePath = TablePath.of(databaseName, srcTableName);
         Map<Long, String> partitionNameById =
-                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), srcTablePath);
+                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), srcTablePath);
         // just pick first partition to insert data
         Iterator<String> partitionIterator =
                 partitionNameById.values().stream().sorted().iterator();
@@ -279,7 +279,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         if (partitionTable) {
             String partition =
                     waitUntilPartitions(
-                                    FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(),
+                                    FLUSS_CLUSTER_EXTENSION.metadataStore(),
                                     TablePath.of(databaseName, tableName))
                             .values()
                             .stream()
@@ -316,7 +316,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         if (partitionTable) {
             Collection<String> partitions =
                     waitUntilPartitions(
-                                    FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(),
+                                    FLUSS_CLUSTER_EXTENSION.metadataStore(),
                                     TablePath.of(databaseName, tableName))
                             .values();
             expected =
@@ -940,7 +940,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         String partition1 = null;
         if (partitionedKey != null) {
             Map<Long, String> partitionNameById =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath);
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath);
             // just pick first partition to insert data
             Iterator<String> partitionIterator =
                     partitionNameById.values().stream().sorted().iterator();
@@ -1011,7 +1011,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
 
         TablePath tablePath = TablePath.of(databaseName, tableName);
         Map<Long, String> partitionNameById =
-                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath);
+                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath);
         Collection<String> partitions = partitionNameById.values();
 
         // prepare table data with NULL values in address column

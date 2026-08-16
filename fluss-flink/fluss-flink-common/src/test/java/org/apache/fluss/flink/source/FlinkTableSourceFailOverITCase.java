@@ -23,8 +23,8 @@ import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.testutils.common.MultiVersionTest;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -84,14 +84,14 @@ abstract class FlinkTableSourceFailOverITCase {
                     .build();
 
     org.apache.fluss.config.Configuration clientConf;
-    ZooKeeperClient zkClient;
+    MetadataStoreClient zkClient;
     Connection conn;
     MiniClusterWithClientResource cluster;
 
     @BeforeEach
     protected void beforeEach() throws Exception {
         clientConf = FLUSS_CLUSTER_EXTENSION.getClientConfig();
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         conn = ConnectionFactory.createConnection(clientConf);
 
         cluster =

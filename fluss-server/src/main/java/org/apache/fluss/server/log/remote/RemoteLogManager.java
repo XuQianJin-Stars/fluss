@@ -30,9 +30,9 @@ import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.storage.LocalDiskManager;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
@@ -80,7 +80,7 @@ public class RemoteLogManager implements Closeable {
     private final CoordinatorGateway coordinatorGateway;
     private final ScheduledExecutorService rlManagerScheduledThreadPool;
     private final Clock clock;
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
     private final LogManager logManager;
 
     private final Map<TableBucket, TaskWithFuture> rlmTasks = new ConcurrentHashMap<>();
@@ -88,7 +88,7 @@ public class RemoteLogManager implements Closeable {
 
     public RemoteLogManager(
             Configuration conf,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             CoordinatorGateway coordinatorGateway,
             LocalDiskManager localDiskManager,
             LogManager logManager,
@@ -111,7 +111,7 @@ public class RemoteLogManager implements Closeable {
     @VisibleForTesting
     public RemoteLogManager(
             Configuration conf,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             CoordinatorGateway coordinatorGateway,
             LocalDiskManager localDiskManager,
             LogManager logManager,

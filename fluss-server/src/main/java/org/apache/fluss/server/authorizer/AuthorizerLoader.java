@@ -20,6 +20,7 @@ package org.apache.fluss.server.authorizer;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.ValidationException;
 import org.apache.fluss.plugin.PluginManager;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 
 import javax.annotation.Nullable;
@@ -42,7 +43,7 @@ public class AuthorizerLoader {
     /** Load authorizer. */
     public static @Nullable Authorizer createAuthorizer(
             Configuration configuration,
-            ZooKeeperClient zooKeeperClient,
+            @Nullable MetadataStoreClient metadataStoreClient,
             @Nullable PluginManager pluginManager) {
         if (!configuration.get(AUTHORIZER_ENABLED)) {
             return null;
@@ -87,18 +88,18 @@ public class AuthorizerLoader {
 
         return matchingPlugins
                 .get(0)
-                .createAuthorizer(new DefaultContext(configuration, zooKeeperClient));
+                .createAuthorizer(new DefaultContext(configuration, metadataStoreClient));
     }
 
     /** Default implementation of {@link AuthorizationPlugin.Context}. */
     public static class DefaultContext implements AuthorizationPlugin.Context {
         private final Configuration configuration;
-        private final ZooKeeperClient zooKeeperClient;
+        @Nullable private final MetadataStoreClient metadataStoreClient;
 
         public DefaultContext(
-                Configuration configuration, @Nullable ZooKeeperClient zooKeeperClient) {
+                Configuration configuration, @Nullable MetadataStoreClient metadataStoreClient) {
             this.configuration = configuration;
-            this.zooKeeperClient = zooKeeperClient;
+            this.metadataStoreClient = metadataStoreClient;
         }
 
         @Override
@@ -108,7 +109,14 @@ public class AuthorizerLoader {
 
         @Override
         public Optional<ZooKeeperClient> getZooKeeperClient() {
-            return Optional.ofNullable(zooKeeperClient);
+            return metadataStoreClient instanceof ZooKeeperClient
+                    ? Optional.of((ZooKeeperClient) metadataStoreClient)
+                    : Optional.empty();
+        }
+
+        @Override
+        public Optional<MetadataStoreClient> getMetadataStoreClient() {
+            return Optional.ofNullable(metadataStoreClient);
         }
     }
 }

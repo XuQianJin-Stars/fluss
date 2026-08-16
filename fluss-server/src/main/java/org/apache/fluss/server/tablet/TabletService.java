@@ -19,6 +19,7 @@ package org.apache.fluss.server.tablet;
 
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.exception.AuthorizationException;
+import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidScanRequestException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
@@ -42,6 +43,8 @@ import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusRequest;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusResponse;
 import org.apache.fluss.rpc.messages.GetTableStatsRequest;
 import org.apache.fluss.rpc.messages.GetTableStatsResponse;
 import org.apache.fluss.rpc.messages.InitWriterRequest;
@@ -83,8 +86,11 @@ import org.apache.fluss.security.acl.OperationType;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.server.DynamicConfigManager;
 import org.apache.fluss.server.RpcServiceBase;
+import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.coordinator.raft.AllocateIdRpcServer;
+import org.apache.fluss.server.coordinator.raft.RaftRemoteSequenceIDCounter;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LookupDataForBucket;
 import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
@@ -101,6 +107,7 @@ import org.apache.fluss.server.log.FetchParamsBuilder;
 import org.apache.fluss.server.log.FilterInfo;
 import org.apache.fluss.server.log.ListOffsetsParam;
 import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metadata.TabletServerMetadataProvider;
 import org.apache.fluss.server.replica.Replica;
@@ -168,10 +175,17 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     private final String interListenerName;
     private final ExecutorService replicaStateChangeExecutor;
 
+    /**
+     * The Raft-backend writer-id counter: reserves the single global writer id from the coordinator
+     * leader via the {@code AllocateId} RPC (kind {@link AllocateIdRpcServer#KIND_WRITER}). {@code
+     * null} on the ZooKeeper backend, where {@link MetadataManager#initWriterId()} is used instead.
+     */
+    @Nullable private final SequenceIDCounter writerIdCounter;
+
     public TabletService(
             int serverId,
             FileSystem remoteFileSystem,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             ReplicaManager replicaManager,
             TabletServerMetadataCache metadataCache,
             MetadataManager metadataManager,
@@ -199,6 +213,17 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
         this.coordinatorGateway = coordinatorGateway;
         this.interListenerName = interListenerName;
         this.replicaStateChangeExecutor = replicaStateChangeExecutor;
+        // On Raft the writer id is a single global id reserved from the coordinator leader via the
+        // AllocateId RPC (the tablet server holds no leader-capable metadata client). On ZooKeeper
+        // MetadataManager#initWriterId() (getWriterIdAndIncrement) is used, so leave the counter
+        // null.
+        this.writerIdCounter =
+                zkClient instanceof ZooKeeperClient
+                        ? null
+                        : new RaftRemoteSequenceIDCounter(
+                                request -> this.coordinatorGateway.allocateId(request),
+                                AllocateIdRpcServer.KIND_WRITER,
+                                new byte[0]);
     }
 
     @Override
@@ -477,8 +502,26 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                         .collect(Collectors.toList());
         authorizeAnyTable(WRITE, tablePathsList);
         CompletableFuture<InitWriterResponse> response = new CompletableFuture<>();
-        response.complete(makeInitWriterResponse(metadataManager.initWriterId()));
+        response.complete(makeInitWriterResponse(allocateWriterId()));
         return response;
+    }
+
+    /**
+     * Allocates a globally-unique writer id: on Raft from the coordinator leader via the {@code
+     * AllocateId} RPC, on ZooKeeper via {@link MetadataManager#initWriterId()}.
+     */
+    private long allocateWriterId() {
+        if (writerIdCounter != null) {
+            try {
+                return writerIdCounter.getAndIncrement();
+            } catch (Exception e) {
+                throw new FlussRuntimeException(
+                        "Failed to allocate a writer id from the "
+                                + "coordinator leader via the AllocateId RPC.",
+                        e);
+            }
+        }
+        return metadataManager.initWriterId();
     }
 
     @Override
@@ -540,6 +583,23 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             return failed;
         }
         return coordinatorGateway.getClusterHealth(request);
+    }
+
+    @Override
+    public CompletableFuture<GetCoordinatorRaftStatusResponse> getCoordinatorRaftStatus(
+            GetCoordinatorRaftStatusRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+        if (metadataCache.getCoordinatorServer(interListenerName) == null) {
+            CompletableFuture<GetCoordinatorRaftStatusResponse> failed = new CompletableFuture<>();
+            failed.completeExceptionally(
+                    new StaleMetadataException(
+                            "Tablet server has not yet received coordinator metadata; raft"
+                                    + " status is unavailable."));
+            return failed;
+        }
+        return coordinatorGateway.getCoordinatorRaftStatus(request);
     }
 
     @Override

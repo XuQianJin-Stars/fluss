@@ -45,6 +45,7 @@ import org.apache.fluss.utils.ExceptionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.util.ArrayList;
@@ -111,6 +112,8 @@ public class Sender implements Runnable {
 
     private final WriterMetricGroup writerMetricGroup;
 
+    @Nullable private volatile DynamicPartitionCreator dynamicPartitionCreator;
+
     public Sender(
             RecordAccumulator accumulator,
             int maxRequestTimeoutMs,
@@ -135,6 +138,10 @@ public class Sender implements Runnable {
         this.writerMetricGroup = writerMetricGroup;
 
         // TODO add retry logic while send failed. See FLUSS-56364375
+    }
+
+    void setDynamicPartitionCreator(DynamicPartitionCreator dynamicPartitionCreator) {
+        this.dynamicPartitionCreator = dynamicPartitionCreator;
     }
 
     @VisibleForTesting
@@ -211,11 +218,19 @@ public class Sender implements Runnable {
     }
 
     private void sendWriteData() throws Exception {
+        if (dynamicPartitionCreator != null) {
+            dynamicPartitionCreator.refreshPendingCreatedPartitions();
+        }
+
         Cluster clusterSnapshot = metadataUpdater.getCluster();
 
         // Refresh per-bucket throttle entries against the current cluster snapshot,
         // dropping any whose bucket has disappeared from metadata.
         accumulator.maybeEvictStaleThrottles(clusterSnapshot);
+
+        // Fail records that have been stuck (unknown leader / pending dynamic partition)
+        // longer than the request timeout so flush() cannot hang indefinitely.
+        accumulator.abortExpiredBatches(maxRequestTimeoutMs);
 
         // get the list of buckets with data ready to send.
         ReadyCheckResult readyCheckResult = accumulator.ready(clusterSnapshot);
@@ -253,8 +268,6 @@ public class Sender implements Runnable {
 
         if (!batches.isEmpty()) {
             addToInflightBatches(batches);
-
-            // TODO add logic for batch expire.
 
             sendWriteRequests(batches);
 
@@ -533,12 +546,14 @@ public class Sender implements Runnable {
     private void handleWriteRequestException(Throwable t, List<ReadyWriteBatch> writeBatches) {
         ApiError error = ApiError.fromThrowable(t);
 
-        // if batch failed because of retrievable exception, we need to retry send all those
-        // batches.
+        // RPC-level failure (disconnect, timeout, connection refused) is not a per-bucket
+        // InvalidMetadataException, but the destination node is gone or unreachable. Drop
+        // cached leaders so the retry is not sent to the same dead server.
         Set<PhysicalTablePath> invalidMetadataTablesSet = new HashSet<>();
         for (ReadyWriteBatch batch : writeBatches) {
             Set<PhysicalTablePath> invalidMetadataTables = handleWriteBatchException(batch, error);
             invalidMetadataTablesSet.addAll(invalidMetadataTables);
+            invalidMetadataTablesSet.add(batch.writeBatch().physicalTablePath());
         }
 
         metadataUpdater.invalidPhysicalTableBucketMeta(invalidMetadataTablesSet);

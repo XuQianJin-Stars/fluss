@@ -514,6 +514,7 @@ public class ReplicaFetcherThreadTest {
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.TABLET_SERVER_ID, serverId);
         conf.setString(ConfigOptions.DATA_DIR, tempDir.getAbsolutePath() + "/server-" + serverId);
+        conf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 1.0);
         return LocalDiskManager.create(conf);
     }
 
@@ -523,6 +524,7 @@ public class ReplicaFetcherThreadTest {
         conf.set(ConfigOptions.TABLET_SERVER_ID, serverId);
         conf.setString(ConfigOptions.DATA_DIR, tempDir.getAbsolutePath() + "/server-" + serverId);
         conf.set(ConfigOptions.WRITER_ID_EXPIRATION_TIME, Duration.ofHours(12));
+        conf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 1.0);
         Scheduler scheduler = new FlussScheduler(2);
         scheduler.startup();
 

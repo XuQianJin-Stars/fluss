@@ -39,6 +39,9 @@ case $DAEMON in
     ;;
 
     (zookeeper)
+        # Dual-support: ZooKeeper daemon is only meaningful when zookeeper.address is set.
+        # Callers (e.g. local-cluster.sh) should gate start/stop; this keeps the daemon
+        # entry for explicit ZK-mode operations.
         CLASS_TO_RUN=org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.server.quorum.QuorumPeerMain
     ;;
 

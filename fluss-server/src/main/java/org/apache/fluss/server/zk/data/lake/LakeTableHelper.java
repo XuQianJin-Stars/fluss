@@ -23,7 +23,7 @@ import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.json.TableBucketOffsets;
 import org.apache.fluss.utils.types.Tuple2;
@@ -42,10 +42,10 @@ import static org.apache.fluss.metrics.registry.MetricRegistry.LOG;
 /** The helper to handle {@link LakeTable}. */
 public class LakeTableHelper {
 
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
     private final String remoteDataDir;
 
-    public LakeTableHelper(ZooKeeperClient zkClient, String remoteDataDir) {
+    public LakeTableHelper(MetadataStoreClient zkClient, String remoteDataDir) {
         this.zkClient = zkClient;
         this.remoteDataDir = remoteDataDir;
     }

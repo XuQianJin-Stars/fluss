@@ -1,0 +1,16 @@
+fluss-shaded-ratis
+Copyright 2025-2026 The Apache Software Foundation
+
+This project includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+
+This project bundles the following dependencies under the Apache Software License 2.0 (http://www.apache.org/licenses/LICENSE-2.0.txt)
+
+- org.apache.ratis:ratis-client:2.4.1
+- org.apache.ratis:ratis-common:2.4.1
+- org.apache.ratis:ratis-grpc:2.4.1
+- org.apache.ratis:ratis-metrics:2.4.1
+- org.apache.ratis:ratis-proto:2.4.1
+- org.apache.ratis:ratis-server-api:2.4.1
+- org.apache.ratis:ratis-server:2.4.1
+- org.apache.ratis:ratis-thirdparty-misc:1.0.3

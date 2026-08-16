@@ -34,8 +34,8 @@ import org.apache.fluss.server.coordinator.rebalance.goal.GoalOptimizer;
 import org.apache.fluss.server.coordinator.rebalance.model.ClusterModel;
 import org.apache.fluss.server.coordinator.rebalance.model.RackModel;
 import org.apache.fluss.server.coordinator.rebalance.model.ServerModel;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metadata.ServerInfo;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.RebalanceTask;
 import org.apache.fluss.utils.clock.Clock;
@@ -84,7 +84,7 @@ public class RebalanceManager {
     /** Hardcoded interval for the periodic timeout check: 30 seconds. */
     private static final long TIMEOUT_CHECK_INTERVAL_MS = 30 * 1000L;
 
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
     private final CoordinatorEventProcessor eventProcessor;
     private final EventManager eventManager;
     private final Clock clock;
@@ -123,7 +123,7 @@ public class RebalanceManager {
 
     public RebalanceManager(
             CoordinatorEventProcessor eventProcessor,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             EventManager eventManager,
             Clock clock) {
         this(
@@ -140,7 +140,7 @@ public class RebalanceManager {
     @VisibleForTesting
     RebalanceManager(
             CoordinatorEventProcessor eventProcessor,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             EventManager eventManager,
             Clock clock,
             ScheduledExecutorService timeoutChecker) {

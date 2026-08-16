@@ -24,6 +24,8 @@ import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusRequest;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusResponse;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenRequest;
@@ -202,4 +204,14 @@ public interface AdminReadOnlyGateway extends RpcGateway {
      */
     @RPC(api = ApiKeys.GET_CLUSTER_HEALTH)
     CompletableFuture<GetClusterHealthResponse> getClusterHealth(GetClusterHealthRequest request);
+
+    /**
+     * Returns the current coordinator Raft status (leader identity, term, commit/applied indexes,
+     * and optionally the voter lag table). On the ZooKeeper backend {@code is_raft_mode} is false.
+     *
+     * @return the coordinator Raft status response
+     */
+    @RPC(api = ApiKeys.GET_COORDINATOR_RAFT_STATUS)
+    CompletableFuture<GetCoordinatorRaftStatusResponse> getCoordinatorRaftStatus(
+            GetCoordinatorRaftStatusRequest request);
 }

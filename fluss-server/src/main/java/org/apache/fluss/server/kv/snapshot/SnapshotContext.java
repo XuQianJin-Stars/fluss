@@ -20,19 +20,37 @@ package org.apache.fluss.server.kv.snapshot;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.rpc.messages.AllocateIdRequest;
+import org.apache.fluss.rpc.messages.AllocateIdResponse;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.utils.function.FunctionWithException;
 
+import javax.annotation.Nullable;
+
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Function;
 
 /**
  * A context to provide necessary objects/parameters used by kv snapshot and recover from snapshot.
  */
 public interface SnapshotContext {
 
-    /** Get the zookeeper client. */
-    ZooKeeperClient getZooKeeperClient();
+    /** Get the backend-neutral metadata store client. */
+    MetadataStoreClient getZooKeeperClient();
+
+    /**
+     * The Raft-backend transport for reserving bucket-snapshot id ranges from the coordinator
+     * leader via the {@code AllocateId} RPC. {@code null} on the ZooKeeper backend (a per-bucket
+     * {@code ZkSequenceIDCounter} znode is used instead). See {@code zookeeper-removal-design.md}
+     * §5.3.
+     */
+    @Nullable
+    default Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+            getAllocateIdTransport() {
+        return null;
+    }
 
     /** Get the thread pool to execute tasks running in the async phase of kv snapshot . */
     ExecutorService getAsyncOperationsThreadPool();

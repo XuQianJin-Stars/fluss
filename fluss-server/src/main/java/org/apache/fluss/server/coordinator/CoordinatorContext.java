@@ -28,7 +28,6 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.statemachine.BucketState;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaState;
 import org.apache.fluss.server.metadata.ServerInfo;
-import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -131,9 +130,9 @@ public class CoordinatorContext {
 
     private ServerInfo coordinatorServerInfo = null;
 
-    public CoordinatorContext(ZkEpoch zkEpoch) {
-        this.coordinatorEpoch = zkEpoch.getCoordinatorEpoch();
-        this.coordinatorEpochZkVersion = zkEpoch.getCoordinatorEpochZkVersion();
+    public CoordinatorContext(CoordinatorEpoch epoch) {
+        this.coordinatorEpoch = epoch.coordinatorEpoch();
+        this.coordinatorEpochZkVersion = epoch.coordinatorEpochVersion();
     }
 
     public int getCoordinatorEpoch() {

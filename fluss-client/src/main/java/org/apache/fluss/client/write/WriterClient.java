@@ -125,15 +125,16 @@ public class WriterClient {
                     new RecordAccumulator(
                             conf, idempotenceManager, writerMetricGroup, SystemClock.getInstance());
             this.sender = newSender(acks, retries);
-            this.ioThreadPool = createThreadPool();
-            ioThreadPool.submit(sender);
-
             this.dynamicPartitionCreator =
                     new DynamicPartitionCreator(
                             metadataUpdater,
                             admin,
                             conf.get(ConfigOptions.CLIENT_WRITER_DYNAMIC_CREATE_PARTITION_ENABLED),
-                            this::maybeAbortBatches);
+                            this::maybeAbortBatches,
+                            sender::wakeup);
+            sender.setDynamicPartitionCreator(dynamicPartitionCreator);
+            this.ioThreadPool = createThreadPool();
+            ioThreadPool.submit(sender);
         } catch (Throwable t) {
             LOG.error("Failed to construct writer.", t);
             close(Duration.ofMillis(0));

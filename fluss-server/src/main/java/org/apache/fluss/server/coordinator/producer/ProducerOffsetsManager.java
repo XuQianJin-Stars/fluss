@@ -27,7 +27,7 @@ import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.types.Tuple2;
@@ -75,7 +75,7 @@ public class ProducerOffsetsManager implements AutoCloseable {
     private final long cleanupIntervalMs;
     private final ScheduledExecutorService cleanupScheduler;
 
-    public ProducerOffsetsManager(Configuration conf, ZooKeeperClient zkClient) {
+    public ProducerOffsetsManager(Configuration conf, MetadataStoreClient zkClient) {
         this(
                 new ProducerOffsetsStore(zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR)),
                 conf.get(ConfigOptions.COORDINATOR_PRODUCER_OFFSETS_TTL).toMillis(),

@@ -283,7 +283,8 @@ if [ -z "${FLUSS_SSH_OPTS}" ]; then
     FLUSS_SSH_OPTS=$(readFromConfig ${KEY_ENV_SSH_OPTS} "${DEFAULT_ENV_SSH_OPTS}" "${YAML_CONF}")
 fi
 
-# Define ZK_HEAP if it is not already set
+# Define ZK_HEAP if it is not already set (only used when starting the ZooKeeper daemon).
+# Raft mode does not launch ZooKeeper; see local-cluster.sh dual-support gating.
 if [ -z "${ZK_HEAP}" ]; then
     ZK_HEAP=$(readFromConfig ${KEY_ZK_HEAP_MB} 0 "${YAML_CONF}")
 fi

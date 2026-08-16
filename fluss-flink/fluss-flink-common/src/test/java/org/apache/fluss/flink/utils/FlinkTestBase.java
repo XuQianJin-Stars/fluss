@@ -36,9 +36,10 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.types.DataTypes;
 
@@ -191,9 +192,9 @@ public class FlinkTestBase extends AbstractTestBase {
      * partition name.
      */
     public static Map<Long, String> waitUntilPartitions(
-            ZooKeeperClient zooKeeperClient, TablePath tablePath) {
+            MetadataStoreClient metadataStore, TablePath tablePath) {
         return waitUntilPartitions(
-                zooKeeperClient,
+                metadataStore,
                 tablePath,
                 ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.defaultValue());
     }
@@ -203,11 +204,10 @@ public class FlinkTestBase extends AbstractTestBase {
      * partition name.
      */
     public static Map<Long, String> waitUntilPartitions(
-            ZooKeeperClient zooKeeperClient, TablePath tablePath, int expectPartitions) {
+            MetadataStoreClient metadataStore, TablePath tablePath, int expectPartitions) {
         return waitValue(
                 () -> {
-                    Map<Long, String> gotPartitions =
-                            zooKeeperClient.getPartitionIdAndNames(tablePath);
+                    Map<Long, String> gotPartitions = partitionIdAndNames(metadataStore, tablePath);
                     return expectPartitions == gotPartitions.size()
                             ? Optional.of(gotPartitions)
                             : Optional.empty();
@@ -216,18 +216,37 @@ public class FlinkTestBase extends AbstractTestBase {
                 String.format("expect %d table partition has not been created", expectPartitions));
     }
 
+    /** Returns {@code partitionId -> partitionName} for all partitions of {@code tablePath}. */
+    public static Map<Long, String> partitionIdAndNames(
+            MetadataStoreClient metadataStore, TablePath tablePath) throws Exception {
+        Map<Long, String> result = new HashMap<>();
+        for (Map.Entry<String, PartitionRegistration> entry :
+                metadataStore.getPartitionRegistrations(tablePath).entrySet()) {
+            result.put(entry.getValue().getPartitionId(), entry.getKey());
+        }
+        return result;
+    }
+
     public static Map<Long, String> createPartitions(
-            ZooKeeperClient zkClient, TablePath tablePath, List<String> partitionsToCreate)
+            MetadataStoreClient metadataStore, TablePath tablePath, List<String> partitionsToCreate)
             throws Exception {
         MetadataManager metadataManager =
                 new MetadataManager(
-                        zkClient,
+                        metadataStore,
                         new Configuration(),
                         new LakeCatalogDynamicLoader(new Configuration(), null, false));
         TableInfo tableInfo = metadataManager.getTable(tablePath);
+        // Use the table's own remote dir. Callers such as FlinkTableSourceFailOverITCase have
+        // their own FlussClusterExtension; FlinkTestBase.FLUSS_CLUSTER_EXTENSION.tempDir is
+        // then null and getRemoteDataDir() NPEs.
+        String remoteDataDir = tableInfo.getRemoteDataDir();
+        if (remoteDataDir == null) {
+            throw new IllegalStateException(
+                    "Table " + tablePath + " has no remoteDataDir; cannot register partitions");
+        }
         Map<Long, String> newPartitionIds = new HashMap<>();
         for (String partition : partitionsToCreate) {
-            long partitionId = zkClient.getPartitionIdAndIncrement();
+            long partitionId = metadataStore.getPartitionIdAndIncrement();
             newPartitionIds.put(partitionId, partition);
             TableAssignment assignment =
                     generateAssignment(
@@ -240,12 +259,12 @@ public class FlinkTestBase extends AbstractTestBase {
                             });
 
             // register partition assignments and metadata
-            zkClient.registerPartitionAssignmentAndMetadata(
+            metadataStore.registerPartitionAssignmentAndMetadata(
                     partitionId,
                     partition,
                     new PartitionAssignment(
                             tableInfo.getTableId(), assignment.getBucketAssignments()),
-                    zkClient.getDefaultRemoteDataDir(),
+                    remoteDataDir,
                     tablePath,
                     tableInfo.getTableId());
         }
@@ -253,10 +272,10 @@ public class FlinkTestBase extends AbstractTestBase {
     }
 
     public static void dropPartitions(
-            ZooKeeperClient zkClient, TablePath tablePath, Set<String> droppedPartitions)
+            MetadataStoreClient metadataStore, TablePath tablePath, Set<String> droppedPartitions)
             throws Exception {
         for (String partition : droppedPartitions) {
-            zkClient.deletePartition(tablePath, partition);
+            metadataStore.deletePartition(tablePath, partition);
         }
     }
 

@@ -36,9 +36,10 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.types.DataTypes;
 
@@ -216,16 +217,16 @@ public abstract class FlinkPaimonTieringTestBase {
      * partition name.
      */
     public static Map<Long, String> waitUntilPartitions(
-            ZooKeeperClient zooKeeperClient, TablePath tablePath) {
+            MetadataStoreClient metadataStore, TablePath tablePath) {
         return waitUntilPartitions(
-                zooKeeperClient,
+                metadataStore,
                 tablePath,
                 ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.defaultValue());
     }
 
     public Map<Long, String> waitUntilPartitions(TablePath tablePath) {
         return waitUntilPartitions(
-                getFlussClusterExtension().getZooKeeperClient(),
+                getFlussClusterExtension().metadataStore(),
                 tablePath,
                 ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.defaultValue());
     }
@@ -235,11 +236,14 @@ public abstract class FlinkPaimonTieringTestBase {
      * partition name.
      */
     public static Map<Long, String> waitUntilPartitions(
-            ZooKeeperClient zooKeeperClient, TablePath tablePath, int expectPartitions) {
+            MetadataStoreClient metadataStore, TablePath tablePath, int expectPartitions) {
         return waitValue(
                 () -> {
-                    Map<Long, String> gotPartitions =
-                            zooKeeperClient.getPartitionIdAndNames(tablePath);
+                    Map<Long, String> gotPartitions = new HashMap<>();
+                    for (Map.Entry<String, PartitionRegistration> entry :
+                            metadataStore.getPartitionRegistrations(tablePath).entrySet()) {
+                        gotPartitions.put(entry.getValue().getPartitionId(), entry.getKey());
+                    }
                     return expectPartitions == gotPartitions.size()
                             ? Optional.of(gotPartitions)
                             : Optional.empty();

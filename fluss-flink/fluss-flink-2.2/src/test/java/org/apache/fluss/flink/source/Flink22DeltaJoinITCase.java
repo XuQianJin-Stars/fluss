@@ -673,7 +673,7 @@ public class Flink22DeltaJoinITCase extends FlinkTestBase {
                 ImmutableMap.of("table.delete.behavior", "IGNORE"));
         TablePath leftTablePath = TablePath.of(DEFAULT_DB, leftTableName);
         Iterator<String> leftPartitionIterator =
-                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), leftTablePath)
+                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), leftTablePath)
                         .values()
                         .iterator();
         // pick two partition to insert data
@@ -697,7 +697,7 @@ public class Flink22DeltaJoinITCase extends FlinkTestBase {
                 ImmutableMap.of("table.delete.behavior", "IGNORE"));
         TablePath rightTablePath = TablePath.of(DEFAULT_DB, rightTableName);
         Iterator<String> rightPartitionIterator =
-                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), rightTablePath)
+                waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), rightTablePath)
                         .values()
                         .iterator();
         // pick two partition to insert data

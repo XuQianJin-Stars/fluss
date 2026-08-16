@@ -109,7 +109,26 @@ public enum ApiKeys {
     SCAN_KV(1061, 0, 0, PUBLIC),
     GET_CLUSTER_HEALTH(1062, 0, 0, PUBLIC),
     LIST_REMOTE_LOG_MANIFESTS(1063, 0, 0, PUBLIC),
-    LIST_KV_SNAPSHOTS(1064, 0, 0, PUBLIC);
+    LIST_KV_SNAPSHOTS(1064, 0, 0, PUBLIC),
+    // Cross-process metadata stream (zookeeper-removal-design.md 5.8), leader-served, server-to-
+    // server (subscriber = tablet server / standby coordinator).
+    FETCH_METADATA(1065, 0, 0, PRIVATE),
+    FETCH_METADATA_SNAPSHOT(1066, 0, 0, PRIVATE),
+    // TabletServer registration & liveness (zookeeper-removal-design.md 5.4.2), leader-served,
+    // server-to-server. Raft metadata backend only (replaces the ephemeral /tabletservers/ids znode
+    // + ZK session); on the ZooKeeper backend the coordinator does not serve these.
+    REGISTER_TABLET_SERVER(1067, 0, 0, PRIVATE),
+    TABLET_SERVER_HEARTBEAT(1068, 0, 0, PRIVATE),
+    // TabletServer id/sequence allocation (zookeeper-removal-design.md 5.3), leader-served, server-
+    // to-server. Raft metadata backend only (replaces the ZooKeeper-backed writer id / kv
+    // auto-increment column id / bucket snapshot id sequence generators); on the ZooKeeper backend
+    // the coordinator does not serve this.
+    ALLOCATE_ID(1069, 0, 0, PRIVATE),
+    // Operator-facing Raft / coordinator status (zookeeper-removal-design.md §7.4.5).
+    GET_COORDINATOR_RAFT_STATUS(1070, 0, 0, PUBLIC),
+    // Quorum membership reconfiguration (zookeeper-removal-design.md §5.10). Leader-only.
+    ADD_RAFT_VOTER(1071, 0, 0, PUBLIC),
+    REMOVE_RAFT_VOTER(1072, 0, 0, PUBLIC);
 
     private static final Map<Integer, ApiKeys> ID_TO_TYPE =
             Arrays.stream(ApiKeys.values())

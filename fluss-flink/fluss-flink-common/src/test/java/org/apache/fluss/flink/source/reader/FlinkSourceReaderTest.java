@@ -31,7 +31,7 @@ import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.types.RowType;
 
 import org.apache.flink.api.connector.source.SourceEvent;
@@ -68,7 +68,7 @@ class FlinkSourceReaderTest extends FlinkTestBase {
         long tableId = createTable(tablePath, tableDescriptor);
 
         // wait until partitions are created
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         Map<Long, String> partitionNameByIds = waitUntilPartitions(zooKeeperClient, tablePath);
 
         // now, write rows to the table

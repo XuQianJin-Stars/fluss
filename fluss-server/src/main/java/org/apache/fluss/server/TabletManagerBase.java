@@ -28,7 +28,7 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.log.LogManager;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
@@ -232,7 +232,7 @@ public abstract class TabletManagerBase {
     }
 
     // TODO: we should support get table info from local properties file instead of from zk
-    public static TableInfo getTableInfo(ZooKeeperClient zkClient, TablePath tablePath)
+    public static TableInfo getTableInfo(MetadataStoreClient zkClient, TablePath tablePath)
             throws Exception {
         int schemaId = zkClient.getCurrentSchemaId(tablePath);
         Optional<SchemaInfo> schemaInfoOpt = zkClient.getSchemaById(tablePath, schemaId);

@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.metrics.group;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -266,5 +267,18 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
                 metricGroupByTable.remove(tablePath);
             }
         }
+    }
+
+    /**
+     * Clears all cached table/bucket metric subgroups. Used by unit tests that share a static
+     * {@link TabletServerMetricGroup} so gauges from a previous test do not collide with
+     * re-registrations for the same table/bucket.
+     */
+    @VisibleForTesting
+    public void clearTableMetricGroups() {
+        for (TableMetricGroup tableMetricGroup : metricGroupByTable.values()) {
+            tableMetricGroup.close();
+        }
+        metricGroupByTable.clear();
     }
 }

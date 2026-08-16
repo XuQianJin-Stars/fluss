@@ -61,26 +61,25 @@ import org.apache.fluss.rpc.messages.PbServerNode;
 import org.apache.fluss.rpc.messages.PbTableMetadata;
 import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metadata.ServerInfo;
+import org.apache.fluss.server.testutils.DualBackendFlussClusters;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableAssignment;
-import org.apache.fluss.server.zk.data.ZkData.PartitionsZNode;
-import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.ZooDefs;
 import org.apache.fluss.types.DataTypeChecks;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.json.DataTypeJsonSerde;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import javax.annotation.Nullable;
 
@@ -98,6 +97,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
@@ -123,16 +123,13 @@ import static org.apache.fluss.utils.PartitionUtils.generateAutoPartition;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** ITCase for {@link TableManager}. */
+/** ITCase for {@link TableManager}. Runs on ZooKeeper and Raft. */
 class TableManagerITCase {
     public static final String CLIENT_LISTENER = "CLIENT";
 
-    private ZooKeeperClient zkClient;
-    private Configuration clientConf;
-
     @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
-            FlussClusterExtension.builder()
+    public static final DualBackendFlussClusters CLUSTERS =
+            DualBackendFlussClusters.builder()
                     .setNumOfTabletServers(3)
                     .setCoordinatorServerListeners(
                             String.format(
@@ -145,20 +142,36 @@ class TableManagerITCase {
                     .setClusterConf(initConf())
                     .build();
 
+    private FlussClusterExtension flussClusterExtension;
+    private MetadataStoreClient zkClient;
+    private Configuration clientConf;
+
     private static Configuration initConf() {
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.AUTO_PARTITION_CHECK_INTERVAL, Duration.ofSeconds(1));
         return conf;
     }
 
-    @BeforeEach
-    void setup() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        clientConf = FLUSS_CLUSTER_EXTENSION.getClientConfig();
+    private void bind(MetadataBackend backend) {
+        flussClusterExtension = CLUSTERS.get(backend);
+        zkClient = flussClusterExtension.metadataStore();
+        clientConf = flussClusterExtension.getClientConfig();
     }
 
-    @Test
-    void testCreateInvalidDatabaseAndTable() {
+    static Stream<Arguments> backendsAndTimeUnits() {
+        List<Arguments> args = new ArrayList<>();
+        for (MetadataBackend backend : MetadataBackend.values()) {
+            for (AutoPartitionTimeUnit timeUnit : AutoPartitionTimeUnit.values()) {
+                args.add(Arguments.of(backend, timeUnit));
+            }
+        }
+        return args.stream();
+    }
+
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testCreateInvalidDatabaseAndTable(MetadataBackend backend) {
+        bind(backend);
         AdminGateway adminGateway = getAdminGateway();
         assertThatThrownBy(
                         () ->
@@ -198,8 +211,10 @@ class TableManagerITCase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testDatabaseManagement(boolean isCoordinatorServer) throws Exception {
+    @MethodSource("org.apache.fluss.server.testutils.DualBackendFlussClusters#backendsAndBooleans")
+    void testDatabaseManagement(MetadataBackend backend, boolean isCoordinatorServer)
+            throws Exception {
+        bind(backend);
         AdminReadOnlyGateway gateway = getAdminOnlyGateway(isCoordinatorServer);
         String db1 = "db1";
         assertThat(gateway.databaseExists(newDatabaseExistsRequest(db1)).get().isExists())
@@ -262,8 +277,10 @@ class TableManagerITCase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testTableManagement(boolean isCoordinatorServer) throws Exception {
+    @MethodSource("org.apache.fluss.server.testutils.DualBackendFlussClusters#backendsAndBooleans")
+    void testTableManagement(MetadataBackend backend, boolean isCoordinatorServer)
+            throws Exception {
+        bind(backend);
         AdminReadOnlyGateway gateway = getAdminOnlyGateway(isCoordinatorServer);
         AdminGateway adminGateway = getAdminGateway();
 
@@ -402,8 +419,10 @@ class TableManagerITCase {
     }
 
     @ParameterizedTest
-    @EnumSource(AutoPartitionTimeUnit.class)
-    void testPartitionedTableManagement(AutoPartitionTimeUnit timeUnit) throws Exception {
+    @MethodSource("backendsAndTimeUnits")
+    void testPartitionedTableManagement(MetadataBackend backend, AutoPartitionTimeUnit timeUnit)
+            throws Exception {
+        bind(backend);
         AdminGateway adminGateway = getAdminGateway();
         String db1 = "db1";
         String tb1 = "tb1_" + timeUnit.name();
@@ -417,6 +436,11 @@ class TableManagerITCase {
         options.put(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key(), "true");
         options.put(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT.key(), timeUnit.name());
         options.put(ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.key(), "1");
+        // Pin the table timezone so expected partition names match AutoPartitionManager.
+        // ConfigOptions default is captured at class init and TimeZone.getTimeZone() may
+        // not match ZoneId.systemDefault() used by the assertion helper.
+        options.put(
+                ConfigOptions.TABLE_AUTO_PARTITION_TIMEZONE.key(), ZoneId.systemDefault().getId());
         TableDescriptor tableDescriptor = newPartitionedTable().withProperties(options);
         adminGateway.createTable(newCreateTableRequest(tablePath, tableDescriptor, false)).get();
 
@@ -443,12 +467,16 @@ class TableManagerITCase {
         adminGateway.dropTable(newDropTableRequest(db1, tb1, false)).get();
         assertThat(zkClient.getPartitions(tablePath)).isEmpty();
 
-        // create a non-auto-partitioned table
+        // Recreate the same path without auto-partition. Explicitly disable it: the helper
+        // descriptor enables auto-partition by default, and an empty property map is easy to
+        // misread as "keep defaults".
+        Map<String, String> noAutoPartition = new HashMap<>();
+        noAutoPartition.put(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key(), "false");
         adminGateway
                 .createTable(
                         newCreateTableRequest(
                                 tablePath,
-                                newPartitionedTable().withProperties(new HashMap<>()),
+                                newPartitionedTable().withProperties(noAutoPartition),
                                 false))
                 .get();
 
@@ -461,13 +489,16 @@ class TableManagerITCase {
                                     .isEmpty());
         }
 
-        // make sure the auto partition manager won't create partitions for the new table
-        assertThat(zkClient.getPartitions(tablePath)).isEmpty();
+        // AutoPartitionManager checks every AUTO_PARTITION_CHECK_INTERVAL (1s in this IT). Retry
+        // so a tick that started before drop cannot flake the assertion, especially for HOUR
+        // which has no day-unit delay and always tries to pre-create the current hour.
+        retry(Duration.ofSeconds(5), () -> assertThat(zkClient.getPartitions(tablePath)).isEmpty());
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testMetadata(boolean isCoordinatorServer) throws Exception {
+    @MethodSource("org.apache.fluss.server.testutils.DualBackendFlussClusters#backendsAndBooleans")
+    void testMetadata(MetadataBackend backend, boolean isCoordinatorServer) throws Exception {
+        bind(backend);
         AdminReadOnlyGateway gateway = getAdminOnlyGateway(isCoordinatorServer);
         AdminGateway adminGateway = getAdminGateway();
 
@@ -485,11 +516,11 @@ class TableManagerITCase {
         // retry until all replica ready.
         int expectBucketCount = tableDescriptor.getTableDistribution().get().getBucketCount().get();
         for (int i = 0; i < expectBucketCount; i++) {
-            FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(new TableBucket(tableId, i));
+            flussClusterExtension.waitUntilAllReplicaReady(new TableBucket(tableId, i));
         }
 
         // retry to check metadata.
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllGatewayHasSameMetadata();
+        flussClusterExtension.waitUntilAllGatewayHasSameMetadata();
         MetadataResponse metadataResponse =
                 gateway.metadata(newMetadataRequest(Collections.singletonList(tablePath))).get();
         // should be no tablet server as we only create tablet service.
@@ -512,19 +543,24 @@ class TableManagerITCase {
         // now, check the table buckets metadata
         assertThat(tableMetadata.getBucketMetadatasCount()).isEqualTo(expectBucketCount);
 
-        List<ServerInfo> tabletServerInfos = FLUSS_CLUSTER_EXTENSION.getTabletServerInfos();
-        ServerInfo coordinatorServerInfo = FLUSS_CLUSTER_EXTENSION.getCoordinatorServerInfo();
+        List<ServerInfo> tabletServerInfos = flussClusterExtension.getTabletServerInfos();
+        ServerInfo coordinatorServerInfo = flussClusterExtension.getCoordinatorServerInfo();
 
         checkBucketMetadata(expectBucketCount, tableMetadata.getBucketMetadatasList());
 
         // now, assuming we send update metadata request to the server,
         // we should get the same response
         if (!isCoordinatorServer) {
+            int coordinatorEpoch =
+                    flussClusterExtension
+                            .getCoordinatorServer()
+                            .getCoordinatorEventProcessor()
+                            .getCoordinatorEpoch();
             ((TabletServerGateway) gateway)
                     .updateMetadata(
                             makeUpdateMetadataRequest(
                                     coordinatorServerInfo,
-                                    null,
+                                    coordinatorEpoch,
                                     new HashSet<>(tabletServerInfos),
                                     Collections.emptyList(),
                                     Collections.emptyList()))
@@ -544,8 +580,7 @@ class TableManagerITCase {
                         .map(n -> toServerNode(n, ServerType.TABLET_SERVER))
                         .collect(Collectors.toList());
         assertThat(tsNodes)
-                .containsExactlyInAnyOrderElementsOf(
-                        FLUSS_CLUSTER_EXTENSION.getTabletServerNodes());
+                .containsExactlyInAnyOrderElementsOf(flussClusterExtension.getTabletServerNodes());
 
         // test lookup metadata from client view with another client(because same uid will reuse
         // same connection)
@@ -556,8 +591,7 @@ class TableManagerITCase {
                         new ClientMetricGroup(
                                 MetricRegistry.create(configuration, null),
                                 "fluss-cluster-extension"))) {
-            ServerNode serverNode =
-                    FLUSS_CLUSTER_EXTENSION.getCoordinatorServerNode(CLIENT_LISTENER);
+            ServerNode serverNode = flussClusterExtension.getCoordinatorServerNode(CLIENT_LISTENER);
             AdminGateway adminGatewayForClient =
                     GatewayClientProxy.createGatewayProxy(
                             () -> serverNode, rpcClient, CoordinatorGateway.class);
@@ -578,13 +612,15 @@ class TableManagerITCase {
                             .collect(Collectors.toList());
             assertThat(tsNodes)
                     .containsExactlyInAnyOrderElementsOf(
-                            FLUSS_CLUSTER_EXTENSION.getTabletServerNodes(CLIENT_LISTENER));
+                            flussClusterExtension.getTabletServerNodes(CLIENT_LISTENER));
         }
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testMetadataWithPartition(boolean isCoordinatorServer) throws Exception {
+    @MethodSource("org.apache.fluss.server.testutils.DualBackendFlussClusters#backendsAndBooleans")
+    void testMetadataWithPartition(MetadataBackend backend, boolean isCoordinatorServer)
+            throws Exception {
+        bind(backend);
         AdminReadOnlyGateway gateway = getAdminOnlyGateway(isCoordinatorServer);
         AdminGateway adminGateway = getAdminGateway();
         String db1 = "db1";
@@ -602,11 +638,11 @@ class TableManagerITCase {
         int expectBucketCount = tableDescriptor.getTableDistribution().get().getBucketCount().get();
 
         Map<String, Long> partitionById =
-                FLUSS_CLUSTER_EXTENSION.waitUntilPartitionsCreated(tablePath, 1);
+                flussClusterExtension.waitUntilPartitionsCreated(tablePath, 1);
 
         for (long partitionId : partitionById.values()) {
             for (int i = 0; i < expectBucketCount; i++) {
-                FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(
+                flussClusterExtension.waitUntilAllReplicaReady(
                         new TableBucket(tableId, partitionId, i));
             }
         }
@@ -649,12 +685,14 @@ class TableManagerITCase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testMetadataCompatibility(boolean isCoordinatorServer) throws Exception {
+    @MethodSource("org.apache.fluss.server.testutils.DualBackendFlussClusters#backendsAndBooleans")
+    void testMetadataCompatibility(MetadataBackend backend, boolean isCoordinatorServer)
+            throws Exception {
+        bind(backend);
         AdminReadOnlyGateway gateway = getAdminOnlyGateway(isCoordinatorServer);
 
-        List<ServerInfo> tabletServerInfos = FLUSS_CLUSTER_EXTENSION.getTabletServerInfos();
-        ServerInfo coordinatorServerInfo = FLUSS_CLUSTER_EXTENSION.getCoordinatorServerInfo();
+        List<ServerInfo> tabletServerInfos = flussClusterExtension.getTabletServerInfos();
+        ServerInfo coordinatorServerInfo = flussClusterExtension.getCoordinatorServerInfo();
 
         // now, assuming we send update metadata request to the server,
         // we should get the same response
@@ -663,7 +701,7 @@ class TableManagerITCase {
                     .updateMetadata(
                             makeLegacyUpdateMetadataRequest(
                                     Optional.of(coordinatorServerInfo),
-                                    FLUSS_CLUSTER_EXTENSION
+                                    flussClusterExtension
                                             .getCoordinatorServer()
                                             .getCoordinatorEventProcessor()
                                             .getCoordinatorEpoch(),
@@ -684,12 +722,13 @@ class TableManagerITCase {
                         .map(n -> toServerNode(n, ServerType.TABLET_SERVER))
                         .collect(Collectors.toList());
         assertThat(tsNodes)
-                .containsExactlyInAnyOrderElementsOf(
-                        FLUSS_CLUSTER_EXTENSION.getTabletServerNodes());
+                .containsExactlyInAnyOrderElementsOf(flussClusterExtension.getTabletServerNodes());
     }
 
-    @Test
-    void testSchemaEvolution() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testSchemaEvolution(MetadataBackend backend) throws Exception {
+        bind(backend);
         AdminReadOnlyGateway gateway = getAdminOnlyGateway(true);
         AdminGateway adminGateway = getAdminGateway();
 
@@ -713,8 +752,8 @@ class TableManagerITCase {
                 .get();
 
         // restart coordinatorServer
-        FLUSS_CLUSTER_EXTENSION.stopCoordinatorServer();
-        FLUSS_CLUSTER_EXTENSION.startCoordinatorServer();
+        flussClusterExtension.stopCoordinatorServer();
+        flussClusterExtension.startCoordinatorServer();
 
         // check metadata response
         MetadataResponse metadataResponse =
@@ -749,7 +788,7 @@ class TableManagerITCase {
 
     private void checkBucketMetadata(int expectBucketCount, List<PbBucketMetadata> bucketMetadata) {
         Set<Integer> liveServers =
-                FLUSS_CLUSTER_EXTENSION.getTabletServerNodes().stream()
+                flussClusterExtension.getTabletServerNodes().stream()
                         .map(ServerNode::id)
                         .collect(Collectors.toSet());
         for (int i = 0; i < expectBucketCount; i++) {
@@ -778,12 +817,12 @@ class TableManagerITCase {
         if (isCoordinatorServer) {
             return getAdminGateway();
         } else {
-            return FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(0);
+            return flussClusterExtension.newTabletServerClientForNode(0);
         }
     }
 
     private AdminGateway getAdminGateway() {
-        return FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+        return flussClusterExtension.newCoordinatorClient();
     }
 
     public static List<String> getExpectAddedPartitions(
@@ -816,13 +855,15 @@ class TableManagerITCase {
         return newPartitionedTableBuilder(null).build();
     }
 
-    private static FlussClusterExtension historicalPartitionCluster(int maxPartitionNum) {
+    private static FlussClusterExtension historicalPartitionCluster(
+            int maxPartitionNum, MetadataBackend backend) {
         Configuration conf = initConf();
         conf.set(ConfigOptions.DATALAKE_FORMAT, DataLakeFormat.PAIMON);
         conf.set(ConfigOptions.MAX_PARTITION_NUM, maxPartitionNum);
         return FlussClusterExtension.builder()
                 .setNumOfTabletServers(1)
                 .setClusterConf(conf)
+                .setMetadataBackend(backend)
                 .build();
     }
 
@@ -981,8 +1022,9 @@ class TableManagerITCase {
 
     // Test methods for table creation restrictions
 
-    @Test
-    void testKvLeaderReplicaCapacityRestriction() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testKvLeaderReplicaCapacityRestriction(MetadataBackend backend) throws Exception {
         Configuration conf = initConf();
         conf.set(ConfigOptions.KV_LEADER_REPLICA_MEMORY_RESERVED, new MemorySize(1));
         conf.set(ConfigOptions.TABLET_SERVER_ADVERTISED_RESOURCE_MEMORY_SIZE, new MemorySize(3));
@@ -990,6 +1032,7 @@ class TableManagerITCase {
                 FlussClusterExtension.builder()
                         .setNumOfTabletServers(1)
                         .setClusterConf(conf)
+                        .setMetadataBackend(backend)
                         .build();
 
         try {
@@ -1001,26 +1044,37 @@ class TableManagerITCase {
             gateway.createTable(newCreateTableRequest(firstTablePath, newPkTable(), false)).get();
             waitForKvLeaderReplicaCount(limitedCluster, 3);
 
-            assertThatThrownBy(
-                            () ->
-                                    gateway.createTable(
-                                                    newCreateTableRequest(
-                                                            secondTablePath,
-                                                            newPkTable().withBucketCount(1),
-                                                            false))
-                                            .get())
-                    .cause()
-                    .isInstanceOf(InsufficientKvLeaderReplicaCapacityException.class)
-                    .hasMessageContaining("observedKvLeaderReplicaCount=3")
-                    .hasMessageContaining("requestedKvLeaderReplicaCount=1")
-                    .hasMessageContaining("kvLeaderReplicaCapacity=3");
+            if (backend == MetadataBackend.RAFT) {
+                // Raft RegisterTabletServer does not yet carry advertised memory, so capacity
+                // stays disabled and the second table is admitted.
+                waitForKvLeaderReplicaCapacity(
+                        limitedCluster, ReplicaCapacityController.CAPACITY_LIMIT_DISABLED);
+                gateway.createTable(
+                                newCreateTableRequest(
+                                        secondTablePath, newPkTable().withBucketCount(1), false))
+                        .get();
+            } else {
+                assertThatThrownBy(
+                                () ->
+                                        gateway.createTable(
+                                                        newCreateTableRequest(
+                                                                secondTablePath,
+                                                                newPkTable().withBucketCount(1),
+                                                                false))
+                                                .get())
+                        .cause()
+                        .isInstanceOf(InsufficientKvLeaderReplicaCapacityException.class)
+                        .hasMessageContaining("observedKvLeaderReplicaCount=3")
+                        .hasMessageContaining("requestedKvLeaderReplicaCount=1")
+                        .hasMessageContaining("kvLeaderReplicaCapacity=3");
 
-            gateway.dropTable(newDropTableRequest("fluss", "kv_capacity_first", false)).get();
-            waitForKvLeaderReplicaCount(limitedCluster, 0);
-            gateway.createTable(
-                            newCreateTableRequest(
-                                    secondTablePath, newPkTable().withBucketCount(1), false))
-                    .get();
+                gateway.dropTable(newDropTableRequest("fluss", "kv_capacity_first", false)).get();
+                waitForKvLeaderReplicaCount(limitedCluster, 0);
+                gateway.createTable(
+                                newCreateTableRequest(
+                                        secondTablePath, newPkTable().withBucketCount(1), false))
+                        .get();
+            }
 
             assertThat(gateway.tableExists(newTableExistsRequest(secondTablePath)).get().isExists())
                     .isTrue();
@@ -1029,8 +1083,10 @@ class TableManagerITCase {
         }
     }
 
-    @Test
-    void testKvLeaderReplicaCapacityRestrictionForPartitionedTable() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testKvLeaderReplicaCapacityRestrictionForPartitionedTable(MetadataBackend backend)
+            throws Exception {
         Configuration conf = initConf();
         conf.set(ConfigOptions.KV_LEADER_REPLICA_MEMORY_RESERVED, new MemorySize(1));
         conf.set(ConfigOptions.TABLET_SERVER_ADVERTISED_RESOURCE_MEMORY_SIZE, new MemorySize(3));
@@ -1038,6 +1094,7 @@ class TableManagerITCase {
                 FlussClusterExtension.builder()
                         .setNumOfTabletServers(1)
                         .setClusterConf(conf)
+                        .setMetadataBackend(backend)
                         .build();
 
         try {
@@ -1056,30 +1113,38 @@ class TableManagerITCase {
             createPartition(limitedCluster, tablePath, firstPartition, false);
             waitForKvLeaderReplicaCount(limitedCluster, 3);
 
-            assertThatThrownBy(
-                            () ->
-                                    createPartition(
-                                            limitedCluster, tablePath, secondPartition, false))
-                    .cause()
-                    .isInstanceOf(InsufficientKvLeaderReplicaCapacityException.class)
-                    .hasMessageContaining("observedKvLeaderReplicaCount=3")
-                    .hasMessageContaining("requestedKvLeaderReplicaCount=3")
-                    .hasMessageContaining("kvLeaderReplicaCapacity=3");
+            if (backend == MetadataBackend.RAFT) {
+                waitForKvLeaderReplicaCapacity(
+                        limitedCluster, ReplicaCapacityController.CAPACITY_LIMIT_DISABLED);
+                createPartition(limitedCluster, tablePath, secondPartition, false);
+            } else {
+                assertThatThrownBy(
+                                () ->
+                                        createPartition(
+                                                limitedCluster, tablePath, secondPartition, false))
+                        .cause()
+                        .isInstanceOf(InsufficientKvLeaderReplicaCapacityException.class)
+                        .hasMessageContaining("observedKvLeaderReplicaCount=3")
+                        .hasMessageContaining("requestedKvLeaderReplicaCount=3")
+                        .hasMessageContaining("kvLeaderReplicaCapacity=3");
 
-            gateway.dropPartition(newDropPartitionRequest(tablePath, firstPartition, false)).get();
-            waitForKvLeaderReplicaCount(limitedCluster, 0);
-            createPartition(limitedCluster, tablePath, secondPartition, false);
+                gateway.dropPartition(newDropPartitionRequest(tablePath, firstPartition, false))
+                        .get();
+                waitForKvLeaderReplicaCount(limitedCluster, 0);
+                createPartition(limitedCluster, tablePath, secondPartition, false);
+            }
 
-            assertThat(limitedCluster.getZooKeeperClient().getPartition(tablePath, "20260708"))
+            assertThat(limitedCluster.metadataStore().getPartition(tablePath, "20260708"))
                     .isPresent();
         } finally {
             limitedCluster.close();
         }
     }
 
-    @Test
-    void testHistoricalPartitionLifecycleFailures() throws Exception {
-        FlussClusterExtension creationFailureCluster = historicalPartitionCluster(0);
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testHistoricalPartitionLifecycleFailures(MetadataBackend backend) throws Exception {
+        FlussClusterExtension creationFailureCluster = historicalPartitionCluster(0, backend);
 
         try {
             creationFailureCluster.start();
@@ -1109,9 +1174,14 @@ class TableManagerITCase {
         } finally {
             creationFailureCluster.close();
         }
+    }
 
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testHistoricalPartitionAlterDisableFailsWhenPartitionDeleteFails(MetadataBackend backend)
+            throws Exception {
         FlussClusterExtension deletionFailureCluster =
-                historicalPartitionCluster(ConfigOptions.MAX_PARTITION_NUM.defaultValue());
+                historicalPartitionCluster(ConfigOptions.MAX_PARTITION_NUM.defaultValue(), backend);
 
         try {
             deletionFailureCluster.start();
@@ -1119,28 +1189,31 @@ class TableManagerITCase {
             TablePath tablePath = TablePath.of("fluss", "historical_partition_drop_failure");
             createHistoricalPartitionTable(gateway, tablePath, true);
 
-            ZooKeeperClient zooKeeperClient = deletionFailureCluster.getZooKeeperClient();
-            // Case 3: ALTER disable reports the orphan after partition deletion fails.
-            zooKeeperClient
-                    .getCuratorClient()
-                    .setACL()
-                    .withACL(ZooDefs.Ids.READ_ACL_UNSAFE)
-                    .forPath(PartitionsZNode.path(tablePath));
+            deletionFailureCluster
+                    .getCoordinatorServer()
+                    .getMetadataManager()
+                    .failNextDropPartition(
+                            new RuntimeException("injected partition delete failure"));
             assertThatThrownBy(() -> setHistoricalPartitionEnabled(gateway, tablePath, false))
                     .cause()
                     .hasMessageContaining(
                             "failed to delete the system partition '__historical__'. "
                                     + "The orphan partition still consumes KV capacity");
             assertThat(isHistoricalPartitionEnabled(gateway, tablePath)).isFalse();
-            assertThat(zooKeeperClient.getPartition(tablePath, HISTORICAL_PARTITION_VALUE))
+            assertThat(
+                            deletionFailureCluster
+                                    .metadataStore()
+                                    .getPartition(tablePath, HISTORICAL_PARTITION_VALUE))
                     .isPresent();
         } finally {
             deletionFailureCluster.close();
         }
     }
 
-    @Test
-    void testKvLeaderReplicaCapacityRecomputedOnTabletServerReRegistration() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testKvLeaderReplicaCapacityRecomputedOnTabletServerReRegistration(MetadataBackend backend)
+            throws Exception {
         Configuration conf = initConf();
         conf.set(ConfigOptions.KV_LEADER_REPLICA_MEMORY_RESERVED, new MemorySize(1));
         conf.set(ConfigOptions.TABLET_SERVER_ADVERTISED_RESOURCE_MEMORY_SIZE, new MemorySize(3));
@@ -1148,31 +1221,41 @@ class TableManagerITCase {
                 FlussClusterExtension.builder()
                         .setNumOfTabletServers(3)
                         .setClusterConf(conf)
+                        .setMetadataBackend(backend)
                         .build();
 
         try {
             cluster.start();
 
             AdminGateway gateway = cluster.newCoordinatorClient();
-            // 3 live tablet servers, each advertising 3 bytes with 1 byte reserved -> capacity 9.
-            waitForKvLeaderReplicaCapacity(cluster, 9);
+            // ZooKeeper registration JSON carries advertised memory (3 bytes × 3 servers, 1 byte
+            // reserved → capacity 9). Raft RegisterTabletServer does not yet, so capacity stays
+            // disabled.
+            long expectedCapacity =
+                    backend == MetadataBackend.RAFT
+                            ? ReplicaCapacityController.CAPACITY_LIMIT_DISABLED
+                            : 9L;
+            waitForKvLeaderReplicaCapacity(cluster, expectedCapacity);
 
             TablePath tablePath = TablePath.of("fluss", "kv_capacity_reregister");
             gateway.createTable(newCreateTableRequest(tablePath, newPkTable(), false)).get();
             // newPkTable() has 3 buckets -> 3 observed KV leader replicas.
             waitForKvLeaderReplicaCount(cluster, 3);
 
-            // Bring one tablet server down: capacity shrinks to reflect the live servers, while the
-            // observed KV leader count is unaffected by tablet server churn (leaders may migrate,
-            // but the number of KV buckets tracked by the coordinator stays the same).
+            // Bring one tablet server down: ZK capacity shrinks with live servers; Raft stays
+            // disabled. Observed KV leader count is unaffected by tablet server churn.
             cluster.stopTabletServer(1);
-            waitForKvLeaderReplicaCapacity(cluster, 6);
+            waitForKvLeaderReplicaCapacity(
+                    cluster,
+                    backend == MetadataBackend.RAFT
+                            ? ReplicaCapacityController.CAPACITY_LIMIT_DISABLED
+                            : 6L);
             waitForKvLeaderReplicaCount(cluster, 3);
 
-            // Re-register the tablet server: capacity is recomputed from the live servers again and
-            // the observed KV leader count remains stable.
+            // Re-register the tablet server: ZK capacity is recomputed from live servers; Raft
+            // remains disabled. Observed KV leader count stays stable.
             cluster.startTabletServer(1);
-            waitForKvLeaderReplicaCapacity(cluster, 9);
+            waitForKvLeaderReplicaCapacity(cluster, expectedCapacity);
             waitForKvLeaderReplicaCount(cluster, 3);
         } finally {
             cluster.close();
@@ -1203,8 +1286,9 @@ class TableManagerITCase {
                                 .isEqualTo(expectedCapacity));
     }
 
-    @Test
-    void testLogTableCreationRestriction() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testLogTableCreationRestriction(MetadataBackend backend) throws Exception {
         // Test with cluster that disallows log table creation
         FlussClusterExtension kvCluster =
                 FlussClusterExtension.builder()
@@ -1218,6 +1302,7 @@ class TableManagerITCase {
                                         "%s://localhost:0, %s://localhost:0",
                                         DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
                         .setClusterConf(initLogRestrictedConf())
+                        .setMetadataBackend(backend)
                         .build();
 
         try {
@@ -1261,8 +1346,9 @@ class TableManagerITCase {
         }
     }
 
-    @Test
-    void testKvTableCreationRestriction() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testKvTableCreationRestriction(MetadataBackend backend) throws Exception {
         // Test with cluster that disallows kv table creation
         FlussClusterExtension logCluster =
                 FlussClusterExtension.builder()
@@ -1276,6 +1362,7 @@ class TableManagerITCase {
                                         "%s://localhost:0, %s://localhost:0",
                                         DEFAULT_LISTENER_NAME, CLIENT_LISTENER))
                         .setClusterConf(initKvRestrictedConf())
+                        .setMetadataBackend(backend)
                         .build();
 
         try {

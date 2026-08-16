@@ -28,14 +28,21 @@ image:
   pullSecrets: []
 
 # Fluss server configuration options
+# Default metadata backend is Raft. For ZooKeeper, set zookeeper.address and
+# omit coordinator.seed.nodes (both set together is rejected).
 configurationOverrides:
   default.bucket.number: 3
   default.replication.factor: 3
-  zookeeper.path.root: /fluss
-  zookeeper.address: zk-zookeeper.{{ .Release.Namespace }}.svc.cluster.local:2181
   remote.data.dir: /tmp/fluss/remote-data
   data.dir: /tmp/fluss/data
   internal.listener.name: INTERNAL
+  # Raft default (example — adjust hostnames for the release):
+  coordinator.seed.nodes: fluss-coordinator-0.fluss-coordinator:9123
+  coordinator.raft.voters: fluss-coordinator-0.fluss-coordinator:9124
+  coordinator.raft.dir: /tmp/fluss/raft
+  # ZooKeeper alternative (comment Raft keys above when enabling):
+  # zookeeper.path.root: /fluss
+  # zookeeper.address: zk-zookeeper.{{ .Release.Namespace }}.svc.cluster.local:2181
 
 tablet:
   numberOfReplicas: 3

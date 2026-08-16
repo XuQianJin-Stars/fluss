@@ -5,9 +5,16 @@ sidebar_position: 4
 
 # Deploying with Docker
 
-This guide will show you how to run a Fluss cluster using Docker. 
+This guide will show you how to run a Fluss cluster using Docker.
 We will introduce the [prerequisites of the Docker environment](#prerequisites), and how to quickly create a Fluss cluster using [`docker run` commands](#deploy-with-docker)
 or a [`docker compose` file](#deploy-with-docker-compose).
+
+:::tip
+**Prefer Raft (default).** You do not need a ZooKeeper container when using
+`coordinator.seed.nodes` / `coordinator.raft.voters`. See
+[Deploying with Raft](install-deploy/deploying-with-raft.md). The ZooKeeper-based examples below
+are retained for legacy clusters and are **deprecated**.
+:::
 
 ## Prerequisites
 

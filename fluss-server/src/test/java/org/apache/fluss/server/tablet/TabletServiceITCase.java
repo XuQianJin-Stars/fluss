@@ -825,10 +825,15 @@ public class TabletServiceITCase {
         // start again.
         FLUSS_CLUSTER_EXTENSION.startCoordinatorServer();
 
-        for (int i = 100; i < 200; i++) {
+        // ZooKeeper continues from the last handed-out id. Raft pre-reserves writer-id blocks and
+        // discards the unused tail on failover (gap, never reuse), so the next id is >= 100.
+        long firstAfterRestart =
+                tabletServerGateway.initWriter(new InitWriterRequest()).get().getWriterId();
+        assertThat(firstAfterRestart).isGreaterThanOrEqualTo(100L);
+        for (int i = 1; i < 100; i++) {
             InitWriterResponse response =
                     tabletServerGateway.initWriter(new InitWriterRequest()).get();
-            assertThat(response.getWriterId()).isEqualTo(i);
+            assertThat(response.getWriterId()).isEqualTo(firstAfterRestart + i);
         }
     }
 
@@ -893,7 +898,7 @@ public class TabletServiceITCase {
                 .updateMetadata(
                         makeUpdateMetadataRequest(
                                 coordinatorServerInfo,
-                                null,
+                                originLeaderAndIsr.coordinatorEpoch(),
                                 newTabletServerInfos,
                                 Collections.emptyList(),
                                 Collections.emptyList()))
@@ -979,7 +984,7 @@ public class TabletServiceITCase {
                         new NotifyLeaderAndIsrData(
                                 physicalTablePath, tableBucket, leaderAndIsr.isr(), leaderAndIsr));
         return ServerRpcMessageUtils.makeNotifyLeaderAndIsrRequest(
-                0, Collections.singletonList(reqForBucket));
+                leaderAndIsr.coordinatorEpoch(), Collections.singletonList(reqForBucket));
     }
 
     @Test

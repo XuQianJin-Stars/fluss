@@ -64,7 +64,6 @@ import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITION_ID;
 import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITION_NAME;
-import static org.apache.fluss.server.metadata.TableMetadata.DELETED_TABLE_ID;
 import static org.apache.fluss.server.metadata.TableMetadata.DELETED_TABLE_PATH;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifyLeaderAndIsrResponseData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeNotifyBucketLeaderAndIsr;
@@ -279,8 +278,8 @@ public class CoordinatorRequestBatch {
      *   <li>case3: Table create and bucketAssignment don't generated, case will happen for new
      *       created partitioned table
      *   <li>case4: Table is queued for deletion, in this case we will set an empty tableBucket set
-     *       and tableId set to {@link TableMetadata#DELETED_TABLE_ID} to avoid send unless info to
-     *       tabletServer
+     *       and tablePath set to {@link TableMetadata#DELETED_TABLE_PATH} (with the real tableId)
+     *       to avoid send unless info to tabletServer
      *   <li>case5: Partition create and bucketAssignment of this partition generated.
      *   <li>case6: Partition is queued for deletion, in this case we will set an empty tableBucket
      *       set and partitionId set to {@link PartitionMetadata#DELETED_PARTITION_ID } to avoid
@@ -742,10 +741,13 @@ public class CoordinatorRequestBatch {
                 return null;
             }
         } else {
+            // Prefer DELETED_TABLE_PATH + real tableId over real path + DELETED_TABLE_ID.
+            // Path-keyed delete markers race with afterEach recreate of the same TablePath:
+            // a late tombstone would wipe the newly created table from tablet metadata caches.
             return tableQueuedForDeletion
                     ? TableInfo.of(
-                            tableInfo.getTablePath(),
-                            DELETED_TABLE_ID,
+                            DELETED_TABLE_PATH,
+                            tableId,
                             0,
                             EMPTY_TABLE_DESCRIPTOR,
                             EMPTY_REMOTE_DATA_DIR,

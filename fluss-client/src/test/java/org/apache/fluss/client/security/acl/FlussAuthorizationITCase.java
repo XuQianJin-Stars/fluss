@@ -68,8 +68,8 @@ import org.apache.fluss.security.acl.OperationType;
 import org.apache.fluss.security.acl.PermissionType;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.security.acl.ResourceFilter;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.Lists;
 import org.apache.fluss.utils.CloseableIterator;
@@ -495,8 +495,8 @@ public class FlussAuthorizationITCase {
             readOnlyGateway = ((FlussAdmin) guestAdmin).getAdminReadOnlyGateway();
         }
 
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        TableRegistration tableRegistration = zooKeeperClient.getTable(DATA1_TABLE_PATH_PK).get();
+        MetadataStoreClient metadataStore = FLUSS_CLUSTER_EXTENSION.metadataStore();
+        TableRegistration tableRegistration = metadataStore.getTable(DATA1_TABLE_PATH_PK).get();
         long tableId = tableRegistration.tableId;
         FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
 

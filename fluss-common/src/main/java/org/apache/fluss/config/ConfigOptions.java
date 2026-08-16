@@ -828,13 +828,23 @@ public class ConfigOptions {
     // ZooKeeper Settings
     // ------------------------------------------------------------------
 
-    /** The ZooKeeper address to use, when running Fluss with ZooKeeper. */
+    /**
+     * The ZooKeeper address to use when running Fluss with the legacy ZooKeeper metadata backend.
+     *
+     * @deprecated Prefer the Raft metadata backend ({@link #COORDINATOR_SEED_NODES} / {@link
+     *     #COORDINATOR_RAFT_VOTERS}). ZooKeeper mode remains supported for migration but will be
+     *     removed in a future major release.
+     */
+    @Deprecated
     public static final ConfigOption<String> ZOOKEEPER_ADDRESS =
             key("zookeeper.address")
                     .stringType()
                     .noDefaultValue()
                     .withDescription(
-                            "The ZooKeeper address to use, when running Fluss with ZooKeeper.");
+                            "Deprecated. The ZooKeeper address for the legacy metadata backend. "
+                                    + "Prefer coordinator.seed.nodes / coordinator.raft.voters "
+                                    + "(Raft is the default). ZooKeeper mode will be removed in a "
+                                    + "future major release.");
 
     /** The root path under which Fluss stores its entries in ZooKeeper. */
     public static final ConfigOption<String> ZOOKEEPER_ROOT =
@@ -924,6 +934,238 @@ public class ConfigOptions {
                             "The maximum buffer size (in bytes) for ZooKeeper client. "
                                     + "This corresponds to the jute.maxbuffer property. "
                                     + "Default is 100MB to match the RPC frame length limit.");
+
+    // ------------------------------------------------------------------------
+    //  Coordinator Raft / Metadata Settings (ZooKeeper replacement, see
+    //  zookeeper-removal-design.md Appendix 11.2)
+    // ------------------------------------------------------------------------
+
+    /**
+     * Comma-separated coordinator {@code host:port} seed list. Presence of this option (and absence
+     * of {@link #ZOOKEEPER_ADDRESS}) selects the Raft metadata backend.
+     */
+    public static final ConfigOption<String> COORDINATOR_SEED_NODES =
+            key("coordinator.seed.nodes")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Comma-separated coordinator host:port seed list for TabletServers and "
+                                    + "clients. Presence of this (and absence of zookeeper.address) "
+                                    + "selects Raft mode.");
+
+    /** Static voter set ({@code host:port}) forming the coordinator Raft quorum. */
+    public static final ConfigOption<String> COORDINATOR_RAFT_VOTERS =
+            key("coordinator.raft.voters")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Static voter set (host:port) forming the coordinator Raft quorum.");
+
+    /** This node's Raft peer id; defaults to the coordinator server id. */
+    public static final ConfigOption<String> COORDINATOR_RAFT_NODE_ID =
+            key("coordinator.raft.node.id")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "This node's Raft peer id; defaults to the coordinator server id.");
+
+    /** Dedicated Raft transport port (separate from client RPC port). */
+    public static final ConfigOption<Integer> COORDINATOR_RAFT_PORT =
+            key("coordinator.raft.port")
+                    .intType()
+                    .defaultValue(9124)
+                    .withDescription(
+                            "Dedicated Raft transport port (separate from client RPC port).");
+
+    /** Local directory for the Raft log and metadata KvStore. */
+    public static final ConfigOption<String> COORDINATOR_RAFT_DIR =
+            key("coordinator.raft.dir")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Local directory for the Raft log and metadata KvStore.");
+
+    /** Raft leader heartbeat interval. */
+    public static final ConfigOption<Duration> COORDINATOR_RAFT_HEARTBEAT_INTERVAL =
+            key("coordinator.raft.heartbeat.interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(500))
+                    .withDescription("Raft leader heartbeat interval.");
+
+    /**
+     * Upper bound a newly-elected leader waits to apply the backlog up to its leadership-gain
+     * commit index before serving. On timeout the node steps down and retries rather than serving
+     * stale reads.
+     */
+    public static final ConfigOption<Duration> COORDINATOR_RAFT_CATCHUP_TIMEOUT =
+            key("coordinator.raft.catchup.timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "Upper bound a newly-elected leader waits to apply the backlog up to "
+                                    + "its leadership-gain commit index before serving "
+                                    + "(RaftLeaderSelector.awaitCatchUp, 5.1.5). On timeout the "
+                                    + "node steps down and retries rather than serving stale reads.");
+
+    /** Raft election timeout upper bound; min is derived as half of this. */
+    public static final ConfigOption<Duration> COORDINATOR_RAFT_ELECTION_TIMEOUT =
+            key("coordinator.raft.election.timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(1000))
+                    .withDescription(
+                            "Raft election timeout upper bound; min is derived as half of this "
+                                    + "(see RaftMetadataServer.buildRaftProperties, 5.1.2).");
+
+    /**
+     * Upper bound for the FIRST election on a fresh cluster, kept short so a single-node/bootstrap
+     * cluster elects a leader quickly. Min is derived as half of this.
+     */
+    public static final ConfigOption<Duration> COORDINATOR_RAFT_FIRST_ELECTION_TIMEOUT =
+            key("coordinator.raft.first-election.timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(300))
+                    .withDescription(
+                            "Upper bound for the FIRST election on a fresh cluster, kept short so a "
+                                    + "single-node/bootstrap cluster elects a leader quickly. Min is "
+                                    + "derived as half of this.");
+
+    /** Max size of a Raft log segment (Ratis Log.setSegmentSizeMax). */
+    public static final ConfigOption<MemorySize> COORDINATOR_RAFT_LOG_SEGMENT_SIZE =
+            key("coordinator.raft.log.segment-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("8 mb"))
+                    .withDescription(
+                            "Max size of a Raft log segment (Ratis Log.setSegmentSizeMax).");
+
+    /** Number of committed log entries between automatic Raft snapshots. */
+    public static final ConfigOption<Integer> COORDINATOR_RAFT_SNAPSHOT_TRIGGER_THRESHOLD =
+            key("coordinator.raft.snapshot.trigger.threshold")
+                    .intType()
+                    .defaultValue(10000)
+                    .withDescription(
+                            "Number of committed log entries between automatic Raft snapshots.");
+
+    /** Number of sequence ids reserved per Raft round-trip (see 5.3.2). */
+    public static final ConfigOption<Long> COORDINATOR_RAFT_ID_BLOCK_SIZE =
+            key("coordinator.raft.id-block-size")
+                    .longType()
+                    .defaultValue(1000L)
+                    .withDescription(
+                            "Number of sequence ids reserved per Raft round-trip (see 5.3.2).");
+
+    /**
+     * Heartbeat lease timeout after which a TabletServer is fenced (replaces the ZooKeeper
+     * ephemeral-node session, see 5.4.2).
+     */
+    public static final ConfigOption<Duration> COORDINATOR_TABLET_SERVER_SESSION_TIMEOUT =
+            key("coordinator.tablet-server.session-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription(
+                            "Heartbeat lease timeout after which a TabletServer is fenced (replaces "
+                                    + "the ZooKeeper ephemeral-node session, see 5.4.2).");
+
+    /**
+     * Optional gossip-based coordinator service discovery (design §1.2 / §5.4.4). When enabled,
+     * coordinators exchange RPC membership so peers and TabletServers can learn the full
+     * coordinator set from a partial {@link #COORDINATOR_SEED_NODES} list.
+     */
+    public static final ConfigOption<Boolean> COORDINATOR_GOSSIP_ENABLED =
+            key("coordinator.gossip.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Enable optional gossip-based coordinator service discovery (§1.2 / "
+                                    + "§5.4.4). Coordinators exchange RPC membership so peers and "
+                                    + "TabletServers can learn the full set from a partial seed "
+                                    + "list. Default false: static coordinator.seed.nodes only.");
+
+    /**
+     * TCP port this coordinator listens on for gossip membership exchange. Seeds are contacted at
+     * {@code seed-host:coordinator.gossip.port}. Use {@code 0} to bind an ephemeral port (tests).
+     */
+    public static final ConfigOption<Integer> COORDINATOR_GOSSIP_PORT =
+            key("coordinator.gossip.port")
+                    .intType()
+                    .defaultValue(9125)
+                    .withDescription(
+                            "TCP port this coordinator listens on for gossip membership exchange. "
+                                    + "Seeds are contacted at seed-host:coordinator.gossip.port. "
+                                    + "Use 0 to bind an ephemeral port (tests).");
+
+    /** How often a coordinator runs one gossip push-pull round. */
+    public static final ConfigOption<Duration> COORDINATOR_GOSSIP_INTERVAL =
+            key("coordinator.gossip.interval")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(1))
+                    .withDescription("How often a coordinator runs one gossip push-pull round.");
+
+    /** Drop a gossip member that has not been refreshed within this timeout (failure detection). */
+    public static final ConfigOption<Duration> COORDINATOR_GOSSIP_FAILURE_TIMEOUT =
+            key("coordinator.gossip.failure-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(10))
+                    .withDescription(
+                            "Drop a gossip member that has not been refreshed within this timeout.");
+
+    /** Long-poll wait for FetchMetadata when the subscriber is caught up (5.8). */
+    public static final ConfigOption<Duration> COORDINATOR_METADATA_STREAM_MAX_WAIT =
+            key("coordinator.metadata-stream.max-wait")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(500))
+                    .withDescription(
+                            "Long-poll wait for FetchMetadata when the subscriber is caught up "
+                                    + "(5.8).");
+
+    /**
+     * Enable TLS on the Raft peer gRPC transport (port {@link #COORDINATOR_RAFT_PORT}, default
+     * 9124). Firewall that port to coordinators only — never client-facing (see design §5.9).
+     */
+    public static final ConfigOption<Boolean> COORDINATOR_RAFT_TLS_ENABLED =
+            key("coordinator.raft.tls.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Enable TLS on the Raft peer gRPC transport "
+                                    + "(coordinator.raft.port, default 9124). Maps to Ratis "
+                                    + "GrpcConfigKeys.TLS.enabled. Firewall 9124 to coordinators "
+                                    + "only (design §5.9).");
+
+    /** Require mutual TLS authentication between Raft peers when TLS is enabled. */
+    public static final ConfigOption<Boolean> COORDINATOR_RAFT_TLS_MUTUAL_AUTH_ENABLED =
+            key("coordinator.raft.tls.mutual-auth.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Require mutual TLS authentication between Raft peers when "
+                                    + "coordinator.raft.tls.enabled is true (GrpcConfigKeys.TLS"
+                                    + ".mutual_authn.enabled).");
+
+    /** Path to this node's private key PEM for Raft TLS. */
+    public static final ConfigOption<String> COORDINATOR_RAFT_TLS_PRIVATE_KEY_FILE =
+            key("coordinator.raft.tls.private-key.file")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Path to this node's private key PEM for the Raft gRPC TLS transport "
+                                    + "(GrpcConfigKeys.TLS.private.key.file.name).");
+
+    /** Path to this node's certificate chain PEM for Raft TLS. */
+    public static final ConfigOption<String> COORDINATOR_RAFT_TLS_CERT_CHAIN_FILE =
+            key("coordinator.raft.tls.cert-chain.file")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Path to this node's certificate chain PEM for the Raft gRPC TLS "
+                                    + "transport (GrpcConfigKeys.TLS.cert.chain.file.name).");
+
+    /** Path to the trust-store / CA certificate PEM used to verify Raft peer certificates. */
+    public static final ConfigOption<String> COORDINATOR_RAFT_TLS_TRUST_STORE_FILE =
+            key("coordinator.raft.tls.trust-store.file")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Path to the trust-store / CA certificate PEM used to verify Raft peer "
+                                    + "certificates (GrpcConfigKeys.TLS.trust.store).");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Log

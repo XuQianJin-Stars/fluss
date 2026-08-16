@@ -221,7 +221,7 @@ class FlinkUnionReadDvTableITCase extends FlinkUnionReadTestBase {
 
             // Get partition IDs after partitions are created
             Map<Long, String> partitionNameById =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath, 2);
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath, 2);
             Map<TableBucket, Long> bucketLogEndOffset = new HashMap<>();
             for (Long partitionId : partitionNameById.keySet()) {
                 bucketLogEndOffset.putAll(getBucketLogEndOffset(tableId, bucketNum, partitionId));

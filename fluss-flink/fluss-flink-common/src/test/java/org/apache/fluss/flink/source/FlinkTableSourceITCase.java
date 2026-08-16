@@ -28,8 +28,8 @@ import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.testutils.common.MultiVersionTest;
 import org.apache.fluss.utils.clock.ManualClock;
 
@@ -37,14 +37,22 @@ import org.apache.commons.lang3.RandomUtils;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
+import org.apache.flink.client.program.MiniClusterClient;
+import org.apache.flink.configuration.CoreOptions;
+import org.apache.flink.runtime.client.JobStatusMessage;
+import org.apache.flink.runtime.minicluster.MiniCluster;
+import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.util.TestStreamEnvironment;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.api.config.ExecutionConfigOptions;
-import org.apache.flink.test.util.AbstractTestBase;
+import org.apache.flink.test.junit5.InjectClusterClient;
+import org.apache.flink.test.junit5.InjectMiniCluster;
+import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 import org.junit.jupiter.api.AfterEach;
@@ -70,6 +78,7 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -82,12 +91,29 @@ import static org.apache.fluss.flink.utils.FlinkTestBase.writeRowsToPartition;
 import static org.apache.fluss.server.testutils.FlussClusterExtension.BUILTIN_DATABASE;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** IT case for using flink sql to read fluss table. */
-abstract class FlinkTableSourceITCase extends AbstractTestBase {
+abstract class FlinkTableSourceITCase {
     protected static final ManualClock CLOCK = new ManualClock();
+
+    /**
+     * Dedicated MiniCluster. {@code MiniClusterExtension} otherwise defaults job parallelism to the
+     * slot count, so one leftover collect job occupies every slot and the next test fails with
+     * {@code NoResourceAvailableException}.
+     */
+    @RegisterExtension
+    public static final MiniClusterExtension MINI_CLUSTER_EXTENSION =
+            new MiniClusterExtension(
+                    new MiniClusterResourceConfiguration.Builder()
+                            .setNumberTaskManagers(2)
+                            .setNumberSlotsPerTaskManager(8)
+                            .setConfiguration(
+                                    new org.apache.flink.configuration.Configuration()
+                                            .set(CoreOptions.DEFAULT_PARALLELISM, 1))
+                            .build());
 
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
@@ -121,27 +147,43 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
     }
 
     @BeforeEach
-    void before() {
-        // initialize env and table env
-        execEnv = StreamExecutionEnvironment.getExecutionEnvironment();
+    void before(@InjectMiniCluster MiniCluster miniCluster) {
+        // MiniClusterExtension.registerEnv() also installs a factory with slot-count
+        // parallelism; override it so executeSql cannot pick up a 16-parallel job.
+        TestStreamEnvironment.setAsContext(miniCluster, 1);
+        execEnv = new TestStreamEnvironment(miniCluster, 1);
         tEnv = StreamTableEnvironment.create(execEnv, EnvironmentSettings.inStreamingMode());
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
 
-        // initialize catalog and database
         String bootstrapServers = String.join(",", clientConf.get(ConfigOptions.BOOTSTRAP_SERVERS));
         tEnv.executeSql(
                 String.format(
                         "create catalog %s with ('type' = 'fluss', '%s' = '%s')",
                         CATALOG_NAME, ConfigOptions.BOOTSTRAP_SERVERS.key(), bootstrapServers));
         tEnv.executeSql("use catalog " + CATALOG_NAME);
-        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 4);
         tEnv.executeSql("create database " + DEFAULT_DB);
         tEnv.useDatabase(DEFAULT_DB);
     }
 
     @AfterEach
-    void after() {
+    void after(@InjectClusterClient MiniClusterClient clusterClient) throws Exception {
         tEnv.useDatabase(BUILTIN_DATABASE);
-        tEnv.executeSql(String.format("drop database %s cascade", DEFAULT_DB));
+        tEnv.executeSql(String.format("drop database %s cascade", DEFAULT_DB)).await();
+        for (JobStatusMessage job : clusterClient.listJobs().get()) {
+            if (!job.getJobState().isTerminalState()) {
+                try {
+                    clusterClient.cancel(job.getJobId()).get();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        retry(
+                Duration.ofSeconds(30),
+                () -> {
+                    for (JobStatusMessage job : clusterClient.listJobs().get()) {
+                        assertThat(job.getJobState().isTerminalState()).isTrue();
+                    }
+                });
     }
 
     @Test
@@ -392,7 +434,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         assertResultsIgnoreOrder(rowIter, expectedRows, true);
 
         // check lease will be dropped after job finished.
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         retry(
                 Duration.ofMinutes(1),
                 () -> assertThat(zkClient.getKvSnapshotLeasesList().isEmpty()).isTrue());
@@ -417,7 +459,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         assertResultsIgnoreOrder(rowIter, expectedRows, true);
 
         // check lease will be dropped after job finished.
-        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         retry(
                 Duration.ofMinutes(1),
                 () -> assertThat(zkClient.getKvSnapshotLeasesList().isEmpty()).isTrue());
@@ -452,7 +494,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                                     + "'table.auto-partition.num-precreate' = '1')",
                             tableName));
             Map<Long, String> partitionNameById =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath, 1);
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath, 1);
             // just pick one partition
             partitionName = partitionNameById.values().iterator().next();
         }
@@ -583,7 +625,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                                     + " 'table.auto-partition.num-precreate' = '1')",
                             tableName));
             Map<Long, String> partitionNameById =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath, 1);
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath, 1);
             // just pick one partition
             partitionName = partitionNameById.values().iterator().next();
         }
@@ -655,14 +697,14 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         Map<Long, String> partitionNameById;
         if (isAutoPartition) {
             partitionNameById =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath);
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath);
         } else {
             int currentYear = LocalDate.now().getYear();
             tEnv.executeSql(
                     String.format(
                             "alter table %s add partition (c = '%s')", tableName, currentYear));
             partitionNameById =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath, 1);
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath, 1);
         }
 
         List<String> expectedRowValues =
@@ -824,8 +866,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
 
         Map<Long, String> partitionNameById =
                 waitUntilPartitions(
-                        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(),
-                        TablePath.of(DEFAULT_DB, dim));
+                        FLUSS_CLUSTER_EXTENSION.metadataStore(), TablePath.of(DEFAULT_DB, dim));
 
         // pick the first partition to do filter
         String filteredPartition = partitionNameById.values().stream().sorted().iterator().next();
@@ -1975,31 +2016,36 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
                         RandomUtils.nextInt());
         if (partitionedKey == null) {
             tEnv.executeSql(
-                    String.format(
-                            "create table %s ("
-                                    + "  id int not null,"
-                                    + "  address varchar,"
-                                    + "  name varchar,"
-                                    + "  primary key (%s) NOT ENFORCED) with (%s %s)",
-                            tableName, String.join(",", primaryKeys), options, bucketOptions));
+                            String.format(
+                                    "create table %s ("
+                                            + "  id int not null,"
+                                            + "  address varchar,"
+                                            + "  name varchar,"
+                                            + "  primary key (%s) NOT ENFORCED) with (%s %s)",
+                                    tableName,
+                                    String.join(",", primaryKeys),
+                                    options,
+                                    bucketOptions))
+                    .await();
         } else {
             tEnv.executeSql(
-                    String.format(
-                            "create table %s ("
-                                    + "  id int not null,"
-                                    + "  address varchar,"
-                                    + "  name varchar,"
-                                    + "  %s varchar , "
-                                    + "  primary key (%s, %s) NOT ENFORCED) partitioned by (%s) with (%s , "
-                                    + " 'table.auto-partition.enabled' = 'true', 'table.auto-partition.time-unit' = 'year'"
-                                    + " %s)",
-                            tableName,
-                            partitionedKey,
-                            String.join(",", primaryKeys),
-                            partitionedKey,
-                            partitionedKey,
-                            options,
-                            bucketOptions));
+                            String.format(
+                                    "create table %s ("
+                                            + "  id int not null,"
+                                            + "  address varchar,"
+                                            + "  name varchar,"
+                                            + "  %s varchar , "
+                                            + "  primary key (%s, %s) NOT ENFORCED) partitioned by (%s) with (%s , "
+                                            + " 'table.auto-partition.enabled' = 'true', 'table.auto-partition.time-unit' = 'year'"
+                                            + " %s)",
+                                    tableName,
+                                    partitionedKey,
+                                    String.join(",", primaryKeys),
+                                    partitionedKey,
+                                    partitionedKey,
+                                    options,
+                                    bucketOptions))
+                    .await();
         }
 
         TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
@@ -2007,15 +2053,25 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         String partition2 = null;
         if (partitionedKey != null) {
             Map<Long, String> partitionNameById =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath);
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath);
             // just pick one partition to insert data
             Iterator<String> partitionIterator = partitionNameById.values().iterator();
             partition1 = partitionIterator.next();
             partition2 = partitionIterator.next();
         }
 
-        // prepare dim table data
-        try (Table dimTable = conn.getTable(tablePath)) {
+        // Tablet servers can lag the coordinator after CREATE TABLE; retry until visible.
+        try (Table dimTable =
+                waitValue(
+                        () -> {
+                            try {
+                                return Optional.of(conn.getTable(tablePath));
+                            } catch (Exception e) {
+                                return Optional.empty();
+                            }
+                        },
+                        Duration.ofSeconds(30),
+                        "dim table not visible yet: " + tablePath)) {
             UpsertWriter upsertWriter = dimTable.newUpsert().createWriter();
             for (int i = 1; i <= 5; i++) {
                 Object[] values =

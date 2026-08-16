@@ -23,6 +23,7 @@ import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.client.table.writer.UpsertWriter;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 
@@ -46,8 +47,13 @@ class FlussFailServerTableITCase extends ClientToServerITCaseBase {
 
     private static final int SERVER = 0;
 
+    /**
+     * Wait for cluster metadata to converge before each test. JUnit 5 does not invoke an overridden
+     * superclass {@code @BeforeEach} unless the override is also annotated.
+     */
+    @Override
     @BeforeEach
-    void beforeEach() throws Exception {
+    protected void setup() throws Exception {
         // since we kill and start one tablet server in each test,
         // we need to wait for metadata to be updated to servers
         FLUSS_CLUSTER_EXTENSION.waitUntilAllGatewayHasSameMetadata();
@@ -56,7 +62,7 @@ class FlussFailServerTableITCase extends ClientToServerITCaseBase {
 
     @Test
     void testAppend() throws Exception {
-        createTable(DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR, false);
+        long tableId = createTable(DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR, false);
         try (Table table = conn.getTable(DATA1_TABLE_PATH)) {
             AppendWriter appendWriter = table.newAppend().createWriter();
             GenericRow row = row(1, "a");
@@ -66,6 +72,7 @@ class FlussFailServerTableITCase extends ClientToServerITCaseBase {
 
             // now, kill one server and try to append data again
             FLUSS_CLUSTER_EXTENSION.stopTabletServer(SERVER);
+            waitUntilFailedServerLeftIsr(tableId, table.getTableInfo().getNumBuckets());
 
             try {
                 // append some rows again, should success
@@ -80,7 +87,7 @@ class FlussFailServerTableITCase extends ClientToServerITCaseBase {
 
     @Test
     void testPut() throws Exception {
-        createTable(DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK, false);
+        long tableId = createTable(DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK, false);
         // put one row
         try (Table table = conn.getTable(DATA1_TABLE_PATH_PK)) {
             UpsertWriter upsertWriter = table.newUpsert().createWriter();
@@ -89,6 +96,7 @@ class FlussFailServerTableITCase extends ClientToServerITCaseBase {
 
             // kill first tablet server
             FLUSS_CLUSTER_EXTENSION.stopTabletServer(SERVER);
+            waitUntilFailedServerLeftIsr(tableId, table.getTableInfo().getNumBuckets());
 
             try {
                 // append some rows again, should success
@@ -144,6 +152,13 @@ class FlussFailServerTableITCase extends ClientToServerITCaseBase {
             } finally {
                 FLUSS_CLUSTER_EXTENSION.startTabletServer(SERVER);
             }
+        }
+    }
+
+    private void waitUntilFailedServerLeftIsr(long tableId, int numBuckets) {
+        for (int bucketId = 0; bucketId < numBuckets; bucketId++) {
+            FLUSS_CLUSTER_EXTENSION.waitUntilReplicaShrinkFromIsr(
+                    new TableBucket(tableId, bucketId), SERVER);
         }
     }
 

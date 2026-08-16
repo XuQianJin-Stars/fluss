@@ -18,11 +18,13 @@
 
 package org.apache.fluss.server.zk;
 
+import org.apache.fluss.server.coordinator.CoordinatorEpoch;
+
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH_ZK_VERSION;
 
 /** Class for coordinator epoch and coordinator epoch zk version. */
-public class ZkEpoch {
+public class ZkEpoch implements CoordinatorEpoch {
 
     public static final ZkEpoch INITIAL_EPOCH =
             new ZkEpoch(INITIAL_COORDINATOR_EPOCH, INITIAL_COORDINATOR_EPOCH_ZK_VERSION);
@@ -44,6 +46,16 @@ public class ZkEpoch {
     }
 
     public int getCoordinatorEpochZkVersion() {
+        return coordinatorEpochZkVersion;
+    }
+
+    @Override
+    public int coordinatorEpoch() {
+        return coordinatorEpoch;
+    }
+
+    @Override
+    public int coordinatorEpochVersion() {
         return coordinatorEpochZkVersion;
     }
 }

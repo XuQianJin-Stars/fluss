@@ -102,7 +102,7 @@ class HistoricalPartitionLookupITCase extends FlinkPaimonTieringTestBase {
         // The ALTER RPC must not complete until the required system partition is persisted.
         Optional<PartitionRegistration> historicalPartition =
                 FLUSS_CLUSTER_EXTENSION
-                        .getZooKeeperClient()
+                        .metadataStore()
                         .getPartition(tablePath, HISTORICAL_PARTITION_VALUE);
         assertThat(historicalPartition).isPresent();
         long historicalPartitionId = historicalPartition.get().getPartitionId();

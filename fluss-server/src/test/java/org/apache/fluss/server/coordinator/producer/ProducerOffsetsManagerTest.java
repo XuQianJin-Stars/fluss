@@ -21,8 +21,8 @@ package org.apache.fluss.server.coordinator.producer;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidProducerIdException;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 
 import org.junit.jupiter.api.AfterEach;
@@ -58,14 +58,14 @@ class ProducerOffsetsManagerTest {
 
     private ProducerOffsetsManager manager;
     private ProducerOffsetsStore store;
-    private ZooKeeperClient zkClient;
+    private MetadataStoreClient zkClient;
 
     private static final long DEFAULT_TTL_MS = 3600000; // 1 hour
     private static final long CLEANUP_INTERVAL_MS = 60000; // 1 minute
 
     @BeforeEach
     void setUp() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         store = new ProducerOffsetsStore(zkClient, tempDir.toString());
         manager = new ProducerOffsetsManager(store, DEFAULT_TTL_MS, CLEANUP_INTERVAL_MS);
     }

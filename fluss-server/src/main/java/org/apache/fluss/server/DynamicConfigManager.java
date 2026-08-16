@@ -28,6 +28,7 @@ import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.config.provider.ConfigProviders;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.server.authorizer.ZkNodeChangeNotificationWatcher;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.ZkData.ConfigEntityChangeNotificationSequenceZNode;
 import org.apache.fluss.server.zk.data.ZkData.ConfigEntityChangeNotificationZNode;
@@ -35,6 +36,8 @@ import org.apache.fluss.utils.clock.SystemClock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -55,14 +58,21 @@ import java.util.Objects;
  * letting it react to its own notifications could roll a config back to an older value (A to B to
  * A). On losing leadership it resumes consuming (see {@link #resumeListening()}) and re-syncs from
  * ZooKeeper to pick up any changes made by the new leader while it was not listening.
+ *
+ * <p>On the Raft backend there is no ZK change-notification watcher; config changes propagate via
+ * the metadata stream (see {@link #reloadDynamicConfig(Map)}).
  */
 public class DynamicConfigManager {
     private static final Logger LOG = LoggerFactory.getLogger(DynamicConfigManager.class);
     private static final long CHANGE_NOTIFICATION_EXPIRATION_MS = 15 * 60 * 1000L;
 
     private final DynamicServerConfig dynamicServerConfig;
-    private final ZooKeeperClient zooKeeperClient;
-    private final ZkNodeChangeNotificationWatcher configChangeListener;
+    // Backend-neutral store for the dynamic entity config (fetch/upsert). On the ZooKeeper backend
+    // this is the ZooKeeperClient; on the Raft backend it is the RaftMetadataClient.
+    private final MetadataStoreClient configStore;
+    // The ZK change-notification watcher. Only present on the ZooKeeper backend; null on Raft,
+    // where config changes propagate via the metadata stream instead of a ZK notification znode.
+    @Nullable private final ZkNodeChangeNotificationWatcher configChangeListener;
 
     /**
      * Whether change notifications are applied. Always true on a TabletServer and on a standby
@@ -71,9 +81,10 @@ public class DynamicConfigManager {
      */
     private volatile boolean listeningEnabled = true;
 
+    /** ZooKeeper-backend constructor: wires the ZK change-notification watcher. */
     public DynamicConfigManager(ZooKeeperClient zooKeeperClient, Configuration configuration) {
         this.dynamicServerConfig = new DynamicServerConfig(configuration);
-        this.zooKeeperClient = zooKeeperClient;
+        this.configStore = zooKeeperClient;
         this.configChangeListener =
                 new ZkNodeChangeNotificationWatcher(
                         zooKeeperClient,
@@ -84,13 +95,62 @@ public class DynamicConfigManager {
                         SystemClock.getInstance());
     }
 
+    /**
+     * ZooKeeper-backend constructor. The {@code isCoordinator} flag is retained for call-site
+     * compatibility; listening is controlled by {@link #pauseListening()} / {@link
+     * #resumeListening()} instead.
+     */
+    public DynamicConfigManager(
+            ZooKeeperClient zooKeeperClient, Configuration configuration, boolean isCoordinator) {
+        this(zooKeeperClient, configuration);
+    }
+
+    /**
+     * Backend-neutral constructor (e.g. Raft): no ZK change-notification watcher. Config-change
+     * propagation to tablet servers is expected to flow through the metadata stream. The {@code
+     * isCoordinator} flag is retained for call-site compatibility; listening is controlled by
+     * {@link #pauseListening()} / {@link #resumeListening()} instead.
+     *
+     * <p>Note: this overload is intentionally 3-arg so that a {@link ZooKeeperClient} argument
+     * resolves to the ZooKeeper-specific constructors above (ZooKeeperClient implements {@link
+     * MetadataStoreClient}).
+     */
+    public DynamicConfigManager(
+            MetadataStoreClient configStore, Configuration configuration, boolean isCoordinator) {
+        this.dynamicServerConfig = new DynamicServerConfig(configuration);
+        this.configStore = configStore;
+        this.configChangeListener = null;
+    }
+
     public void startup() throws Exception {
         try {
-            configChangeListener.start();
-            Map<String, String> entityConfigs = zooKeeperClient.fetchEntityConfig();
+            if (configChangeListener != null) {
+                configChangeListener.start();
+            }
+            Map<String, String> entityConfigs = configStore.fetchEntityConfig();
             dynamicServerConfig.updateDynamicConfig(entityConfigs, true);
         } catch (Exception e) {
-            LOG.error("Failed to update dynamic configs from zookeeper", e);
+            LOG.error("Failed to update dynamic configs from the metadata store", e);
+        }
+    }
+
+    /**
+     * Applies a dynamic-config snapshot delivered by the Raft metadata stream — the backend-neutral
+     * replacement for the ZooKeeper config-change notification. Ignored while {@link
+     * #pauseListening()} is in effect (active coordinator leader). Errors are logged (not thrown)
+     * so a single bad update does not break the subscriber / apply loop, matching {@link
+     * #startup()}.
+     */
+    public void reloadDynamicConfig(Map<String, String> entityConfig) {
+        // Match the ZooKeeper notification handler: an active coordinator leader is the sole
+        // writer and already holds the latest values, so ignore apply-loop snapshots.
+        if (!listeningEnabled) {
+            return;
+        }
+        try {
+            dynamicServerConfig.updateDynamicConfig(entityConfig, true);
+        } catch (Exception e) {
+            LOG.error("Failed to apply the streamed dynamic config", e);
         }
     }
 
@@ -113,7 +173,9 @@ public class DynamicConfigManager {
     }
 
     public void close() {
-        configChangeListener.stop();
+        if (configChangeListener != null) {
+            configChangeListener.stop();
+        }
     }
 
     /**
@@ -127,14 +189,13 @@ public class DynamicConfigManager {
     }
 
     /**
-     * Resumes applying config-change notifications and re-syncs the current config from ZooKeeper.
-     * Called when a CoordinatorServer loses leadership: while it was leader it ignored
-     * notifications, so it must re-read ZooKeeper once to pick up any changes made by the new
-     * leader.
+     * Resumes applying config-change notifications and re-syncs the current config from the
+     * metadata store. Called when a CoordinatorServer loses leadership: while it was leader it
+     * ignored notifications, so it must re-read once to pick up any changes made by the new leader.
      */
     public void resumeListening() throws Exception {
         listeningEnabled = true;
-        Map<String, String> entityConfigs = zooKeeperClient.fetchEntityConfig();
+        Map<String, String> entityConfigs = configStore.fetchEntityConfig();
         dynamicServerConfig.updateDynamicConfig(entityConfigs, true);
     }
 
@@ -168,7 +229,7 @@ public class DynamicConfigManager {
     }
 
     public void alterConfigs(List<AlterConfig> clusterConfigChanges) throws Exception {
-        Map<String, String> persistentProps = zooKeeperClient.fetchEntityConfig();
+        Map<String, String> persistentProps = configStore.fetchEntityConfig();
         prepareIncrementalConfigs(clusterConfigChanges, persistentProps);
         alterServerConfigs(persistentProps);
     }
@@ -362,8 +423,8 @@ public class DynamicConfigManager {
     protected void alterServerConfigs(Map<String, String> configsProps) throws Exception {
         dynamicServerConfig.updateDynamicConfig(configsProps, false);
 
-        // Apply to zookeeper only after verification.
-        zooKeeperClient.upsertServerEntityConfig(configsProps);
+        // Apply to the metadata store only after verification.
+        configStore.upsertServerEntityConfig(configsProps);
     }
 
     private static void validateListOrMapType(String configKey) {
@@ -399,7 +460,7 @@ public class DynamicConfigManager {
                         "Config change notification of this version is only empty");
             }
 
-            Map<String, String> entityConfig = zooKeeperClient.fetchEntityConfig();
+            Map<String, String> entityConfig = configStore.fetchEntityConfig();
             dynamicServerConfig.updateDynamicConfig(entityConfig, true);
         }
     }

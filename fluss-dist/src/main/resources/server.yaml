@@ -17,15 +17,31 @@
 ################################################################################
 
 #==============================================================================
-# Zookeeper
+# Metadata backend (default: Raft)
 #==============================================================================
+#
+# Default is the embedded Raft coordinator quorum. Set coordinator.seed.nodes
+# (and leave zookeeper.address unset). For a ZooKeeper cluster instead, comment
+# out the Raft block and set zookeeper.address.
 
-# Zookeeper connection string (see zookeeper docs for details).
-# This is a comma separated host:port pairs, each corresponding to a zk
-# server. e.g. "127.0.0.1:3000,127.0.0.1:3001,127.0.0.1:3002".
-# You can also append an optional chroot string to the urls to specify the
-# root directory for all Fluss znodes.
-zookeeper.address: localhost:2181
+coordinator.seed.nodes: localhost:9123
+coordinator.raft.voters: localhost:9124
+coordinator.raft.dir: /tmp/fluss-raft
+coordinator.raft.port: 9124
+
+# Format once before first start: ./bin/fluss raft bootstrap --config $FLUSS_CONF_DIR
+# Status: ./bin/fluss raft status --coordinator localhost:9123
+# Watch:  ./bin/fluss raft status --coordinator localhost:9123 --watch
+
+# Optional gossip: expand a partial coordinator.seed.nodes list (default off).
+# Does not replace Raft voters or the bootstrap seed list.
+# coordinator.gossip.enabled: false
+# coordinator.gossip.port: 9125
+# coordinator.gossip.interval: 1s
+# coordinator.gossip.failure-timeout: 10s
+
+# Optional ZooKeeper backend (mutually exclusive with coordinator.seed.nodes):
+# zookeeper.address: localhost:2181
 
 #==============================================================================
 # Common

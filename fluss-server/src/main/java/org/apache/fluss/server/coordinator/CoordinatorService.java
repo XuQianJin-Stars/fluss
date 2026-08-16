@@ -18,6 +18,7 @@
 package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.cluster.Endpoint;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.cluster.TabletServerInfo;
 import org.apache.fluss.cluster.rebalance.GoalType;
@@ -36,6 +37,7 @@ import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.LakeTableAlreadyExistException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
+import org.apache.fluss.exception.NotCoordinatorLeaderException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.TableAlreadyExistException;
@@ -62,10 +64,14 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.AddRaftVoterRequest;
+import org.apache.fluss.rpc.messages.AddRaftVoterResponse;
 import org.apache.fluss.rpc.messages.AddServerTagRequest;
 import org.apache.fluss.rpc.messages.AddServerTagResponse;
 import org.apache.fluss.rpc.messages.AdjustIsrRequest;
 import org.apache.fluss.rpc.messages.AdjustIsrResponse;
+import org.apache.fluss.rpc.messages.AllocateIdRequest;
+import org.apache.fluss.rpc.messages.AllocateIdResponse;
 import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.AlterClusterConfigsResponse;
 import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
@@ -102,8 +108,14 @@ import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.DropPartitionResponse;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.FetchMetadataRequest;
+import org.apache.fluss.rpc.messages.FetchMetadataResponse;
+import org.apache.fluss.rpc.messages.FetchMetadataSnapshotRequest;
+import org.apache.fluss.rpc.messages.FetchMetadataSnapshotResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusRequest;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusResponse;
 import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.GetProducerOffsetsResponse;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
@@ -123,6 +135,7 @@ import org.apache.fluss.rpc.messages.PbKvSnapshotLeaseForTable;
 import org.apache.fluss.rpc.messages.PbLakeTieringStats;
 import org.apache.fluss.rpc.messages.PbPrepareLakeTableRespForTable;
 import org.apache.fluss.rpc.messages.PbProducerTableOffsets;
+import org.apache.fluss.rpc.messages.PbServerNode;
 import org.apache.fluss.rpc.messages.PbTableBucket;
 import org.apache.fluss.rpc.messages.PbTableOffsets;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotRequest;
@@ -131,10 +144,16 @@ import org.apache.fluss.rpc.messages.RebalanceRequest;
 import org.apache.fluss.rpc.messages.RebalanceResponse;
 import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.RegisterProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.RegisterTabletServerRequest;
+import org.apache.fluss.rpc.messages.RegisterTabletServerResponse;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.RemoveRaftVoterRequest;
+import org.apache.fluss.rpc.messages.RemoveRaftVoterResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
+import org.apache.fluss.rpc.messages.TabletServerHeartbeatRequest;
+import org.apache.fluss.rpc.messages.TabletServerHeartbeatResponse;
 import org.apache.fluss.rpc.netty.server.Session;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
@@ -163,6 +182,10 @@ import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseHandler;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.producer.ProducerOffsetsManager;
+import org.apache.fluss.server.coordinator.raft.AllocateIdRpcServer;
+import org.apache.fluss.server.coordinator.raft.MetadataStreamRpcServer;
+import org.apache.fluss.server.coordinator.raft.RaftMetadataClient;
+import org.apache.fluss.server.coordinator.raft.TabletServerRegistrationRpcServer;
 import org.apache.fluss.server.coordinator.rebalance.goal.Goal;
 import org.apache.fluss.server.coordinator.remote.RemoteDirDynamicLoader;
 import org.apache.fluss.server.entity.CommitKvSnapshotData;
@@ -173,13 +196,13 @@ import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
 import org.apache.fluss.server.metadata.CoordinatorMetadataProvider;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.ZooKeeperClient.TableBucketAndManifest;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableBucketAndManifest;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
@@ -247,6 +270,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     private final int defaultReplicationFactor;
     private final boolean logTableAllowCreation;
     private final boolean kvTableAllowCreation;
+    private final Supplier<CoordinatorEventProcessor> coordinatorEventProcessorSupplier;
     private final Supplier<EventManager> eventManagerSupplier;
     private final Supplier<Integer> coordinatorEpochSupplier;
     private final CoordinatorMetadataCache metadataCache;
@@ -258,14 +282,29 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     private final LakeTableHelper lakeTableHelper;
     private final ProducerOffsetsManager producerOffsetsManager;
     private final KvSnapshotLeaseManager kvSnapshotLeaseManager;
-    private final CoordinatorLeaderElection coordinatorLeaderElection;
+    private final LeaderElection coordinatorLeaderElection;
     private final RemoteDirDynamicLoader remoteDirDynamicLoader;
     private final ReplicaCapacityController replicaCapacityController;
+
+    // Leader-side handler for the cross-process metadata stream (§5.8). Non-null ONLY on the Raft
+    // metadata backend, wired after construction once the coordinator's MetadataStreamService
+    // exists. Null on the ZooKeeper backend, where the coordinator serves no stream.
+    @Nullable private volatile MetadataStreamRpcServer metadataStreamRpcServer;
+
+    // Leader-side handler for TabletServer registration/heartbeat (§5.4.2). Non-null ONLY on the
+    // Raft metadata backend, wired after construction once the TabletServerLivenessManager exists.
+    // Null on the ZooKeeper backend, where a tablet server writes its own ephemeral znode.
+    @Nullable private volatile TabletServerRegistrationRpcServer tabletServerRegistrationRpcServer;
+
+    // Leader-side handler for TabletServer id/sequence allocation (§5.3). Non-null ONLY on the Raft
+    // metadata backend. Null on the ZooKeeper backend, where a tablet server allocates ids directly
+    // against ZooKeeper (writer id / kv auto-increment column id / bucket snapshot id).
+    @Nullable private volatile AllocateIdRpcServer allocateIdRpcServer;
 
     public CoordinatorService(
             Configuration conf,
             FileSystem remoteFileSystem,
-            ZooKeeperClient zkClient,
+            MetadataStoreClient zkClient,
             Supplier<CoordinatorEventProcessor> coordinatorEventProcessorSupplier,
             CoordinatorMetadataCache metadataCache,
             MetadataManager metadataManager,
@@ -276,7 +315,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             DynamicConfigManager dynamicConfigManager,
             ExecutorService ioExecutor,
             KvSnapshotLeaseManager kvSnapshotLeaseManager,
-            CoordinatorLeaderElection coordinatorLeaderElection,
+            LeaderElection coordinatorLeaderElection,
             ReplicaCapacityController replicaCapacityController) {
         super(
                 remoteFileSystem,
@@ -290,6 +329,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         this.defaultReplicationFactor = conf.getInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR);
         this.logTableAllowCreation = conf.getBoolean(ConfigOptions.LOG_TABLE_ALLOW_CREATION);
         this.kvTableAllowCreation = conf.getBoolean(ConfigOptions.KV_TABLE_ALLOW_CREATION);
+        this.coordinatorEventProcessorSupplier = coordinatorEventProcessorSupplier;
         this.eventManagerSupplier =
                 () -> coordinatorEventProcessorSupplier.get().getCoordinatorEventManager();
         this.coordinatorEpochSupplier =
@@ -321,6 +361,100 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public boolean isLeader() {
         return coordinatorLeaderElection.isLeader();
+    }
+
+    /** Returns the current coordinator epoch (ZK epoch or Raft term). */
+    public int getCoordinatorEpoch() {
+        return coordinatorEpochSupplier.get();
+    }
+
+    /**
+     * Wires the leader-side metadata-stream handler (Raft backend only). Called after construction
+     * once the coordinator's {@code MetadataStreamService} has been created; leaving it unset (the
+     * ZooKeeper backend) makes {@link #fetchMetadata}/{@link #fetchMetadataSnapshot} report the
+     * stream as unsupported.
+     */
+    public void setMetadataStreamRpcServer(MetadataStreamRpcServer metadataStreamRpcServer) {
+        this.metadataStreamRpcServer = metadataStreamRpcServer;
+    }
+
+    /**
+     * Wires the leader-side TabletServer registration/heartbeat handler (Raft backend only). Called
+     * after construction once the coordinator's {@code TabletServerLivenessManager} exists; leaving
+     * it unset (the ZooKeeper backend, where the tablet server writes its own ephemeral znode)
+     * makes {@link #registerTabletServer}/{@link #tabletServerHeartbeat} report the operation as
+     * unsupported.
+     */
+    public void setTabletServerRegistrationRpcServer(
+            TabletServerRegistrationRpcServer tabletServerRegistrationRpcServer) {
+        this.tabletServerRegistrationRpcServer = tabletServerRegistrationRpcServer;
+    }
+
+    /**
+     * Sets the leader-side id-allocation handler (§5.3). Called on the Raft metadata backend once
+     * the coordinator's {@code AllocateIdRpcServer} exists; leaving it null (the ZooKeeper backend)
+     * makes {@link #allocateId} report the operation as unsupported.
+     */
+    public void setAllocateIdRpcServer(AllocateIdRpcServer allocateIdRpcServer) {
+        this.allocateIdRpcServer = allocateIdRpcServer;
+    }
+
+    @Override
+    public CompletableFuture<FetchMetadataResponse> fetchMetadata(FetchMetadataRequest request) {
+        MetadataStreamRpcServer handler = metadataStreamRpcServer;
+        if (handler == null) {
+            return raftBackendOnly("FetchMetadata");
+        }
+        return handler.fetchMetadata(request);
+    }
+
+    @Override
+    public CompletableFuture<FetchMetadataSnapshotResponse> fetchMetadataSnapshot(
+            FetchMetadataSnapshotRequest request) {
+        MetadataStreamRpcServer handler = metadataStreamRpcServer;
+        if (handler == null) {
+            return raftBackendOnly("FetchMetadataSnapshot");
+        }
+        return handler.fetchMetadataSnapshot(request);
+    }
+
+    @Override
+    public CompletableFuture<RegisterTabletServerResponse> registerTabletServer(
+            RegisterTabletServerRequest request) {
+        TabletServerRegistrationRpcServer handler = tabletServerRegistrationRpcServer;
+        if (handler == null) {
+            return raftBackendOnly("RegisterTabletServer");
+        }
+        return handler.registerTabletServer(request);
+    }
+
+    @Override
+    public CompletableFuture<TabletServerHeartbeatResponse> tabletServerHeartbeat(
+            TabletServerHeartbeatRequest request) {
+        TabletServerRegistrationRpcServer handler = tabletServerRegistrationRpcServer;
+        if (handler == null) {
+            return raftBackendOnly("TabletServerHeartbeat");
+        }
+        return handler.tabletServerHeartbeat(request);
+    }
+
+    @Override
+    public CompletableFuture<AllocateIdResponse> allocateId(AllocateIdRequest request) {
+        AllocateIdRpcServer handler = allocateIdRpcServer;
+        if (handler == null) {
+            return raftBackendOnly("AllocateId");
+        }
+        return handler.allocateId(request);
+    }
+
+    private static <T> CompletableFuture<T> raftBackendOnly(String api) {
+        CompletableFuture<T> failed = new CompletableFuture<>();
+        failed.completeExceptionally(
+                new UnsupportedOperationException(
+                        api
+                                + " is only served by a coordinator running on the Raft metadata "
+                                + "backend; this coordinator uses the ZooKeeper backend."));
+        return failed;
     }
 
     @Override
@@ -852,8 +986,29 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         authorizeTable(OperationType.DROP, tablePath);
 
         DropTableResponse response = new DropTableResponse();
+        // Unregister before deleting metadata. AutoPartitionManager.createPartition can otherwise
+        // recreate znodes (creatingParentsIfNeeded) while drop is in flight; ZooKeeper allows that
+        // concurrent write, so a later create of the same path would still see the current-hour
+        // partition. Raft serializes metadata appends, which is why the same IT only failed on ZK.
+        maybeRemoveAutoPartitionTable(tablePath);
         metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
         return CompletableFuture.completedFuture(response);
+    }
+
+    private void maybeRemoveAutoPartitionTable(TablePath tablePath) {
+        try {
+            TableInfo table = metadataManager.getTable(tablePath);
+            if (table.isAutoPartitioned()) {
+                coordinatorEventProcessorSupplier
+                        .get()
+                        .getAutoPartitionManager()
+                        .removeAutoPartitionTable(table.getTableId());
+            }
+        } catch (TableNotExistException | IllegalStateException e) {
+            // Table already gone, or coordinator is not a serving leader / AutoPartitionManager
+            // is closed. Drop still proceeds against the metadata store.
+            LOG.debug("Skip auto-partition unregister for {}.", tablePath, e);
+        }
     }
 
     @Override
@@ -1590,6 +1745,93 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         return event.getResultFuture();
     }
 
+    @Override
+    public CompletableFuture<GetCoordinatorRaftStatusResponse> getCoordinatorRaftStatus(
+            GetCoordinatorRaftStatusRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+        GetCoordinatorRaftStatusResponse response = new GetCoordinatorRaftStatusResponse();
+        if (zkClient instanceof RaftMetadataClient) {
+            ((RaftMetadataClient) zkClient)
+                    .populateCoordinatorRaftStatus(response, coordinatorLeaderElection);
+        } else {
+            response.setIsRaftMode(false);
+            try {
+                Optional<org.apache.fluss.server.zk.data.CoordinatorAddress> leader =
+                        zkClient.getCoordinatorLeaderAddress();
+                if (leader.isPresent()) {
+                    org.apache.fluss.server.zk.data.CoordinatorAddress address = leader.get();
+                    List<Endpoint> endpoints = address.getEndpoints();
+                    if (!endpoints.isEmpty()) {
+                        Endpoint ep = endpoints.get(0);
+                        response.setLeader(
+                                new PbServerNode()
+                                        .setNodeId(0)
+                                        .setHost(ep.getHost())
+                                        .setPort(ep.getPort()));
+                    }
+                }
+                response.setLeaderEpoch(
+                        coordinatorLeaderElection.currentEpoch().coordinatorEpoch());
+            } catch (Exception e) {
+                LOG.warn("Failed to read ZooKeeper coordinator leader for raft-status RPC", e);
+            }
+        }
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public CompletableFuture<AddRaftVoterResponse> addRaftVoter(AddRaftVoterRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+        if (!(zkClient instanceof RaftMetadataClient)) {
+            throw new InvalidConfigException(
+                    "add-voter is only supported on the Raft metadata backend");
+        }
+        if (!coordinatorLeaderElection.isLeader()) {
+            throw new NotCoordinatorLeaderException(
+                    "This coordinator is not the raft leader; retry against the leader.");
+        }
+        AddRaftVoterResponse response = new AddRaftVoterResponse();
+        try {
+            response.addAllVoters(((RaftMetadataClient) zkClient).addVoter(request.getAddress()));
+        } catch (ApiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new FlussRuntimeException("Failed to add Raft voter " + request.getAddress(), e);
+        }
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public CompletableFuture<RemoveRaftVoterResponse> removeRaftVoter(
+            RemoveRaftVoterRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+        if (!(zkClient instanceof RaftMetadataClient)) {
+            throw new InvalidConfigException(
+                    "remove-voter is only supported on the Raft metadata backend");
+        }
+        if (!coordinatorLeaderElection.isLeader()) {
+            throw new NotCoordinatorLeaderException(
+                    "This coordinator is not the raft leader; retry against the leader.");
+        }
+        RemoveRaftVoterResponse response = new RemoveRaftVoterResponse();
+        try {
+            response.addAllVoters(
+                    ((RaftMetadataClient) zkClient).removeVoter(request.getServerId()));
+        } catch (ApiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to remove Raft voter " + request.getServerId(), e);
+        }
+        return CompletableFuture.completedFuture(response);
+    }
+
     @VisibleForTesting
     static GetClusterHealthResponse computeClusterHealth(CoordinatorContext ctx) {
         GetClusterHealthResponse response = new GetClusterHealthResponse();
@@ -1600,6 +1842,11 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         int activeLeaderReplicas = 0;
 
         for (TableBucket tb : ctx.getAllBuckets()) {
+            // Drop RPCs ack before replica cleanup finishes. Those leftover assignments
+            // have no active leader and must not paint the live cluster RED/YELLOW.
+            if (ctx.isToBeDeleted(tb)) {
+                continue;
+            }
             List<Integer> assignment = ctx.getAssignment(tb);
             numReplicas += assignment.size();
             numLeaderReplicas++;

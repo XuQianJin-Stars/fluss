@@ -37,15 +37,17 @@ import org.apache.fluss.server.coordinator.rebalance.model.ClusterModel;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaState;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.log.remote.RemoteLogTablet;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.tablet.TabletServer;
+import org.apache.fluss.server.testutils.DualBackendFlussClusters;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -70,30 +72,34 @@ import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObje
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** IT test for {@link RebalanceManager}. */
+/** IT test for {@link RebalanceManager}. Runs on ZooKeeper and Raft. */
 public class RebalanceManagerITCase {
 
     @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
-            FlussClusterExtension.builder()
+    public static final DualBackendFlussClusters CLUSTERS =
+            DualBackendFlussClusters.builder()
                     .setNumOfTabletServers(6)
                     .setClusterConf(initConfig())
                     .build();
 
-    private ZooKeeperClient zkClient;
+    private FlussClusterExtension flussClusterExtension;
+    private MetadataStoreClient zkClient;
     private RebalanceManager rebalanceManager;
 
-    @BeforeEach
-    void beforeEach() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        rebalanceManager = FLUSS_CLUSTER_EXTENSION.getRebalanceManager();
+    private void bind(MetadataBackend backend) {
+        flussClusterExtension = CLUSTERS.get(backend);
+        zkClient = flussClusterExtension.metadataStore();
+        rebalanceManager = flussClusterExtension.getRebalanceManager();
     }
 
-    @Test
-    void testBuildClusterModel() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testBuildClusterModel(MetadataBackend backend) throws Exception {
+        bind(backend);
         // one none-partitioned table.
         long tableId1 =
-                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+                createTable(flussClusterExtension, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        flussClusterExtension.waitUntilAllReplicaReady(new TableBucket(tableId1, 0));
         // one partitioned table.
         TablePath partitionTablePath = TablePath.of("test_db_1", "test_partition_table_1");
         TableDescriptor partitionTableDescriptor =
@@ -104,13 +110,15 @@ public class RebalanceManagerITCase {
                         .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, false)
                         .build();
         long tableId2 =
-                createTable(FLUSS_CLUSTER_EXTENSION, partitionTablePath, partitionTableDescriptor);
+                createTable(flussClusterExtension, partitionTablePath, partitionTableDescriptor);
         String partitionName1 = "b1";
-        createPartition(
-                FLUSS_CLUSTER_EXTENSION,
-                partitionTablePath,
-                new PartitionSpec(Collections.singletonMap("b", partitionName1)),
-                false);
+        long partitionId =
+                createPartition(
+                        flussClusterExtension,
+                        partitionTablePath,
+                        new PartitionSpec(Collections.singletonMap("b", partitionName1)),
+                        false);
+        flussClusterExtension.waitUntilAllReplicaReady(new TableBucket(tableId2, partitionId, 0));
 
         ClusterModel clusterModel = rebalanceManager.buildClusterModel();
         assertThat(clusterModel.servers().size()).isEqualTo(6);
@@ -123,7 +131,7 @@ public class RebalanceManagerITCase {
         AddServerTagRequest request =
                 new AddServerTagRequest().setServerTag(ServerTag.PERMANENT_OFFLINE.value);
         request.addServerId(0);
-        FLUSS_CLUSTER_EXTENSION.newCoordinatorClient().addServerTag(request).get();
+        flussClusterExtension.newCoordinatorClient().addServerTag(request).get();
 
         clusterModel = rebalanceManager.buildClusterModel();
         assertThat(clusterModel.servers().size()).isEqualTo(6);
@@ -133,19 +141,21 @@ public class RebalanceManagerITCase {
         assertThat(clusterModel.tables()).contains(tableId1, tableId2);
     }
 
-    @Test
-    void testRebalanceWithRemoteLog() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testRebalanceWithRemoteLog(MetadataBackend backend) throws Exception {
+        bind(backend);
         TableBucket tb = setupTableBucket();
         long tableId = tb.getTableId();
 
-        int leaderId = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leaderId = flussClusterExtension.waitAndGetLeader(tb);
         TabletServerGateway leaderGateway =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leaderId);
+                flussClusterExtension.newTabletServerClientForNode(leaderId);
 
         // produce test records
         produceRecordsAndWaitRemoteLogCopy(leaderGateway, tb, 0L);
         // test metadata updated: verify manifest in metadata
-        TabletServer tabletServer = FLUSS_CLUSTER_EXTENSION.getTabletServerById(leaderId);
+        TabletServer tabletServer = flussClusterExtension.getTabletServerById(leaderId);
         RemoteLogManager remoteLogManager = tabletServer.getReplicaManager().getRemoteLogManager();
         RemoteLogTablet remoteLogTablet = remoteLogManager.remoteLogTablet(tb);
 
@@ -191,12 +201,11 @@ public class RebalanceManagerITCase {
 
                     // leader changed.
                     int newLeader = planForBucket.getNewLeader();
-                    assertThat(FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb)).isEqualTo(newLeader);
+                    assertThat(flussClusterExtension.waitAndGetLeader(tb)).isEqualTo(newLeader);
 
                     // origin replicas all set to offline.
                     for (int originReplica : originReplicas) {
-                        TabletServer ts =
-                                FLUSS_CLUSTER_EXTENSION.getTabletServerById(originReplica);
+                        TabletServer ts = flussClusterExtension.getTabletServerById(originReplica);
                         ReplicaManager rm = ts.getReplicaManager();
                         assertThat(rm.getReplica(tb))
                                 .isInstanceOf(ReplicaManager.NoneReplica.class);
@@ -213,7 +222,7 @@ public class RebalanceManagerITCase {
                 });
         // remote log not be deleted.
         int newLeader = planForBucket.getNewLeader();
-        TabletServer leaderTs = FLUSS_CLUSTER_EXTENSION.getTabletServerById(newLeader);
+        TabletServer leaderTs = flussClusterExtension.getTabletServerById(newLeader);
         RemoteLogManager leaderRm = leaderTs.getReplicaManager().getRemoteLogManager();
         RemoteLogTablet leaderRlt = leaderRm.remoteLogTablet(tb);
 
@@ -251,16 +260,15 @@ public class RebalanceManagerITCase {
                             return null;
                         });
         CoordinatorEventProcessor processor =
-                FLUSS_CLUSTER_EXTENSION.getCoordinatorServer().getCoordinatorEventProcessor();
+                flussClusterExtension.getCoordinatorServer().getCoordinatorEventProcessor();
         processor.getCoordinatorEventManager().put(event);
         event.getResultFuture().get(30, TimeUnit.SECONDS);
     }
 
     private TableBucket setupTableBucket() throws Exception {
-        long tableId =
-                createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+        long tableId = createTable(flussClusterExtension, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
         TableBucket tb = new TableBucket(tableId, 0);
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        flussClusterExtension.waitUntilAllReplicaReady(tb);
         return tb;
     }
 
@@ -315,7 +323,7 @@ public class RebalanceManagerITCase {
                     0,
                     baseOffset + i * 10L);
         }
-        FLUSS_CLUSTER_EXTENSION.waitUntilSomeLogSegmentsCopyToRemote(
+        flussClusterExtension.waitUntilSomeLogSegmentsCopyToRemote(
                 new TableBucket(tb.getTableId(), 0));
     }
 

@@ -19,6 +19,8 @@ package org.apache.fluss.rpc.gateway;
 
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.AddRaftVoterRequest;
+import org.apache.fluss.rpc.messages.AddRaftVoterResponse;
 import org.apache.fluss.rpc.messages.AddServerTagRequest;
 import org.apache.fluss.rpc.messages.AddServerTagResponse;
 import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
@@ -63,6 +65,8 @@ import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.RegisterProducerOffsetsResponse;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.RemoveRaftVoterRequest;
+import org.apache.fluss.rpc.messages.RemoveRaftVoterResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
 import org.apache.fluss.rpc.protocol.ApiKeys;
@@ -245,4 +249,25 @@ public interface AdminGateway extends AdminReadOnlyGateway {
      */
     @RPC(api = ApiKeys.LIST_KV_SNAPSHOTS)
     CompletableFuture<ListKvSnapshotsResponse> listKvSnapshots(ListKvSnapshotsRequest request);
+
+    /**
+     * Adds a Raft voter to the coordinator quorum (zookeeper-removal-design.md §5.10). Leader-only;
+     * followers may return a redirect hint.
+     *
+     * @param request address ({@code host:raftPort}) of the new voter
+     * @return the resulting voter set
+     */
+    @RPC(api = ApiKeys.ADD_RAFT_VOTER)
+    CompletableFuture<AddRaftVoterResponse> addRaftVoter(AddRaftVoterRequest request);
+
+    /**
+     * Removes a Raft voter from the coordinator quorum (zookeeper-removal-design.md §5.10).
+     * Leader-only; refuses a removal that would drop the live set below majority of the new voter
+     * set.
+     *
+     * @param request peer id ({@code host_port}) or address ({@code host:port}) to remove
+     * @return the resulting voter set
+     */
+    @RPC(api = ApiKeys.REMOVE_RAFT_VOTER)
+    CompletableFuture<RemoveRaftVoterResponse> removeRaftVoter(RemoveRaftVoterRequest request);
 }

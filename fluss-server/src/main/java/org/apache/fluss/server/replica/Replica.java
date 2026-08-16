@@ -24,7 +24,6 @@ import org.apache.fluss.config.ConfigurationUtils;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
-import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.InvalidUpdateVersionException;
 import org.apache.fluss.exception.KvStorageException;
@@ -51,11 +50,15 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.rpc.messages.AllocateIdRequest;
+import org.apache.fluss.rpc.messages.AllocateIdResponse;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.rpc.util.PredicateMessageUtils;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
+import org.apache.fluss.server.coordinator.raft.AllocateIdRpcServer;
+import org.apache.fluss.server.coordinator.raft.RaftRemoteSequenceIDCounter;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
@@ -90,6 +93,7 @@ import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
@@ -120,6 +124,7 @@ import javax.annotation.concurrent.ThreadSafe;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -137,6 +142,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -607,9 +613,8 @@ public final class Replica {
                     if (lakeLogEndOffset < 0L) {
                         try {
                             return getRowCount();
-                        } catch (InvalidTableException e) {
-                            // WAL mode or v0.9 old table with no completed tiering:
-                            // row count disabled, return -1 to indicate unavailable
+                        } catch (Exception e) {
+                            // WAL / disabled row count, or KV not ready on this replica yet.
                             return -1L;
                         }
                     }
@@ -1007,7 +1012,7 @@ public final class Replica {
                     snapshotContext.getCompletedSnapshotReporter();
 
             // get latest completed snapshot
-            ZooKeeperClient zkClient = snapshotContext.getZooKeeperClient();
+            MetadataStoreClient zkClient = snapshotContext.getZooKeeperClient();
             RocksIncrementalSnapshot rocksIncrementalSnapshot;
             long lastCompletedSnapshotId = -1;
             long lastCompletedSnapshotLogOffset = 0;
@@ -1029,9 +1034,8 @@ public final class Replica {
 
             // create snapshot ID counter
             SequenceIDCounter snapshotIDCounter =
-                    new ZkSequenceIDCounter(
-                            zkClient.getCuratorClient(),
-                            ZkData.BucketSnapshotSequenceIdZNode.path(tableBucket));
+                    createBucketSnapshotIdCounter(
+                            zkClient, tableBucket, snapshotContext.getAllocateIdTransport());
 
             // todo: it's hack logic for snapshot target
             // to get bucket/coordinator leader epoch.
@@ -1079,6 +1083,55 @@ public final class Replica {
         } catch (Exception e) {
             LOG.error("init kv periodic snapshot for {} failed.", tableBucket, e);
         }
+    }
+
+    /**
+     * Builds the per-bucket snapshot-id counter for the configured metadata backend.
+     *
+     * <p>On the ZooKeeper backend this is a {@link ZkSequenceIDCounter} over the bucket's
+     * snapshot-id znode. On the Raft backend a TabletServer is not a Raft voter and holds no
+     * leader-capable metadata client, so snapshot-id allocation is routed to the coordinator leader
+     * via the {@code AllocateId} RPC ({@link RaftRemoteSequenceIDCounter} of kind {@link
+     * AllocateIdRpcServer#KIND_BUCKET_SNAPSHOT} over the injected transport, §5.3). If neither is
+     * available the Raft path fails fast.
+     */
+    private static SequenceIDCounter createBucketSnapshotIdCounter(
+            MetadataStoreClient client,
+            TableBucket tableBucket,
+            @Nullable
+                    Function<AllocateIdRequest, CompletableFuture<AllocateIdResponse>>
+                            allocateIdTransport) {
+        if (client instanceof ZooKeeperClient) {
+            return new ZkSequenceIDCounter(
+                    ((ZooKeeperClient) client).getCuratorClient(),
+                    ZkData.BucketSnapshotSequenceIdZNode.path(tableBucket));
+        }
+        if (allocateIdTransport != null) {
+            return new RaftRemoteSequenceIDCounter(
+                    allocateIdTransport,
+                    AllocateIdRpcServer.KIND_BUCKET_SNAPSHOT,
+                    bucketSnapshotCounterKey(tableBucket));
+        }
+        throw new UnsupportedOperationException(
+                "The Raft metadata backend requires an AllocateId transport for the "
+                        + "TabletServer-side bucket-snapshot id counter (see "
+                        + "zookeeper-removal-design.md §5.3).");
+    }
+
+    /**
+     * Stable, collision-free counter key for a {@link TableBucket}: 8-byte big-endian table id, a
+     * 0/1 flag byte for the presence of a partition, an 8-byte big-endian partition id (0 when
+     * absent), then the 4-byte big-endian bucket id. Deterministic across restarts so the same
+     * bucket always maps to the same leader-side counter (required for the no-reuse guarantee).
+     */
+    private static byte[] bucketSnapshotCounterKey(TableBucket tableBucket) {
+        Long partitionId = tableBucket.getPartitionId();
+        return ByteBuffer.allocate(Long.BYTES + 1 + Long.BYTES + Integer.BYTES)
+                .putLong(tableBucket.getTableId())
+                .put((byte) (partitionId == null ? 0 : 1))
+                .putLong(partitionId == null ? 0L : partitionId)
+                .putInt(tableBucket.getBucket())
+                .array();
     }
 
     public long getLatestKvSnapshotSize() {
@@ -1646,14 +1699,20 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
-                    KvTablet kv = this.kvTablet;
-                    if (kv != null) {
-                        // return materialized row count for primary key table
-                        return kv.getRowCount();
-                    } else {
-                        // return log row count for non-primary key table
-                        return logTablet.getRowCount();
+                    if (isKvTable()) {
+                        // PK tables must use materialized KV row count. Falling back to
+                        // log (HW - startOffset) while kvTablet is null (follower, or leader
+                        // mid-recovery) returns changelog volume and breaks getTableStats —
+                        // e.g. 100 inserts then 30 deletes still looks like 100 from the log.
+                        if (!isLeader() || kvTablet == null) {
+                            throw new NotLeaderOrFollowerException(
+                                    String.format(
+                                            "Leader KV not ready for bucket %s on tabletServer %d",
+                                            tableBucket, localTabletServerId));
+                        }
+                        return kvTablet.getRowCount();
                     }
+                    return logTablet.getRowCount();
                 });
     }
 

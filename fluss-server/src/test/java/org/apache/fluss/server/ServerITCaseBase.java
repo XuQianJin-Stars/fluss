@@ -43,6 +43,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -55,7 +57,17 @@ public abstract class ServerITCaseBase {
             new AllCallbackWrapper<>(new ZooKeeperExtension());
 
     private static final String SERVER_STARTED_MARKER = "Successfully start Netty server";
+    private static final String SERVER_FAILED_MARKER = "Could not start";
+    private static final Pattern BIND_ENDPOINTS_PATTERN =
+            Pattern.compile("Listening on endpoints \\[([^\\]]+)]");
 
+    /** Bound node parsed from the spawned process log after Netty starts. */
+    private ServerNode boundServerNode;
+
+    /**
+     * Template node used before the process binds. The port may be {@code 0} (ephemeral); the
+     * actual port is taken from the process log after startup.
+     */
     protected abstract ServerNode getServerNode();
 
     protected abstract Class<? extends RpcGateway> getRpcGatewayClass();
@@ -113,15 +125,25 @@ public abstract class ServerITCaseBase {
 
     private void waitUntilServerStartup(TestProcessBuilder.TestProcess process) {
         CommonTestUtils.waitUntil(
-                () ->
-                        process.getProcessOutput().toString().contains(SERVER_STARTED_MARKER)
-                                || !process.getErrorOutput().toString().isEmpty(),
+                () -> {
+                    String output = process.getProcessOutput().toString();
+                    return output.contains(SERVER_STARTED_MARKER)
+                            || output.contains(SERVER_FAILED_MARKER)
+                            || !process.getErrorOutput().toString().isEmpty()
+                            || !process.getProcess().isAlive();
+                },
                 Duration.ofMinutes(2),
-                null);
+                "Timed out waiting for " + getServerClass().getSimpleName() + " process to start");
+        String output = process.getProcessOutput().toString();
         String errorMsg = process.getErrorOutput().toString();
-        if (!errorMsg.isEmpty()) {
-            throw new IllegalStateException("Server process failed to start: " + errorMsg);
+        if (!output.contains(SERVER_STARTED_MARKER)) {
+            throw new IllegalStateException(
+                    "Server process failed to start. stdout:\n"
+                            + output
+                            + "\nstderr:\n"
+                            + errorMsg);
         }
+        boundServerNode = parseBoundServerNode(output, getServerNode());
     }
 
     private void testConnectionToServer() throws Exception {
@@ -129,16 +151,46 @@ public abstract class ServerITCaseBase {
                 new NettyClient(new Configuration(), TestingClientMetricGroup.newInstance())) {
             RpcGateway gateway =
                     GatewayClientProxy.createGatewayProxy(
-                            this::getServerNode, client, getRpcGatewayClass());
+                            this::clientNode, client, getRpcGatewayClass());
             ApiVersionsResponse response =
                     gateway.apiVersions(
                                     new ApiVersionsRequest()
                                             .setClientSoftwareVersion("1.0.0")
                                             .setClientSoftwareName("test"))
                             .get();
-            ApiManager apiManager = new ApiManager(getServerNode().serverType());
+            ApiManager apiManager = new ApiManager(clientNode().serverType());
             assertThat(response.getApiVersionsCount()).isEqualTo(apiManager.enabledApis().size());
         }
+    }
+
+    private ServerNode clientNode() {
+        return boundServerNode != null ? boundServerNode : getServerNode();
+    }
+
+    private static ServerNode parseBoundServerNode(String processOutput, ServerNode template) {
+        Matcher matcher = BIND_ENDPOINTS_PATTERN.matcher(processOutput);
+        if (!matcher.find()) {
+            throw new IllegalStateException(
+                    "Could not parse bind endpoints from process output:\n" + processOutput);
+        }
+        String[] endpoints = matcher.group(1).split(",");
+        for (int i = 0; i < endpoints.length; i++) {
+            String endpoint = endpoints[i].trim();
+            int schemeSep = endpoint.indexOf("://");
+            if (schemeSep < 0) {
+                continue;
+            }
+            String hostAndPort = endpoint.substring(schemeSep + 3);
+            int colon = hostAndPort.lastIndexOf(':');
+            if (colon < 0) {
+                continue;
+            }
+            String host = hostAndPort.substring(0, colon);
+            int port = Integer.parseInt(hostAndPort.substring(colon + 1));
+            return new ServerNode(
+                    template.id(), host, port, template.serverType(), template.rack());
+        }
+        throw new IllegalStateException("No usable bind endpoint in: " + matcher.group(1));
     }
 
     private static void generateYamlFile(Path yamlFile, Configuration configuration)

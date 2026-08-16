@@ -24,7 +24,6 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.MetadataManager;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -41,10 +40,11 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  */
 public abstract class ZkBasedMetadataProvider implements MetadataProvider {
 
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
     private final MetadataManager metadataManager;
 
-    protected ZkBasedMetadataProvider(ZooKeeperClient zkClient, MetadataManager metadataManager) {
+    protected ZkBasedMetadataProvider(
+            MetadataStoreClient zkClient, MetadataManager metadataManager) {
         this.zkClient = zkClient;
         this.metadataManager = metadataManager;
     }

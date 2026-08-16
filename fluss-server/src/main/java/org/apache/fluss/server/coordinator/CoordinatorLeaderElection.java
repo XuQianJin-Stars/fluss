@@ -20,6 +20,7 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.exception.CoordinatorEpochFencedException;
+import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.recipes.leader.LeaderLatch;
@@ -72,12 +73,17 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  * <p>If leader initialization fails, any partially initialized leader resources are cleaned up and
  * the state becomes {@code STANDBY}. The {@code CLOSED} state is terminal.
  */
-public class CoordinatorLeaderElection implements AutoCloseable {
+public class CoordinatorLeaderElection implements LeaderElection {
     private static final Logger LOG = LoggerFactory.getLogger(CoordinatorLeaderElection.class);
     private static final long DEFAULT_CLOSE_TIMEOUT_MS = 10000L;
 
     private final String serverId;
     private final LeaderLatch leaderLatch;
+    // The coordinator epoch (fencing token) captured from fenceBecomeCoordinatorLeader() during
+    // initLeaderServices. Exposed via currentEpoch() for the backend-neutral LeaderElection
+    // contract; this is the same epoch CoordinatorServer already obtains today, so there is no new
+    // ZK round-trip. Before the first successful election it stays at the initial epoch.
+    private volatile ZkEpoch currentEpoch = ZkEpoch.INITIAL_EPOCH;
     // Single-threaded executor to run leader init/cleanup callbacks outside Curator's EventThread.
     // Curator's LeaderLatchListener callbacks run on its internal EventThread; performing
     // synchronous ZK operations there causes deadlock because ZK response dispatch also
@@ -126,6 +132,7 @@ public class CoordinatorLeaderElection implements AutoCloseable {
      * @param initLeaderServices the callback to initialize leader services once elected
      * @param cleanupLeaderServices the callback to clean up leader services when losing leadership
      */
+    @Override
     public void startElectLeaderAsync(
             Runnable initLeaderServices, Consumer<Throwable> cleanupLeaderServices) {
         this.cleanupLeaderServices = cleanupLeaderServices;
@@ -186,6 +193,7 @@ public class CoordinatorLeaderElection implements AutoCloseable {
         awaitCallbackExecutorTermination();
     }
 
+    @Override
     public boolean isLeader() {
         return !closing.get() && state == State.LEADER;
     }
@@ -312,5 +320,20 @@ public class CoordinatorLeaderElection implements AutoCloseable {
         LEADER,
         STANDBY,
         CLOSED
+    }
+
+    /**
+     * Records the coordinator epoch obtained from {@code fenceBecomeCoordinatorLeader()} while this
+     * server was initializing its leader services. Exposed again through {@link #currentEpoch()}
+     * for the backend-neutral {@link LeaderElection} contract without any additional ZooKeeper
+     * access.
+     */
+    public void setCurrentEpoch(ZkEpoch epoch) {
+        this.currentEpoch = epoch;
+    }
+
+    @Override
+    public CoordinatorEpoch currentEpoch() {
+        return currentEpoch;
     }
 }

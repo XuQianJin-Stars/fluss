@@ -95,6 +95,9 @@ import org.apache.fluss.server.coordinator.event.watcher.CoordinatorChangeWatche
 import org.apache.fluss.server.coordinator.event.watcher.TableChangeWatcher;
 import org.apache.fluss.server.coordinator.event.watcher.TabletServerChangeWatcher;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
+import org.apache.fluss.server.coordinator.raft.RaftCoordinatorChangeWatchers;
+import org.apache.fluss.server.coordinator.raft.RaftMetadataClient;
+import org.apache.fluss.server.coordinator.raft.TabletServerLivenessManager;
 import org.apache.fluss.server.coordinator.rebalance.RebalanceManager;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ControlledShutdownLeaderElection;
 import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ReassignmentLeaderElection;
@@ -108,6 +111,7 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotStore;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metrics.group.CoordinatorMetricGroup;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
@@ -120,8 +124,6 @@ import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
-import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
-import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.utils.AutoPartitionStrategy;
@@ -171,7 +173,9 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
     private static final Logger LOG = LoggerFactory.getLogger(CoordinatorEventProcessor.class);
 
-    private final ZooKeeperClient zooKeeperClient;
+    // Backend-neutral metadata store client (ZooKeeperClient on the ZK backend, RaftMetadataClient
+    // on the Raft backend). The field name is retained across the retype to bound the diff.
+    private final MetadataStoreClient zooKeeperClient;
     private final ExecutorService ioExecutor;
     private final CoordinatorContext coordinatorContext;
     private final ReplicaCapacityController replicaCapacityController;
@@ -183,10 +187,14 @@ public class CoordinatorEventProcessor implements EventProcessor {
     private final TableLifecycleThrottler lifecycleThrottler;
     private final AutoPartitionManager autoPartitionManager;
     private final LakeTableTieringManager lakeTableTieringManager;
-    private final TableChangeWatcher tableChangeWatcher;
     private final CoordinatorChannelManager coordinatorChannelManager;
-    private final CoordinatorChangeWatcher coordinatorChangeWatcher;
-    private final TabletServerChangeWatcher tabletServerChangeWatcher;
+    // Metadata change watchers, assembled per backend (ZooKeeper CuratorCache watchers vs. Raft
+    // apply-watch watchers). Started when this becomes leader, stopped on losing leadership.
+    private final Runnable startWatchers;
+    private final Runnable stopWatchers;
+
+    // Raft-only: heartbeat-lease manager for immediate fence on controlled shutdown. Null on ZK.
+    @Nullable private volatile TabletServerLivenessManager tabletServerLivenessManager;
     private final CoordinatorMetadataCache serverMetadataCache;
     private final CoordinatorRequestBatch coordinatorRequestBatch;
     private final String internalListenerName;
@@ -199,7 +207,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
     private ScheduledFuture<?> offlineLeaderRetryTask;
 
     public CoordinatorEventProcessor(
-            ZooKeeperClient zooKeeperClient,
+            MetadataStoreClient zooKeeperClient,
             CoordinatorMetadataCache serverMetadataCache,
             CoordinatorChannelManager coordinatorChannelManager,
             CoordinatorContext coordinatorContext,
@@ -248,13 +256,45 @@ public class CoordinatorEventProcessor implements EventProcessor {
                         new RemoteStorageCleaner(conf, ioExecutor),
                         ioExecutor,
                         lifecycleThrottler);
-        this.coordinatorChangeWatcher =
-                new CoordinatorChangeWatcher(zooKeeperClient, coordinatorEventManager);
-        this.tableChangeWatcher =
-                new TableChangeWatcher(
-                        zooKeeperClient, coordinatorEventManager, lifecycleThrottler);
-        this.tabletServerChangeWatcher =
-                new TabletServerChangeWatcher(zooKeeperClient, coordinatorEventManager);
+        // Assemble the metadata change watchers per backend. On ZooKeeper these are the three
+        // CuratorCache watchers (they react to external znode notifications, including the
+        // coordinator's own writes). On Raft the coordinator leader is the single writer and reacts
+        // to its own committed writes as they are applied, so the three Raft apply-watch watchers
+        // are registered on the in-process MetadataWatchService instead (§5.8, route-1 (c)). Both
+        // sets share the same start/stop-on-(de)election lifecycle, exposed here as two Runnables.
+        if (zooKeeperClient instanceof ZooKeeperClient) {
+            ZooKeeperClient zkClient = (ZooKeeperClient) zooKeeperClient;
+            CoordinatorChangeWatcher coordinatorChangeWatcher =
+                    new CoordinatorChangeWatcher(zkClient, coordinatorEventManager);
+            TabletServerChangeWatcher tabletServerChangeWatcher =
+                    new TabletServerChangeWatcher(zkClient, coordinatorEventManager);
+            TableChangeWatcher tableChangeWatcher =
+                    new TableChangeWatcher(zkClient, coordinatorEventManager, lifecycleThrottler);
+            this.startWatchers =
+                    () -> {
+                        coordinatorChangeWatcher.start();
+                        tabletServerChangeWatcher.start();
+                        tableChangeWatcher.start();
+                    };
+            this.stopWatchers =
+                    () -> {
+                        coordinatorChangeWatcher.stop();
+                        tableChangeWatcher.stop();
+                        tabletServerChangeWatcher.stop();
+                    };
+        } else if (zooKeeperClient instanceof RaftMetadataClient) {
+            RaftCoordinatorChangeWatchers raftWatchers =
+                    new RaftCoordinatorChangeWatchers(
+                            (RaftMetadataClient) zooKeeperClient,
+                            coordinatorEventManager,
+                            lifecycleThrottler);
+            this.startWatchers = raftWatchers::start;
+            this.stopWatchers = raftWatchers::stop;
+        } else {
+            throw new IllegalStateException(
+                    "Unsupported metadata backend for CoordinatorEventProcessor: "
+                            + zooKeeperClient.getClass().getName());
+        }
         this.coordinatorRequestBatch =
                 new CoordinatorRequestBatch(
                         coordinatorChannelManager, coordinatorEventManager, coordinatorContext);
@@ -300,9 +340,43 @@ public class CoordinatorEventProcessor implements EventProcessor {
         return coordinatorContext;
     }
 
+    /**
+     * Raft-only: wires the heartbeat-lease manager so controlled shutdown can fence membership
+     * immediately (ZK ephemeral-delete parity). No-op path when left null (ZooKeeper backend).
+     */
+    public void setTabletServerLivenessManager(
+            @Nullable TabletServerLivenessManager tabletServerLivenessManager) {
+        this.tabletServerLivenessManager = tabletServerLivenessManager;
+    }
+
+    /**
+     * Seeds {@link TabletServerLivenessManager} from store membership loaded into {@link
+     * #initCoordinatorContext()}. No-op on the ZooKeeper backend.
+     */
+    private void seedTabletServerLivenessLeases() {
+        if (tabletServerLivenessManager == null) {
+            return;
+        }
+        try {
+            int[] currentServers = zooKeeperClient.getSortedTabletServerList();
+            List<Integer> serverIds = new ArrayList<>(currentServers.length);
+            for (int serverId : currentServers) {
+                serverIds.add(serverId);
+            }
+            tabletServerLivenessManager.seedRegisteredServers(serverIds);
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Fail to seed TabletServer liveness leases after context init.", e);
+        }
+    }
+
     @VisibleForTesting
     TableLifecycleThrottler getLifecycleThrottler() {
         return lifecycleThrottler;
+    }
+
+    AutoPartitionManager getAutoPartitionManager() {
+        return autoPartitionManager;
     }
 
     @VisibleForTesting
@@ -313,15 +387,18 @@ public class CoordinatorEventProcessor implements EventProcessor {
     public void startup() {
         coordinatorContext.setCoordinatorServerInfo(getCoordinatorServerInfo());
         // start watchers first so that we won't miss node in zk;
-        coordinatorChangeWatcher.start();
-        tabletServerChangeWatcher.start();
-        tableChangeWatcher.start();
+        startWatchers.run();
         LOG.info("Initializing coordinator context.");
         try {
             initCoordinatorContext();
         } catch (Exception e) {
             throw new FlussRuntimeException("Fail to initialize coordinator context.", e);
         }
+
+        // Raft: seed heartbeat leases for members already in the store so offline tablets (no
+        // heartbeats after this leadership) are fenced after session-timeout — ZK ephemeral
+        // expiry parity when the coordinator restarts while REGISTER records remain.
+        seedTabletServerLivenessLeases();
 
         lifecycleThrottler.start();
 
@@ -518,10 +595,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
     }
 
     private void loadTableAssignment() throws Exception {
-        List<String> assignmentTables = zooKeeperClient.getChildren(TableIdsZNode.path());
         Set<Long> deletedTables = new HashSet<>();
-        List<Long> tableIds =
-                assignmentTables.stream().map(Long::parseLong).collect(Collectors.toList());
+        List<Long> tableIds = zooKeeperClient.listAssignedTableIds();
         Map<Long, TableAssignment> tableId2tableAssignmentMap =
                 zooKeeperClient.getTablesAssignments(tableIds);
         for (Long tableId : tableIds) {
@@ -545,10 +620,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
 
     private void loadPartitionAssignment() throws Exception {
         // load all assignment
-        List<Long> partitionAssignmentNodes =
-                zooKeeperClient.getChildren(PartitionIdsZNode.path()).stream()
-                        .map(Long::parseLong)
-                        .collect(Collectors.toList());
+        List<Long> partitionAssignmentNodes = zooKeeperClient.listAssignedPartitionIds();
         Set<TablePartition> deletedPartitions = new HashSet<>();
         Map<Long, PartitionAssignment> partitionId2partitionAssignmentMap =
                 zooKeeperClient.getPartitionsAssignments(partitionAssignmentNodes);
@@ -627,9 +699,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
         lifecycleThrottler.close();
 
         // then stop watchers
-        coordinatorChangeWatcher.stop();
-        tableChangeWatcher.stop();
-        tabletServerChangeWatcher.stop();
+        stopWatchers.run();
     }
 
     private void scheduleOfflineLeaderRetryIfNeeded() {
@@ -1276,30 +1346,28 @@ public class CoordinatorEventProcessor implements EventProcessor {
     }
 
     private void processNewTabletServer(NewTabletServerEvent newTabletServerEvent) {
-        // NOTE: we won't need to detect bounced tablet servers like Kafka as we won't
-        // miss the event of tablet server un-register and register again since we can
-        // listen the children created and deleted in zk node.
-
-        // Also, Kafka use broker epoch to make it can reject the LeaderAndIsrRequest,
-        // UpdateMetadataRequest and StopReplicaRequest
-        // whose epoch < current broker epoch.
-        // See more in KIP-380 & https://github.com/apache/kafka/pull/5821
-        // but for the case of StopReplicaRequest in Fluss, although we will send
-        // stop replica after tablet server is controlled shutdown, but we will detect
-        // it start when it bounce and send start replica request again. It seems not a
-        // problem in Fluss;
-        // TODO: revisit here to see whether we really need epoch for tablet server like kafka
-        // when we finish the logic of tablet server
+        // ZooKeeper: ephemeral delete+create yields Dead then New, so a bounce never hits the
+        // already-live early-return below. Raft: fast re-REGISTER before lease expiry is a
+        // put-overwrite; RaftTabletServerChangeWatcher emits Dead then New for that case so
+        // OnlineReplica / NotifyLeaderAndIsr / LogTiering restart on the new process.
+        //
+        // Kafka uses broker epoch to reject stale LeaderAndIsr/UpdateMetadata/StopReplica
+        // (KIP-380). Fluss may still want a tablet-server epoch later; revisit then.
         ServerInfo serverInfo = newTabletServerEvent.getServerInfo();
         int tabletServerId = serverInfo.id();
         if (coordinatorContext.getLiveTabletServers().containsKey(serverInfo.id())) {
-            // if the dead server is already in live servers, return directly
-            // it may happen during coordinator server initiation, the watcher watch a new tablet
-            // server register event and put it to event manager, but after that, the coordinator
-            // server read
-            // all tablet server nodes registered which contain the tablet server; in this case,
-            // we can ignore it.
-            return;
+            ServerInfo existing = coordinatorContext.getLiveTabletServers().get(tabletServerId);
+            // Same endpoints: duplicate New during coordinator initiation — ignore.
+            // Different endpoints: process restarted with a new bind port before lease fence;
+            // tear down then re-admit (defense in depth alongside Raft fence-then-register).
+            if (existing.endpoints().equals(serverInfo.endpoints())) {
+                return;
+            }
+            LOG.info(
+                    "Tablet server {} re-registered with new endpoints {}; treating as bounce",
+                    tabletServerId,
+                    serverInfo.endpoints());
+            processDeadTabletServer(new DeadTabletServerEvent(tabletServerId));
         }
 
         // process new tablet server
@@ -2428,6 +2496,13 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 remainingLeaderBuckets.stream()
                         .map(ServerRpcMessageUtils::fromTableBucket)
                         .collect(Collectors.toList()));
+        // Raft: successful controlled shutdown (no remaining leaders) immediately fences membership
+        // so DeadTabletServerEvent fires without waiting for heartbeat lease expiry — parity with
+        // ZK ephemeral-node delete on process exit. If leaders remain the tablet retries; lease
+        // expiry (or a later successful CS) still fences if the process force-closes.
+        if (remainingLeaderBuckets.isEmpty() && tabletServerLivenessManager != null) {
+            tabletServerLivenessManager.fenceImmediately(tabletServerId);
+        }
         LOG.info(
                 "Completed controlled shutdown for tabletServer {} in {} ms; {} leader buckets remain.",
                 tabletServerId,

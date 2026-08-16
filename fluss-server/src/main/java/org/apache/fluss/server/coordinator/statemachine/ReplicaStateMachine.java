@@ -24,7 +24,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableBucketReplica;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.coordinator.CoordinatorRequestBatch;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -55,12 +55,12 @@ public class ReplicaStateMachine {
     private final CoordinatorContext coordinatorContext;
 
     private final CoordinatorRequestBatch coordinatorRequestBatch;
-    private final ZooKeeperClient zooKeeperClient;
+    private final MetadataStoreClient zooKeeperClient;
 
     public ReplicaStateMachine(
             CoordinatorContext coordinatorContext,
             CoordinatorRequestBatch coordinatorRequestBatch,
-            ZooKeeperClient zooKeeperClient) {
+            MetadataStoreClient zooKeeperClient) {
         this.coordinatorContext = coordinatorContext;
         this.coordinatorRequestBatch = coordinatorRequestBatch;
         this.zooKeeperClient = zooKeeperClient;

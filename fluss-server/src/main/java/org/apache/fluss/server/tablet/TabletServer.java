@@ -19,6 +19,7 @@ package org.apache.fluss.server.tablet;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.cluster.Endpoint;
+import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -30,20 +31,30 @@ import org.apache.fluss.rpc.RpcServer;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.ControlledShutdownRequest;
 import org.apache.fluss.rpc.messages.ControlledShutdownResponse;
+import org.apache.fluss.rpc.messages.RegisterTabletServerRequest;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.rpc.netty.server.RequestsMetrics;
 import org.apache.fluss.server.DynamicConfigManager;
 import org.apache.fluss.server.ServerBase;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.authorizer.AuthorizerLoader;
+import org.apache.fluss.server.authorizer.DefaultAuthorizer;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.coordinator.gossip.GossipDiscovery;
+import org.apache.fluss.server.coordinator.raft.InMemoryMetadataKvStore;
+import org.apache.fluss.server.coordinator.raft.MetadataWatchService;
+import org.apache.fluss.server.coordinator.raft.RaftMetadataClient;
+import org.apache.fluss.server.coordinator.raft.RaftMetadataStore;
 import org.apache.fluss.server.kv.KvCloseMode;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.DefaultCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
+import org.apache.fluss.server.metadata.MetadataStoreClientFactory;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metadata.TabletServerResource;
 import org.apache.fluss.server.metrics.ServerMetricUtils;
@@ -72,6 +83,7 @@ import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -79,6 +91,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static org.apache.fluss.config.ConfigOptions.BACKGROUND_THREADS;
 import static org.apache.fluss.config.FlussConfigUtils.validateTabletConfigs;
@@ -162,8 +176,40 @@ public class TabletServer extends ServerBase {
     @GuardedBy("lock")
     private Scheduler scheduler;
 
+    /**
+     * The backend-neutral metadata client (a {@code ZooKeeperClient} on the ZooKeeper backend, a
+     * {@code RaftMetadataClient} on the Raft backend). All metadata collaborators are typed to
+     * this.
+     */
     @GuardedBy("lock")
+    private MetadataStoreClient metaClient;
+
+    /**
+     * The ZooKeeper client, kept only for the genuinely ZK-only calls that have no Raft analog (the
+     * ephemeral-znode registration and the session re-init listener). {@code null} on the Raft
+     * backend, where {@link #raftMetadataFeed} replaces both.
+     */
+    @GuardedBy("lock")
+    @Nullable
     private ZooKeeperClient zkClient;
+
+    /**
+     * The Raft-backend follower metadata store, kept in sync by {@link #raftMetadataFeed}'s
+     * metadata-stream subscriber (§5.8). It backs the read-only follower {@link #metaClient} so a
+     * TabletServer never runs an embedded Ratis voter; {@code null} on the ZooKeeper backend.
+     */
+    @GuardedBy("lock")
+    @Nullable
+    private RaftMetadataStore raftFollowerStore;
+
+    /**
+     * The Raft-backend replacement for the ZooKeeper ephemeral-node registration + session and the
+     * coordinator's {@code UpdateMetadata} push: registers/heartbeats this server and keeps the
+     * {@link TabletServerMetadataCache} in sync via the metadata stream. {@code null} on ZooKeeper.
+     */
+    @GuardedBy("lock")
+    @Nullable
+    private TabletServerRaftMetadataFeed raftMetadataFeed;
 
     @GuardedBy("lock")
     @Nullable
@@ -231,13 +277,38 @@ public class TabletServer extends ServerBase {
                             serverId);
             this.userMetrics = new UserMetrics(scheduler, metricRegistry, tabletServerMetricGroup);
 
-            this.zkClient = ZooKeeperUtils.startZookeeperClient(conf, this);
+            // Obtain the metadata client through the backend-neutral seam. On ZooKeeper this yields
+            // exactly the previous ZooKeeperClient. On Raft a TabletServer is NOT a voter, so it
+            // must NOT bootstrap an embedded Ratis server (as MetadataStoreClientFactory does for
+            // the coordinator): its metadata client is a READ-ONLY follower view over a store kept
+            // in sync by the metadata stream (raftMetadataFeed below), and every id/writer
+            // allocation is routed to the coordinator leader via the AllocateId RPC. zkClient is
+            // kept (non-null) only on the ZooKeeper backend for the genuinely ZK-only registration
+            // path.
+            MetadataBackend backend = MetadataBackend.from(conf);
+            if (backend == MetadataBackend.RAFT) {
+                this.raftFollowerStore =
+                        new RaftMetadataStore(
+                                new InMemoryMetadataKvStore(), new MetadataWatchService());
+                this.metaClient = RaftMetadataClient.followerReadView(raftFollowerStore);
+                this.zkClient = null;
+            } else {
+                this.metaClient = MetadataStoreClientFactory.create(conf, this);
+                this.zkClient = (ZooKeeperClient) metaClient;
+            }
 
             this.lakeCatalogDynamicLoader =
                     new LakeCatalogDynamicLoader(conf, pluginManager, false);
             MetadataManager metadataManager =
-                    new MetadataManager(zkClient, conf, lakeCatalogDynamicLoader);
-            this.dynamicConfigManager = new DynamicConfigManager(zkClient, conf);
+                    new MetadataManager(metaClient, conf, lakeCatalogDynamicLoader);
+            // On ZooKeeper, config-change notifications reach this server through a ZK
+            // change-notification watcher; on Raft they arrive via the metadata stream (the
+            // ConfigChangeStreamNotifier wired into the raft metadata feed below), so use the
+            // backend-neutral (watcher-less) constructor there.
+            this.dynamicConfigManager =
+                    zkClient != null
+                            ? new DynamicConfigManager(zkClient, conf)
+                            : new DynamicConfigManager(metaClient, conf, false);
 
             this.metadataCache = new TabletServerMetadataCache(metadataManager);
 
@@ -245,7 +316,7 @@ public class TabletServer extends ServerBase {
             this.logManager =
                     LogManager.create(
                             conf,
-                            zkClient,
+                            metaClient,
                             scheduler,
                             clock,
                             tabletServerMetricGroup,
@@ -254,10 +325,24 @@ public class TabletServer extends ServerBase {
 
             this.kvManager =
                     KvManager.create(
-                            conf, zkClient, logManager, tabletServerMetricGroup, localDiskManager);
+                            conf,
+                            metaClient,
+                            logManager,
+                            tabletServerMetricGroup,
+                            localDiskManager,
+                            // On Raft, kv auto-increment column ids are reserved from the
+                            // coordinator leader via the AllocateId RPC (the tablet server holds no
+                            // leader-capable metadata client). The lambda reads the
+                            // coordinatorGateway
+                            // field lazily — it is only invoked when a kv tablet is created, long
+                            // after the gateway is wired below. Null on ZooKeeper (per-column
+                            // znode).
+                            backend == MetadataBackend.RAFT
+                                    ? (request -> coordinatorGateway.allocateId(request))
+                                    : null);
             kvManager.startup();
 
-            this.authorizer = AuthorizerLoader.createAuthorizer(conf, zkClient, pluginManager);
+            this.authorizer = AuthorizerLoader.createAuthorizer(conf, metaClient, pluginManager);
             if (authorizer != null) {
                 authorizer.startup();
             }
@@ -267,11 +352,41 @@ public class TabletServer extends ServerBase {
                     new ClientMetricGroup(metricRegistry, SERVER_NAME + "-" + serverId);
             this.rpcClient = RpcClient.create(conf, clientMetricGroup);
 
+            // The coordinator node the gateway proxy targets. On ZooKeeper it is read from the
+            // metadata cache (populated by the coordinator's UpdateMetadata push). On Raft the
+            // cache
+            // is initially empty, so fall back to seed-based discovery (§5.4.1) until the metadata
+            // stream converges the cache with the current leader (kept fresh across failover).
+            final Supplier<ServerNode> coordinatorNodeSupplier;
+            if (zkClient != null) {
+                coordinatorNodeSupplier =
+                        () -> metadataCache.getCoordinatorServer(interListenerName);
+            } else {
+                CoordinatorDiscovery coordinatorDiscovery =
+                        new CoordinatorDiscovery(parseSeedNodes(conf), rpcClient);
+                long discoverTimeoutMs =
+                        conf.get(ConfigOptions.COORDINATOR_TABLET_SERVER_SESSION_TIMEOUT)
+                                .toMillis();
+                coordinatorNodeSupplier =
+                        () -> {
+                            ServerNode fromCache =
+                                    metadataCache.getCoordinatorServer(interListenerName);
+                            if (fromCache != null) {
+                                return fromCache;
+                            }
+                            try {
+                                return coordinatorDiscovery.discoverCoordinatorLeader(
+                                        discoverTimeoutMs, 500L);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                return null;
+                            }
+                        };
+            }
+
             this.coordinatorGateway =
                     GatewayClientProxy.createGatewayProxy(
-                            () -> metadataCache.getCoordinatorServer(interListenerName),
-                            rpcClient,
-                            CoordinatorGateway.class);
+                            coordinatorNodeSupplier, rpcClient, CoordinatorGateway.class);
 
             this.ioExecutor =
                     Executors.newFixedThreadPool(
@@ -289,7 +404,7 @@ public class TabletServer extends ServerBase {
                             scheduler,
                             logManager,
                             kvManager,
-                            zkClient,
+                            metaClient,
                             serverId,
                             metadataCache,
                             rpcClient,
@@ -310,7 +425,7 @@ public class TabletServer extends ServerBase {
                     new TabletService(
                             serverId,
                             remoteFileSystem,
-                            zkClient,
+                            metaClient,
                             replicaManager,
                             metadataCache,
                             metadataManager,
@@ -350,11 +465,79 @@ public class TabletServer extends ServerBase {
 
             rpcServer.start();
 
-            registerTabletServer();
-            // when init session, register tablet server again
-            ZooKeeperUtils.registerZookeeperClientReInitSessionListener(
-                    zkClient, this::registerTabletServer, this);
+            if (zkClient != null) {
+                registerTabletServer();
+                // when init session, register tablet server again
+                ZooKeeperUtils.registerZookeeperClientReInitSessionListener(
+                        zkClient, this::registerTabletServer, this);
+            } else {
+                // Raft backend: register/heartbeat via the coordinator RPCs and feed the metadata
+                // cache from the metadata stream, replacing the ZK ephemeral node + session and the
+                // coordinator's UpdateMetadata push.
+                this.raftMetadataFeed = startRaftMetadataFeed();
+            }
         }
+    }
+
+    /**
+     * Starts the Raft-backend metadata feed (§5.4.2 / §5.8): registers this server + heartbeats its
+     * lease and keeps the {@link TabletServerMetadataCache} in sync via the metadata stream. The
+     * dynamic config-change stream is reconciled into the {@link DynamicConfigManager}; ACL changes
+     * are reconciled into {@link DefaultAuthorizer} when authorization is enabled.
+     */
+    private TabletServerRaftMetadataFeed startRaftMetadataFeed() throws Exception {
+        List<Endpoint> advertised =
+                Endpoint.loadAdvertisedEndpoints(rpcServer.getBindEndpoints(), conf);
+        String listenersString = Endpoint.toListenersString(advertised);
+        Supplier<RegisterTabletServerRequest> registrationSupplier =
+                () -> {
+                    RegisterTabletServerRequest request =
+                            new RegisterTabletServerRequest()
+                                    .setServerId(serverId)
+                                    .setRegisterTimestamp(System.currentTimeMillis())
+                                    .setListeners(listenersString);
+                    if (rack != null) {
+                        request.setRack(rack);
+                    }
+                    return request;
+                };
+        TabletServerRaftMetadataFeed feed =
+                TabletServerRaftMetadataFeed.create(
+                        conf,
+                        serverId,
+                        coordinatorGateway,
+                        metadataCache,
+                        registrationSupplier,
+                        dynamicConfigManager::reloadDynamicConfig,
+                        authorizer instanceof DefaultAuthorizer
+                                ? ((DefaultAuthorizer) authorizer)::reconcileAclCache
+                                : null,
+                        // Feed the SAME follower store that backs the read-only follower
+                        // metaClient,
+                        // so table/schema metadata replayed from the stream is visible to
+                        // LogManager/KvManager/MetadataManager reads on this server.
+                        raftFollowerStore);
+        feed.start();
+        return feed;
+    }
+
+    /**
+     * Parses the comma-separated {@code coordinator.seed.nodes} into a list of {@code host:port}.
+     */
+    private static List<String> parseSeedNodes(Configuration conf) {
+        String seeds = conf.getString(ConfigOptions.COORDINATOR_SEED_NODES);
+        if (seeds == null || seeds.trim().isEmpty()) {
+            return new ArrayList<>();
+        }
+        List<String> parsed =
+                Arrays.stream(seeds.split(","))
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .collect(Collectors.toList());
+        if (conf.getBoolean(ConfigOptions.COORDINATOR_GOSSIP_ENABLED)) {
+            return GossipDiscovery.expandRpcSeeds(parsed, conf);
+        }
+        return parsed;
     }
 
     @Override
@@ -539,8 +722,12 @@ public class TabletServer extends ServerBase {
                     lakeCatalogDynamicLoader.close();
                 }
 
-                if (zkClient != null) {
-                    zkClient.close();
+                if (raftMetadataFeed != null) {
+                    raftMetadataFeed.close();
+                }
+
+                if (metaClient != null) {
+                    metaClient.close();
                 }
 
                 if (ioExecutor != null) {

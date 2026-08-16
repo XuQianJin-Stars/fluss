@@ -57,6 +57,8 @@ public abstract class WriteBatch {
     protected boolean reopened;
     protected int recordCount;
     private long drainedMs;
+    /** Time when this batch last entered the accumulator queue (create or re-enqueue). */
+    private long queuedMs;
 
     public WriteBatch(
             long tableId,
@@ -67,6 +69,7 @@ public abstract class WriteBatch {
             long createdMs) {
         this.physicalTablePath = physicalTablePath;
         this.createdMs = createdMs;
+        this.queuedMs = createdMs;
         this.tableId = tableId;
         this.schemaId = schemaId;
         this.writeFormat = checkNotNull(writeFormat, "write format must be not null");
@@ -199,6 +202,15 @@ public abstract class WriteBatch {
 
     public long waitedTimeMs(long nowMs) {
         return Math.max(0, nowMs - createdMs);
+    }
+
+    /** Time spent in the accumulator queue since create or the last re-enqueue. */
+    long queuedTimeMs(long nowMs) {
+        return Math.max(0, nowMs - queuedMs);
+    }
+
+    void resetQueuedTime(long nowMs) {
+        this.queuedMs = nowMs;
     }
 
     public int getRecordCount() {

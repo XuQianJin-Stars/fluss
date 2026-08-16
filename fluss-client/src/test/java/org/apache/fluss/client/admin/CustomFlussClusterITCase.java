@@ -37,8 +37,8 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.types.RowType;
 
 import org.junit.jupiter.api.Test;
@@ -287,10 +287,10 @@ class CustomFlussClusterITCase {
             assertThat(errorCount.get()).isEqualTo(0);
 
             // Verify all leases are cleaned up
-            ZooKeeperClient zkClient = flussClusterExtension.getZooKeeperClient();
+            MetadataStoreClient metadataStore = flussClusterExtension.metadataStore();
             retry(
                     Duration.ofMinutes(1),
-                    () -> assertThat(zkClient.getKvSnapshotLeasesList()).isEmpty());
+                    () -> assertThat(metadataStore.getKvSnapshotLeasesList()).isEmpty());
 
             // Verify data is still consistent after concurrent operations
             try (Table table = connection.getTable(tablePath)) {

@@ -20,17 +20,19 @@ package org.apache.fluss.server.coordinator;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.tablet.TabletServer;
+import org.apache.fluss.server.testutils.DualBackendFlussClusters;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.testutils.RpcMessageTestUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.util.stream.Collectors;
@@ -41,27 +43,22 @@ import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** ITCase for notify leader and isr. */
+/** ITCase for notify leader and isr. Runs on ZooKeeper and Raft. */
 public class NotifyLeaderAndIsrITCase {
     @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
-            FlussClusterExtension.builder()
+    public static final DualBackendFlussClusters CLUSTERS =
+            DualBackendFlussClusters.builder()
                     .setNumOfTabletServers(3)
                     .setClusterConf(initConfig())
                     .build();
 
-    private ZooKeeperClient zkClient;
-
-    @BeforeEach
-    void beforeEach() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-    }
-
-    @Test
-    void testNotifyLeaderAndIsr() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testNotifyLeaderAndIsr(MetadataBackend backend) throws Exception {
+        FlussClusterExtension cluster = CLUSTERS.get(backend);
+        MetadataStoreClient zkClient = cluster.metadataStore();
         long tableId =
-                RpcMessageTestUtils.createTable(
-                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
+                RpcMessageTestUtils.createTable(cluster, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
         TableBucket tb = new TableBucket(tableId, 0);
 
         LeaderAndIsr leaderAndIsr =
@@ -72,7 +69,7 @@ public class NotifyLeaderAndIsrITCase {
 
         // test leader.
         int leader = leaderAndIsr.leader();
-        TabletServer tabletServer = FLUSS_CLUSTER_EXTENSION.getTabletServerById(leader);
+        TabletServer tabletServer = cluster.getTabletServerById(leader);
         ReplicaManager replicaManager = tabletServer.getReplicaManager();
         retry(
                 Duration.ofMinutes(1),
@@ -90,7 +87,7 @@ public class NotifyLeaderAndIsrITCase {
                 leaderAndIsr.isr().stream()
                         .filter(id -> id != leader)
                         .collect(Collectors.toList())) {
-            TabletServer follower = FLUSS_CLUSTER_EXTENSION.getTabletServerById(followId);
+            TabletServer follower = cluster.getTabletServerById(followId);
             ReplicaManager replicaManager1 = follower.getReplicaManager();
             retry(
                     Duration.ofMinutes(1),

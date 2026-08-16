@@ -21,8 +21,8 @@ package org.apache.fluss.server.coordinator.producer;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -52,11 +52,11 @@ class ProducerOffsetsStoreTest {
     @TempDir Path tempDir;
 
     private ProducerOffsetsStore store;
-    private ZooKeeperClient zkClient;
+    private MetadataStoreClient zkClient;
 
     @BeforeEach
     void setUp() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        zkClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         store = new ProducerOffsetsStore(zkClient, tempDir.toString());
     }
 

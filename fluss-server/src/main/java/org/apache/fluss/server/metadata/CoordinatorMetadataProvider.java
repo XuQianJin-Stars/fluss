@@ -24,7 +24,6 @@ import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.coordinator.MetadataManager;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 
 import javax.annotation.Nullable;
@@ -64,7 +63,7 @@ public class CoordinatorMetadataProvider extends ZkBasedMetadataProvider {
      * @param ctx the coordinator context providing cached metadata and assignments
      */
     public CoordinatorMetadataProvider(
-            ZooKeeperClient zkClient, MetadataManager metadataManager, CoordinatorContext ctx) {
+            MetadataStoreClient zkClient, MetadataManager metadataManager, CoordinatorContext ctx) {
         super(zkClient, metadataManager);
         this.ctx = ctx;
     }

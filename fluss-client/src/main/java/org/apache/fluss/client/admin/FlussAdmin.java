@@ -33,6 +33,7 @@ import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.ConfigEntry;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.InvalidMetadataException;
 import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.metadata.DatabaseChange;
 import org.apache.fluss.metadata.DatabaseDescriptor;
@@ -104,6 +105,7 @@ import org.apache.fluss.rpc.messages.TableExistsResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 
@@ -210,8 +212,7 @@ public class FlussAdmin implements Admin {
         request.setTablePath()
                 .setDatabaseName(tablePath.getDatabaseName())
                 .setTableName(tablePath.getTableName());
-        return readOnlyGateway
-                .getTableSchema(request)
+        return gateway.getTableSchema(request)
                 .thenApply(
                         r ->
                                 new SchemaInfo(
@@ -226,8 +227,7 @@ public class FlussAdmin implements Admin {
                 .setTablePath()
                 .setDatabaseName(tablePath.getDatabaseName())
                 .setTableName(tablePath.getTableName());
-        return readOnlyGateway
-                .getTableSchema(request)
+        return gateway.getTableSchema(request)
                 .thenApply(
                         r ->
                                 new SchemaInfo(
@@ -275,7 +275,7 @@ public class FlussAdmin implements Admin {
     public CompletableFuture<Boolean> databaseExists(String databaseName) {
         DatabaseExistsRequest request = new DatabaseExistsRequest();
         request.setDatabaseName(databaseName);
-        return readOnlyGateway.databaseExists(request).thenApply(DatabaseExistsResponse::isExists);
+        return gateway.databaseExists(request).thenApply(DatabaseExistsResponse::isExists);
     }
 
     @Override
@@ -331,8 +331,11 @@ public class FlussAdmin implements Admin {
         request.setTablePath()
                 .setDatabaseName(tablePath.getDatabaseName())
                 .setTableName(tablePath.getTableName());
-        return readOnlyGateway
-                .getTableInfo(request)
+        // Use the coordinator (write) gateway, not a random tablet. Tablet Admin reads go through
+        // the Raft follower metadata store / stream and can lag the leader's create/alter, so
+        // createTable().get() then getTableInfo().get() would otherwise flake with
+        // TableNotExistException under Raft (ZK UpdateMetadata push was usually fast enough).
+        return gateway.getTableInfo(request)
                 .thenApply(
                         r ->
                                 TableInfo.of(
@@ -363,7 +366,8 @@ public class FlussAdmin implements Admin {
         request.setTablePath()
                 .setDatabaseName(tablePath.getDatabaseName())
                 .setTableName(tablePath.getTableName());
-        return readOnlyGateway.tableExists(request).thenApply(TableExistsResponse::isExists);
+        // Same as getTableInfo: use coordinator for linearizable existence checks after DDL.
+        return gateway.tableExists(request).thenApply(TableExistsResponse::isExists);
     }
 
     @Override
@@ -544,8 +548,14 @@ public class FlussAdmin implements Admin {
         return listOffsets(PhysicalTablePath.of(tablePath, partitionName), buckets, offsetSpec);
     }
 
+    private static final int GET_TABLE_STATS_MAX_RETRIES = 5;
+
     @Override
     public CompletableFuture<TableStats> getTableStats(TablePath tablePath) {
+        return getTableStats(tablePath, GET_TABLE_STATS_MAX_RETRIES);
+    }
+
+    private CompletableFuture<TableStats> getTableStats(TablePath tablePath, int retriesLeft) {
         metadataUpdater.updateTableOrPartitionMetadata(tablePath, null);
         TableInfo tableInfo = getTableInfo(tablePath).join();
         try {
@@ -578,7 +588,27 @@ public class FlussAdmin implements Admin {
                             counts -> {
                                 long totalRowCount = counts.stream().reduce(0L, Long::sum);
                                 return new TableStats(totalRowCount);
-                            });
+                            })
+                    .handle(
+                            (stats, throwable) -> {
+                                if (throwable == null) {
+                                    return CompletableFuture.completedFuture(stats);
+                                }
+                                Throwable cause =
+                                        ExceptionUtils.stripCompletionException(throwable);
+                                if (retriesLeft > 0
+                                        && ExceptionUtils.findThrowable(
+                                                        cause, InvalidMetadataException.class)
+                                                .isPresent()) {
+                                    // Stale leader after restart / KV not ready yet — refresh and
+                                    // retry.
+                                    return getTableStats(tablePath, retriesLeft - 1);
+                                }
+                                CompletableFuture<TableStats> failed = new CompletableFuture<>();
+                                failed.completeExceptionally(cause);
+                                return failed;
+                            })
+                    .thenCompose(f -> f);
         } catch (Exception e) {
             throw new FlussRuntimeException(
                     String.format("Failed to get row count for the table '%s'.", tablePath), e);

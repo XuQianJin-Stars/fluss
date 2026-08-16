@@ -54,6 +54,7 @@
     </scm>
 
     <modules>
+        <module>fluss-shaded-ratis</module>
         <module>fluss-common</module>
         <module>fluss-metrics</module>
         <module>fluss-client</module>
@@ -332,6 +333,12 @@
                 <groupId>org.apache.fluss</groupId>
                 <artifactId>fluss-shaded-zookeeper</artifactId>
                 <version>${zookeeper.version}-${fluss.shaded.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.apache.fluss</groupId>
+                <artifactId>fluss-shaded-ratis</artifactId>
+                <version>${project.version}</version>
             </dependency>
 
             <dependency>

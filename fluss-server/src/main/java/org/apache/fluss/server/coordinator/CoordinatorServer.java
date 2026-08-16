@@ -32,10 +32,19 @@ import org.apache.fluss.server.DynamicConfigManager;
 import org.apache.fluss.server.ServerBase;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.authorizer.AuthorizerLoader;
+import org.apache.fluss.server.coordinator.gossip.GossipDiscovery;
+import org.apache.fluss.server.coordinator.gossip.GossipMember;
+import org.apache.fluss.server.coordinator.gossip.GossipService;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
+import org.apache.fluss.server.coordinator.raft.RaftCoordinatorMetadataServices;
+import org.apache.fluss.server.coordinator.raft.RaftMetadataClient;
+import org.apache.fluss.server.coordinator.raft.RaftMetrics;
 import org.apache.fluss.server.coordinator.rebalance.RebalanceManager;
 import org.apache.fluss.server.coordinator.remote.RemoteDirDynamicLoader;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
+import org.apache.fluss.server.metadata.MetadataStoreClientFactory;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
 import org.apache.fluss.server.metrics.ServerMetricUtils;
 import org.apache.fluss.server.metrics.group.CoordinatorMetricGroup;
@@ -131,7 +140,14 @@ public class CoordinatorServer extends ServerBase {
     private CoordinatorEventProcessor coordinatorEventProcessor;
 
     @GuardedBy("lock")
+    @Nullable
     private ZooKeeperClient zkClient;
+
+    // Backend-neutral metadata client (§5.5/§7.3.1). During the dual-support phase the ZooKeeper
+    // backend returns a ZooKeeperClient, which is also assigned to zkClient above; downstream
+    // managers still take the concrete ZooKeeperClient until they are migrated incrementally.
+    @GuardedBy("lock")
+    private MetadataStoreClient metaClient;
 
     @GuardedBy("lock")
     private AutoPartitionManager autoPartitionManager;
@@ -150,6 +166,8 @@ public class CoordinatorServer extends ServerBase {
     @Nullable
     private Authorizer authorizer;
 
+    private boolean authorizerStarted;
+
     @GuardedBy("lock")
     private DynamicConfigManager dynamicConfigManager;
 
@@ -160,13 +178,24 @@ public class CoordinatorServer extends ServerBase {
     private RemoteDirDynamicLoader remoteDirDynamicLoader;
 
     @GuardedBy("lock")
-    private CoordinatorLeaderElection coordinatorLeaderElection;
+    private LeaderElection coordinatorLeaderElection;
 
     @GuardedBy("lock")
     private KvSnapshotLeaseManager kvSnapshotLeaseManager;
 
     @GuardedBy("lock")
     private ReplicaCapacityController replicaCapacityController;
+
+    // Leader-side Raft metadata services (cross-process metadata stream §5.8 + TabletServer
+    // registration/heartbeat §5.4.2). Non-null ONLY on the Raft backend; null on ZooKeeper.
+    @GuardedBy("lock")
+    @Nullable
+    private RaftCoordinatorMetadataServices raftMetadataServices;
+
+    /** Optional gossip membership (§1.2 / §5.4.4). Null when gossip is disabled. */
+    @GuardedBy("lock")
+    @Nullable
+    private GossipService gossipService;
 
     public CoordinatorServer(Configuration conf) {
         this(conf, SystemClock.getInstance());
@@ -236,10 +265,24 @@ public class CoordinatorServer extends ServerBase {
                             endpoints.get(0).getHost(),
                             serverId);
 
-            this.zkClient = ZooKeeperUtils.startZookeeperClient(conf, this);
+            // Obtain the metadata client + leader election through the backend-neutral seam
+            // (§7.3.1). For the ZooKeeper backend this yields exactly the objects created before
+            // (a ZooKeeperClient and a CoordinatorLeaderElection), so behavior is unchanged. For
+            // the Raft backend this bootstraps a RaftMetadataClient owning an embedded Ratis
+            // server; its leader-side stream/registration handlers are wired onto the coordinator
+            // gateway further below (§5.4.2/§5.8).
+            MetadataBackend backend = MetadataBackend.from(conf);
+            this.metaClient = MetadataStoreClientFactory.create(conf, this);
+            // On the ZooKeeper backend the client IS a ZooKeeperClient; zkClient is kept for the
+            // genuinely ZK-only calls that have no Raft analog (split-brain fencing, the session
+            // re-init listener, DynamicConfigManager's config-change notification watcher). It is
+            // null on the Raft backend.
+            this.zkClient =
+                    metaClient instanceof ZooKeeperClient ? (ZooKeeperClient) metaClient : null;
 
-            // CoordinatorLeaderElection must be created after zkClient is initialized.
-            this.coordinatorLeaderElection = new CoordinatorLeaderElection(zkClient, serverId);
+            // Leader election via the backend-neutral seam (CoordinatorLeaderElection on ZooKeeper,
+            // RaftLeaderSelector on Raft).
+            this.coordinatorLeaderElection = metaClient.newLeaderSelector(serverId);
 
             this.lakeCatalogDynamicLoader = new LakeCatalogDynamicLoader(conf, pluginManager, true);
             this.remoteDirDynamicLoader = new RemoteDirDynamicLoader(conf);
@@ -247,18 +290,28 @@ public class CoordinatorServer extends ServerBase {
             this.replicaCapacityController =
                     new ReplicaCapacityController(conf, metadataCache, serverMetricGroup);
 
-            this.dynamicConfigManager = new DynamicConfigManager(zkClient, conf);
-
-            this.authorizer = AuthorizerLoader.createAuthorizer(conf, zkClient, pluginManager);
-            if (authorizer != null) {
-                authorizer.startup();
+            // On ZooKeeper, config-change notifications reach tablet servers through a ZK
+            // change-notification watcher; on Raft they are delivered via the metadata stream
+            // (T6-2), so use the backend-neutral constructor (no watcher) there. zkClient is null
+            // on the Raft backend, which would make the ZK watcher NPE at startup.
+            if (zkClient != null) {
+                this.dynamicConfigManager = new DynamicConfigManager(zkClient, conf);
+            } else {
+                this.dynamicConfigManager = new DynamicConfigManager(metaClient, conf, true);
             }
+
+            this.authorizer = AuthorizerLoader.createAuthorizer(conf, metaClient, pluginManager);
+            // Do not call authorizer.startup() here: DefaultAuthorizer.loadCache() reads ACL
+            // keys via MetadataStoreClient which requireLeader() on Raft. Standby init runs
+            // before (or racing) catch-up sets isLeader=true — that threw
+            // NotCoordinatorLeaderException and failed CoordinatorServer.start when
+            // authorizer.enabled=true. Startup is deferred to initCoordinatorLeader().
 
             this.lakeTableTieringManager =
                     new LakeTableTieringManager(
                             new LakeTieringMetricGroup(metricRegistry, serverMetricGroup));
 
-            this.metadataManager = new MetadataManager(zkClient, conf, lakeCatalogDynamicLoader);
+            this.metadataManager = new MetadataManager(metaClient, conf, lakeCatalogDynamicLoader);
             this.ioExecutor =
                     Executors.newFixedThreadPool(
                             conf.get(ConfigOptions.SERVER_IO_POOL_SIZE),
@@ -269,7 +322,7 @@ public class CoordinatorServer extends ServerBase {
                     new KvSnapshotLeaseManager(
                             conf.get(ConfigOptions.KV_SNAPSHOT_LEASE_EXPIRATION_CHECK_INTERVAL)
                                     .toMillis(),
-                            zkClient,
+                            metaClient,
                             conf.getString(ConfigOptions.REMOTE_DATA_DIR),
                             clock,
                             serverMetricGroup);
@@ -279,7 +332,7 @@ public class CoordinatorServer extends ServerBase {
                     new CoordinatorService(
                             conf,
                             remoteFileSystem,
-                            zkClient,
+                            metaClient,
                             this::getCoordinatorEventProcessor,
                             metadataCache,
                             metadataManager,
@@ -292,6 +345,24 @@ public class CoordinatorServer extends ServerBase {
                             kvSnapshotLeaseManager,
                             coordinatorLeaderElection,
                             replicaCapacityController);
+
+            // On the Raft backend, assemble the leader-side metadata services (the cross-process
+            // metadata stream §5.8 and TabletServer registration/heartbeat §5.4.2) from the
+            // bootstrapped RaftMetadataClient and expose their RPC handlers through the coordinator
+            // gateway. Only meaningful on the leader — the handlers self-guard with requireLeader()
+            // and the liveness fencer checks isLeader — so it is safe to create and start them
+            // while this node is still a standby.
+            if (backend == MetadataBackend.RAFT) {
+                this.raftMetadataServices =
+                        RaftCoordinatorMetadataServices.create(
+                                (RaftMetadataClient) metaClient,
+                                conf,
+                                dynamicConfigManager::reloadDynamicConfig);
+                raftMetadataServices.start();
+                wireRaftLeaderHandlers(coordinatorService, raftMetadataServices);
+                // §5.12 Raft observability gauges (role/term/commit/applied/lag).
+                RaftMetrics.register(serverMetricGroup, (RaftMetadataClient) metaClient);
+            }
 
             this.rpcServer =
                     RpcServer.create(
@@ -313,15 +384,52 @@ public class CoordinatorServer extends ServerBase {
 
             rpcServer.start();
 
+            startGossipIfEnabled();
+
             registerCoordinatorServer();
-            ZooKeeperUtils.registerZookeeperClientReInitSessionListener(
-                    zkClient, this::registerCoordinatorServer, this);
+            // The ZooKeeper session re-init listener re-registers the coordinator ephemeral node
+            // after a ZK session expiry; there is no such session on the Raft backend.
+            if (zkClient != null) {
+                ZooKeeperUtils.registerZookeeperClientReInitSessionListener(
+                        zkClient, this::registerCoordinatorServer, this);
+            }
         }
     }
 
+    /**
+     * Exposes the leader-side Raft metadata handlers (§5.4.2/§5.8/§5.3) through the coordinator
+     * gateway on the Raft backend: the cross-process metadata stream, TabletServer
+     * registration/heartbeat, and TabletServer id/sequence allocation (the AllocateId RPC that
+     * replaces the three ZooKeeper-backed sequence generators — writer id / kv auto-increment
+     * column id / bucket snapshot id). The handlers self-guard with {@code requireLeader()}, so it
+     * is safe to set them while this node is still a standby. Package-private so the assembly test
+     * drives the exact wiring {@link #initCoordinatorStandby} performs.
+     */
+    static void wireRaftLeaderHandlers(
+            CoordinatorService coordinatorService,
+            RaftCoordinatorMetadataServices raftMetadataServices) {
+        coordinatorService.setMetadataStreamRpcServer(
+                raftMetadataServices.metadataStreamRpcServer());
+        coordinatorService.setTabletServerRegistrationRpcServer(
+                raftMetadataServices.tabletServerRegistrationRpcServer());
+        coordinatorService.setAllocateIdRpcServer(raftMetadataServices.allocateIdRpcServer());
+    }
+
     protected void initCoordinatorLeader() throws Exception {
-        // to avoid split-brain
-        ZkEpoch zkEpoch = zkClient.fenceBecomeCoordinatorLeader(serverId);
+        // Establish the fencing epoch for this leadership term. On ZooKeeper this is a CAS on the
+        // /coordinators/epoch znode (returns a ZkEpoch); on Raft the leader term IS the fence and
+        // is
+        // already reflected by the LeaderElection, so no extra write is needed (§5.1.6).
+        CoordinatorEpoch coordinatorEpoch;
+        if (zkClient != null) {
+            ZkEpoch zkEpoch = zkClient.fenceBecomeCoordinatorLeader(serverId);
+            // expose the freshly-fenced epoch through the LeaderElection contract (no extra ZK
+            // access)
+            ((CoordinatorLeaderElection) coordinatorLeaderElection).setCurrentEpoch(zkEpoch);
+            coordinatorEpoch = zkEpoch;
+        } else {
+            coordinatorEpoch = coordinatorLeaderElection.currentEpoch();
+        }
         registerCoordinatorLeader();
 
         synchronized (lock) {
@@ -343,10 +451,10 @@ public class CoordinatorServer extends ServerBase {
             // so that the event processor can get the coordinator leader node from zk during
             // start up. In HA for coordinator server, the processor also need to know the leader
             // node during start up
-            CoordinatorContext coordinatorContext = new CoordinatorContext(zkEpoch);
+            CoordinatorContext coordinatorContext = new CoordinatorContext(coordinatorEpoch);
             this.coordinatorEventProcessor =
                     new CoordinatorEventProcessor(
-                            zkClient,
+                            metaClient,
                             metadataCache,
                             coordinatorChannelManager,
                             coordinatorContext,
@@ -360,6 +468,21 @@ public class CoordinatorServer extends ServerBase {
                             kvSnapshotLeaseManager,
                             scheduler,
                             clock);
+            if (raftMetadataServices != null) {
+                coordinatorEventProcessor.setTabletServerLivenessManager(
+                        raftMetadataServices.livenessManager());
+            }
+            // Load ACL cache once we are a serving leader (requireLeader() succeeds). Idempotent
+            // across re-elections: DefaultAuthorizer ZK watcher must not be started twice.
+            if (authorizer != null && !authorizerStarted) {
+                authorizer.startup();
+                authorizerStarted = true;
+            }
+            // Reload kv-snapshot leases now that requireLeader() succeeds. start() may have run
+            // before Raft leadership and skipped the load.
+            if (kvSnapshotLeaseManager != null) {
+                kvSnapshotLeaseManager.reloadLeasesFromStore();
+            }
             coordinatorEventProcessor.startup();
 
             // As the active leader, this server is the sole writer of dynamic configs and holds the
@@ -399,6 +522,14 @@ public class CoordinatorServer extends ServerBase {
                 }
             } catch (Throwable t) {
                 LOG.warn("Failed to shutdown coordinator event processor", t);
+            }
+
+            try {
+                if (kvSnapshotLeaseManager != null) {
+                    kvSnapshotLeaseManager.clearInMemoryLeases();
+                }
+            } catch (Throwable t) {
+                LOG.warn("Failed to clear kv snapshot lease manager state", t);
             }
 
             try {
@@ -471,24 +602,57 @@ public class CoordinatorServer extends ServerBase {
     private void registerCoordinatorServer() throws Exception {
         CoordinatorAddress coordinatorAddress = buildCoordinatorAddress();
         registerToZookeeperWithRetry(
-                "coordinator server", () -> zkClient.registerCoordinatorServer(coordinatorAddress));
+                "coordinator server",
+                () -> metaClient.registerCoordinatorServer(coordinatorAddress));
     }
 
     private void registerCoordinatorLeader() throws Exception {
         CoordinatorAddress coordinatorAddress = buildCoordinatorAddress();
         registerToZookeeperWithRetry(
-                "coordinator leader", () -> zkClient.registerCoordinatorLeader(coordinatorAddress));
+                "coordinator leader",
+                () -> metaClient.registerCoordinatorLeader(coordinatorAddress));
     }
 
     private void unregisterCoordinatorLeader() throws Exception {
         CoordinatorAddress coordinatorAddress = buildCoordinatorAddress();
-        zkClient.unregisterCoordinatorLeader(coordinatorAddress);
+        metaClient.unregisterCoordinatorLeader(coordinatorAddress);
     }
 
     private CoordinatorAddress buildCoordinatorAddress() {
         List<Endpoint> bindEndpoints = rpcServer.getBindEndpoints();
         return new CoordinatorAddress(
                 this.serverId, Endpoint.loadAdvertisedEndpoints(bindEndpoints, conf));
+    }
+
+    /**
+     * Starts optional gossip membership exchange when {@code coordinator.gossip.enabled} is true
+     * (design §5.4.4). Advertises this coordinator's RPC endpoint so TabletServers can expand a
+     * partial {@code coordinator.seed.nodes} list.
+     */
+    private void startGossipIfEnabled() throws Exception {
+        if (!conf.getBoolean(ConfigOptions.COORDINATOR_GOSSIP_ENABLED)) {
+            return;
+        }
+        List<Endpoint> advertised =
+                Endpoint.loadAdvertisedEndpoints(rpcServer.getBindEndpoints(), conf);
+        if (advertised.isEmpty()) {
+            LOG.warn(
+                    "coordinator.gossip.enabled is true but no advertised endpoint is available; "
+                            + "skipping gossip.");
+            return;
+        }
+        Endpoint ep = advertised.get(0);
+        GossipMember self =
+                new GossipMember(
+                        serverId,
+                        ep.getHost(),
+                        ep.getPort(),
+                        ep.getHost(),
+                        conf.get(ConfigOptions.COORDINATOR_GOSSIP_PORT),
+                        0L,
+                        1);
+        this.gossipService =
+                GossipService.start(self, GossipDiscovery.seedsFromConfig(conf), conf, clock);
     }
 
     /**
@@ -540,7 +704,7 @@ public class CoordinatorServer extends ServerBase {
 
     private void createDefaultDatabase() {
         MetadataManager metadataManager =
-                new MetadataManager(zkClient, conf, lakeCatalogDynamicLoader);
+                new MetadataManager(metaClient, conf, lakeCatalogDynamicLoader);
         List<String> databases = metadataManager.listDatabases();
         if (databases.isEmpty()) {
             metadataManager.createDatabase(DEFAULT_DATABASE, DatabaseDescriptor.EMPTY, true);
@@ -574,6 +738,11 @@ public class CoordinatorServer extends ServerBase {
         return replicaCapacityController;
     }
 
+    @VisibleForTesting
+    MetadataManager getMetadataManager() {
+        return metadataManager;
+    }
+
     CompletableFuture<Void> stopServices() {
         // Closing the leader election may wait for cleanupCoordinatorLeader(), which acquires
         // lock. Close it before entering the synchronized shutdown section to avoid deadlock.
@@ -596,6 +765,15 @@ public class CoordinatorServer extends ServerBase {
                 if (scheduler != null) {
                     scheduler.shutdown();
                     scheduler = null;
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
+                if (gossipService != null) {
+                    gossipService.close();
+                    gossipService = null;
                 }
             } catch (Throwable t) {
                 exception = ExceptionUtils.firstOrSuppressed(t, exception);
@@ -659,6 +837,16 @@ public class CoordinatorServer extends ServerBase {
             }
 
             try {
+                // Release parked stream long-polls and stop the liveness scheduler before the
+                // underlying Ratis server is shut down (via metaClient.close() below).
+                if (raftMetadataServices != null) {
+                    raftMetadataServices.close();
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
                 if (ioExecutor != null) {
                     // shutdown io executor
                     ExecutorUtils.gracefulShutdown(5, TimeUnit.SECONDS, ioExecutor);
@@ -707,6 +895,17 @@ public class CoordinatorServer extends ServerBase {
             try {
                 if (zkClient != null) {
                     zkClient.close();
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
+
+            try {
+                // On the Raft backend metaClient is a RaftMetadataClient owning the embedded Ratis
+                // server and must be closed explicitly. On ZooKeeper metaClient == zkClient (closed
+                // just above), so only close here when they differ, to avoid a double close.
+                if (metaClient != null && metaClient != zkClient) {
+                    metaClient.close();
                 }
             } catch (Throwable t) {
                 exception = ExceptionUtils.firstOrSuppressed(t, exception);
@@ -778,5 +977,15 @@ public class CoordinatorServer extends ServerBase {
     @VisibleForTesting
     public ZooKeeperClient getZooKeeperClient() {
         return zkClient;
+    }
+
+    @VisibleForTesting
+    public boolean isLeader() {
+        return coordinatorLeaderElection != null && coordinatorLeaderElection.isLeader();
+    }
+
+    @VisibleForTesting
+    public MetadataStoreClient getMetadataStoreClient() {
+        return metaClient;
     }
 }

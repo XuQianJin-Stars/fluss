@@ -96,9 +96,7 @@ public class RackAwareClusterITCase {
 
         TableInfo tableInfo = admin.getTableInfo(tablePath).get();
         Optional<TableAssignment> assignmentOpt =
-                FLUSS_CLUSTER_EXTENSION
-                        .getZooKeeperClient()
-                        .getTableAssignment(tableInfo.getTableId());
+                FLUSS_CLUSTER_EXTENSION.metadataStore().getTableAssignment(tableInfo.getTableId());
         assertThat(assignmentOpt.isPresent()).isTrue();
         TableAssignment assignment = assignmentOpt.get();
         BucketAssignment bucketAssignment = assignment.getBucketAssignment(0);

@@ -29,17 +29,19 @@ import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.log.FetchParams;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.testutils.DualBackendFlussClusters;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.testutils.RpcMessageTestUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.types.Tuple2;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.util.Arrays;
@@ -75,41 +77,44 @@ import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** ITCase for replica fetcher. */
+/** ITCase for replica fetcher. Runs on ZooKeeper and Raft. */
 public class ReplicaFetcherITCase {
     @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
-            FlussClusterExtension.builder()
+    public static final DualBackendFlussClusters CLUSTERS =
+            DualBackendFlussClusters.builder()
                     .setNumOfTabletServers(3)
                     .setClusterConf(initConfig())
                     .build();
 
-    private ZooKeeperClient zkClient;
+    private FlussClusterExtension flussClusterExtension;
+    private MetadataStoreClient zkClient;
 
-    @BeforeEach
-    void beforeEach() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+    private void bind(MetadataBackend backend) {
+        flussClusterExtension = CLUSTERS.get(backend);
+        zkClient = flussClusterExtension.metadataStore();
     }
 
-    @Test
-    void testProduceLogNeedAck() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testProduceLogNeedAck(MetadataBackend backend) throws Exception {
+        bind(backend);
         // set bucket count to 1 to easy for debug.
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder().schema(DATA1_SCHEMA).distributedBy(1, "a").build();
 
         // wait until all the gateway has same metadata because the follower fetcher manager need
         // to get the leader address from server metadata while make follower.
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllGatewayHasSameMetadata();
+        flussClusterExtension.waitUntilAllGatewayHasSameMetadata();
 
-        long tableId = createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, tableDescriptor);
+        long tableId = createTable(flussClusterExtension, DATA1_TABLE_PATH, tableDescriptor);
         int bucketId = 0;
         TableBucket tb = new TableBucket(tableId, bucketId);
 
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        flussClusterExtension.waitUntilAllReplicaReady(tb);
 
-        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leader = flussClusterExtension.waitAndGetLeader(tb);
         TabletServerGateway leaderGateWay =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+                flussClusterExtension.newTabletServerClientForNode(leader);
 
         // send one batch, which need ack.
         assertProduceLogResponse(
@@ -140,7 +145,7 @@ public class ReplicaFetcherITCase {
                         .collect(Collectors.toList())) {
 
             ReplicaManager replicaManager =
-                    FLUSS_CLUSTER_EXTENSION.getTabletServerById(followId).getReplicaManager();
+                    flussClusterExtension.getTabletServerById(followId).getReplicaManager();
             // wait until follower highWaterMark equals leader.
             retry(
                     Duration.ofMinutes(1),
@@ -170,23 +175,24 @@ public class ReplicaFetcherITCase {
         }
     }
 
-    @Test
-    void testPutKvNeedAck() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testPutKvNeedAck(MetadataBackend backend) throws Exception {
+        bind(backend);
         // wait until all the gateway has same metadata because the follower fetcher manager need
         // to get the leader address from server metadata while make follower.
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllGatewayHasSameMetadata();
+        flussClusterExtension.waitUntilAllGatewayHasSameMetadata();
 
         long tableId =
-                createTable(
-                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, createPkTableDescriptor());
+                createTable(flussClusterExtension, DATA1_TABLE_PATH_PK, createPkTableDescriptor());
         int bucketId = 0;
         TableBucket tb = new TableBucket(tableId, bucketId);
 
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        flussClusterExtension.waitUntilAllReplicaReady(tb);
 
-        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leader = flussClusterExtension.waitAndGetLeader(tb);
         TabletServerGateway leaderGateWay =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+                flussClusterExtension.newTabletServerClientForNode(leader);
 
         // send one batch, which need ack.
         assertPutKvResponse(
@@ -215,7 +221,7 @@ public class ReplicaFetcherITCase {
                         .filter(id -> id != leader)
                         .collect(Collectors.toList())) {
             ReplicaManager replicaManager =
-                    FLUSS_CLUSTER_EXTENSION.getTabletServerById(followId).getReplicaManager();
+                    flussClusterExtension.getTabletServerById(followId).getReplicaManager();
 
             // wait until follower highWaterMark equals leader. So we can fetch log from follower
             // before highWaterMark.
@@ -248,22 +254,23 @@ public class ReplicaFetcherITCase {
         }
     }
 
-    @Test
-    void testFlushForPutKvNeedAck() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testFlushForPutKvNeedAck(MetadataBackend backend) throws Exception {
+        bind(backend);
         // create a table and wait all replica ready
         long tableId =
-                createTable(
-                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, createPkTableDescriptor());
+                createTable(flussClusterExtension, DATA1_TABLE_PATH_PK, createPkTableDescriptor());
         int bucketId = 0;
         TableBucket tb = new TableBucket(tableId, bucketId);
 
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        flussClusterExtension.waitUntilAllReplicaReady(tb);
 
         // let's kill a non leader server
-        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leader = flussClusterExtension.waitAndGetLeader(tb);
 
         int followerToStop =
-                FLUSS_CLUSTER_EXTENSION.getTabletServerNodes().stream()
+                flussClusterExtension.getTabletServerNodes().stream()
                         .filter(node -> node.id() != leader)
                         .findFirst()
                         .get()
@@ -271,7 +278,7 @@ public class ReplicaFetcherITCase {
 
         int leaderEpoch = 0;
         // stop the follower replica for the bucket
-        FLUSS_CLUSTER_EXTENSION.stopReplica(followerToStop, tb, leaderEpoch);
+        flussClusterExtension.stopReplica(followerToStop, tb, leaderEpoch);
 
         // put kv record batch to the leader,
         // but as one server is killed, the put won't be ack
@@ -279,7 +286,7 @@ public class ReplicaFetcherITCase {
 
         // put kv record batch
         TabletServerGateway leaderGateWay =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+                flussClusterExtension.newTabletServerClientForNode(leader);
         KvRecordBatch kvRecords =
                 genKvRecordBatch(
                         Tuple2.of("k1", new Object[] {1, "a"}),
@@ -290,7 +297,7 @@ public class ReplicaFetcherITCase {
                 leaderGateWay.putKv(newPutKvRequest(tableId, bucketId, -1, kvRecords));
 
         // wait until the log has been written
-        Replica replica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tb);
+        Replica replica = flussClusterExtension.waitAndGetLeaderReplica(tb);
         retry(
                 Duration.ofMinutes(1),
                 () -> assertThat(replica.getLocalLogEndOffset()).isEqualTo(4L));
@@ -319,7 +326,7 @@ public class ReplicaFetcherITCase {
                         Collections.emptyList(),
                         currentLeaderAndIsr.coordinatorEpoch(),
                         currentLeaderAndIsr.bucketEpoch());
-        FLUSS_CLUSTER_EXTENSION.notifyLeaderAndIsr(
+        flussClusterExtension.notifyLeaderAndIsr(
                 followerToStop, DATA1_TABLE_PATH, tb, newLeaderAndIsr, Arrays.asList(0, 1, 2));
 
         // wait until the put future is done

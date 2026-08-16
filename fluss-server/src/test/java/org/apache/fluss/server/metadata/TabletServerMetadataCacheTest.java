@@ -253,6 +253,84 @@ public class TabletServerMetadataCacheTest {
     }
 
     @Test
+    void testIdKeyedDeleteDoesNotWipeRecreatedTableAtSamePath() {
+        // Simulate UpdateMetadata RPC: paths are rebuilt, not the DELETED_TABLE_PATH singleton.
+        TablePath deletedPathMarker = TablePath.of("__UNKNOWN__", "__delete__");
+        long oldTableId = DATA1_TABLE_ID;
+        long newTableId = DATA1_TABLE_ID + 100;
+
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(DATA1_TABLE_INFO, initialBucketMetadata)),
+                        Collections.emptyList()));
+        assertThat(serverMetadataCache.getTablePath(oldTableId)).contains(DATA1_TABLE_PATH);
+
+        // Id-keyed tombstone removes only the old table id.
+        Set<Long> deleted =
+                serverMetadataCache.updateClusterMetadata(
+                        new ClusterMetadata(
+                                coordinatorServer,
+                                aliveTableServers,
+                                Collections.singletonList(
+                                        new TableMetadata(
+                                                TableInfo.of(
+                                                        deletedPathMarker,
+                                                        oldTableId,
+                                                        1,
+                                                        DATA1_TABLE_DESCRIPTOR,
+                                                        DEFAULT_REMOTE_DATA_DIR,
+                                                        System.currentTimeMillis(),
+                                                        System.currentTimeMillis()),
+                                                Collections.emptyList())),
+                                Collections.emptyList()));
+        assertThat(deleted).containsExactly(oldTableId);
+        assertThat(serverMetadataCache.getTablePath(oldTableId)).isEmpty();
+
+        // Recreate same path with a new id (afterEach drop + next test create).
+        TableInfo recreated =
+                TableInfo.of(
+                        DATA1_TABLE_PATH,
+                        newTableId,
+                        1,
+                        DATA1_TABLE_DESCRIPTOR,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis());
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(recreated, initialBucketMetadata)),
+                        Collections.emptyList()));
+        assertThat(serverMetadataCache.getTablePath(newTableId)).contains(DATA1_TABLE_PATH);
+
+        // Late id-keyed tombstone for the old id must not remove the recreated table.
+        deleted =
+                serverMetadataCache.updateClusterMetadata(
+                        new ClusterMetadata(
+                                coordinatorServer,
+                                aliveTableServers,
+                                Collections.singletonList(
+                                        new TableMetadata(
+                                                TableInfo.of(
+                                                        deletedPathMarker,
+                                                        oldTableId,
+                                                        1,
+                                                        DATA1_TABLE_DESCRIPTOR,
+                                                        DEFAULT_REMOTE_DATA_DIR,
+                                                        System.currentTimeMillis(),
+                                                        System.currentTimeMillis()),
+                                                Collections.emptyList())),
+                                Collections.emptyList()));
+        assertThat(deleted).containsExactly(oldTableId);
+        assertThat(serverMetadataCache.getTablePath(newTableId)).contains(DATA1_TABLE_PATH);
+    }
+
+    @Test
     void testContainsTableBucket() {
         tableMetadataList =
                 Collections.singletonList(

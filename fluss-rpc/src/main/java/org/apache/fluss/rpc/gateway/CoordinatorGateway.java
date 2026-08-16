@@ -20,6 +20,8 @@ package org.apache.fluss.rpc.gateway;
 import org.apache.fluss.rpc.RpcGateway;
 import org.apache.fluss.rpc.messages.AdjustIsrRequest;
 import org.apache.fluss.rpc.messages.AdjustIsrResponse;
+import org.apache.fluss.rpc.messages.AllocateIdRequest;
+import org.apache.fluss.rpc.messages.AllocateIdResponse;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
@@ -28,10 +30,18 @@ import org.apache.fluss.rpc.messages.CommitRemoteLogManifestRequest;
 import org.apache.fluss.rpc.messages.CommitRemoteLogManifestResponse;
 import org.apache.fluss.rpc.messages.ControlledShutdownRequest;
 import org.apache.fluss.rpc.messages.ControlledShutdownResponse;
+import org.apache.fluss.rpc.messages.FetchMetadataRequest;
+import org.apache.fluss.rpc.messages.FetchMetadataResponse;
+import org.apache.fluss.rpc.messages.FetchMetadataSnapshotRequest;
+import org.apache.fluss.rpc.messages.FetchMetadataSnapshotResponse;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotRequest;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotResponse;
+import org.apache.fluss.rpc.messages.RegisterTabletServerRequest;
+import org.apache.fluss.rpc.messages.RegisterTabletServerResponse;
+import org.apache.fluss.rpc.messages.TabletServerHeartbeatRequest;
+import org.apache.fluss.rpc.messages.TabletServerHeartbeatResponse;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.RPC;
 
@@ -116,4 +126,51 @@ public interface CoordinatorGateway extends RpcGateway, AdminGateway {
     @RPC(api = ApiKeys.CONTROLLED_SHUTDOWN)
     CompletableFuture<ControlledShutdownResponse> controlledShutdown(
             ControlledShutdownRequest request);
+
+    /**
+     * Pulls an ordered, contiguous run of committed metadata records (the cross-process metadata
+     * stream, §5.8). Leader-served, server-to-server (subscriber = tablet server / standby
+     * coordinator). Only meaningful on the Raft metadata backend; on the ZooKeeper backend the
+     * coordinator does not serve a stream and this fails with an unsupported-operation error.
+     */
+    @RPC(api = ApiKeys.FETCH_METADATA)
+    CompletableFuture<FetchMetadataResponse> fetchMetadata(FetchMetadataRequest request);
+
+    /**
+     * Bootstraps a subscriber whose requested offset was compacted out of the log with a full
+     * terminal-state metadata snapshot (§5.8.1). Leader-served; Raft backend only (see {@link
+     * #fetchMetadata}).
+     */
+    @RPC(api = ApiKeys.FETCH_METADATA_SNAPSHOT)
+    CompletableFuture<FetchMetadataSnapshotResponse> fetchMetadataSnapshot(
+            FetchMetadataSnapshotRequest request);
+
+    /**
+     * Registers a tablet server with the leader, which appends a {@code REGISTER_TABLET_SERVER}
+     * record (§5.4.2). Replaces the ephemeral {@code /tabletservers/ids/[serverId]} znode on the
+     * Raft metadata backend; on the ZooKeeper backend the coordinator does not serve this and it
+     * fails with an unsupported-operation error.
+     */
+    @RPC(api = ApiKeys.REGISTER_TABLET_SERVER)
+    CompletableFuture<RegisterTabletServerResponse> registerTabletServer(
+            RegisterTabletServerRequest request);
+
+    /**
+     * Renews a tablet server's registration lease (§5.4.2). Sent periodically; the leader records
+     * the contact time in memory and a lease whose expiry triggers a {@code FENCE_TABLET_SERVER}
+     * record — the deterministic analog of ZK ephemeral-node expiry. Raft backend only (see {@link
+     * #registerTabletServer}).
+     */
+    @RPC(api = ApiKeys.TABLET_SERVER_HEARTBEAT)
+    CompletableFuture<TabletServerHeartbeatResponse> tabletServerHeartbeat(
+            TabletServerHeartbeatRequest request);
+
+    /**
+     * Reserves a contiguous, durably-committed range of ids for a tablet server (§5.3). Replaces
+     * the three ZooKeeper-backed sequence generators (writer id, kv auto-increment column id,
+     * bucket snapshot id) on the Raft metadata backend; the caller owns {@code [start_id, start_id
+     * + count)} exclusively. Raft backend only (see {@link #registerTabletServer}).
+     */
+    @RPC(api = ApiKeys.ALLOCATE_ID)
+    CompletableFuture<AllocateIdResponse> allocateId(AllocateIdRequest request);
 }

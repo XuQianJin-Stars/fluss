@@ -71,7 +71,21 @@ public class RebalanceITCase {
     @AfterEach
     protected void teardown() throws Exception {
         admin.cancelRebalance(null).get();
-        FLUSS_CLUSTER_EXTENSION.getZooKeeperClient().deleteRebalanceTask();
+        // Cancel clears in-memory queues synchronously, but wait for a final status before
+        // deleting the task so the next test does not inherit a REBALANCING handle.
+        retry(
+                Duration.ofSeconds(30),
+                () -> {
+                    Optional<RebalanceProgress> progress = admin.listRebalanceProgress(null).get();
+                    if (progress.isPresent()) {
+                        assertThat(progress.get().status())
+                                .isIn(
+                                        RebalanceStatus.CANCELED,
+                                        RebalanceStatus.COMPLETED,
+                                        RebalanceStatus.FAILED);
+                    }
+                });
+        FLUSS_CLUSTER_EXTENSION.metadataStore().deleteRebalanceTask();
 
         if (admin != null) {
             admin.close();
@@ -313,6 +327,18 @@ public class RebalanceITCase {
                                 "Rebalance task already exists, current rebalance id is '%s'. "
                                         + "Please wait for it to finish or cancel it first.",
                                 rebalanceId1));
+
+        // Cancel promptly so @AfterEach / cluster cleanup are not racing a large in-flight
+        // rebalance when the next test starts.
+        admin.cancelRebalance(rebalanceId1).get();
+        retry(
+                Duration.ofSeconds(60),
+                () -> {
+                    Optional<RebalanceProgress> progress =
+                            admin.listRebalanceProgress(rebalanceId1).get();
+                    assertThat(progress).isPresent();
+                    assertThat(progress.get().status()).isEqualTo(RebalanceStatus.CANCELED);
+                });
     }
 
     private static Configuration initConfig() {

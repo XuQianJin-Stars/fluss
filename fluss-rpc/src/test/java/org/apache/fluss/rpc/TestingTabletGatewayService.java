@@ -27,6 +27,8 @@ import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusRequest;
+import org.apache.fluss.rpc.messages.GetCoordinatorRaftStatusResponse;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenRequest;
@@ -270,6 +272,12 @@ public class TestingTabletGatewayService extends TestingGatewayService
     @Override
     public CompletableFuture<GetClusterHealthResponse> getClusterHealth(
             GetClusterHealthRequest request) {
+        return null;
+    }
+
+    @Override
+    public CompletableFuture<GetCoordinatorRaftStatusResponse> getCoordinatorRaftStatus(
+            GetCoordinatorRaftStatusRequest request) {
         return null;
     }
 }

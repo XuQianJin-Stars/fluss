@@ -18,7 +18,7 @@
 package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -33,34 +33,40 @@ import java.util.stream.Collectors;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /**
- * Class to store the handle to the snapshot to ZooKeeper.
+ * Class to store the handle to the snapshot in the metadata store.
  *
- * <p>Note: We only store a completed snapshot handle(a path to completed snapshot) to zookeeper
- * instead of the whole {@link CompletedSnapshot} object. This level of indirection is necessary to
- * keep the amount of data in ZooKeeper small. ZooKeeper is build for data in the KB range whereas
- * state can grow to multiple MBs.
+ * <p>Note: We only store a completed snapshot handle(a path to completed snapshot) instead of the
+ * whole {@link CompletedSnapshot} object. This level of indirection is necessary to keep the amount
+ * of data in the metadata store small — it is built for data in the KB range whereas state can grow
+ * to multiple MBs.
+ *
+ * <p>Backend-neutral: it delegates entirely to the {@link MetadataStoreClient} bucket-snapshot
+ * family, so it works over either the ZooKeeper or the Raft backend (the class name is retained for
+ * source compatibility with its many call sites; a concrete {@code ZooKeeperClient} widens to the
+ * interface unchanged).
  */
 public class ZooKeeperCompletedSnapshotHandleStore implements CompletedSnapshotHandleStore {
 
     private static final Logger LOG =
             LoggerFactory.getLogger(ZooKeeperCompletedSnapshotHandleStore.class);
 
-    private final ZooKeeperClient client;
+    private final MetadataStoreClient client;
 
-    public ZooKeeperCompletedSnapshotHandleStore(ZooKeeperClient zooKeeperClient) {
-        this.client = zooKeeperClient;
+    public ZooKeeperCompletedSnapshotHandleStore(MetadataStoreClient metadataStoreClient) {
+        this.client = metadataStoreClient;
     }
 
     /**
-     * Stores the completed snapshot handle to ZooKeeper for given table bucket and snapshot id.
+     * Stores the completed snapshot handle to the metadata store for given table bucket and
+     * snapshot id.
      *
-     * <p><strong>Important</strong>: This will <em>not</em> store the actual snapshot in ZooKeeper,
-     * but store the snapshot path in ZooKeeper. This level of indirection makes sure that data in
-     * ZooKeeper is small.
+     * <p><strong>Important</strong>: This will <em>not</em> store the actual snapshot, but store
+     * the snapshot path. This level of indirection makes sure that the data in the metadata store
+     * is small.
      *
      * <p>The operation will fail if there is already a node under the given path.
      *
-     * @throws Exception If a ZooKeeper or snapshot handle operation fails
+     * @throws Exception If a metadata store or snapshot handle operation fails
      */
     @Override
     public void add(

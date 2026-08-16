@@ -30,6 +30,10 @@
     <name>Apache Fluss : JMH</name>
     <packaging>jar</packaging>
 
+    <properties>
+        <jmh.main>org.apache.fluss.jmh.MetadataBackendJmhMain</jmh.main>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>org.apache.fluss</groupId>
@@ -93,5 +97,19 @@
             <version>${jmh.version}</version>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <configuration>
+                    <classpathScope>test</classpathScope>
+                    <mainClass>${jmh.main}</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 
 </project>

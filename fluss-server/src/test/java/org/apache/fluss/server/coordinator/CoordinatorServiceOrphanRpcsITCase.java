@@ -23,28 +23,41 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.AllocateIdRequest;
+import org.apache.fluss.rpc.messages.AllocateIdResponse;
+import org.apache.fluss.rpc.messages.FetchMetadataRequest;
+import org.apache.fluss.rpc.messages.FetchMetadataResponse;
 import org.apache.fluss.rpc.messages.ListKvSnapshotsRequest;
 import org.apache.fluss.rpc.messages.ListKvSnapshotsResponse;
 import org.apache.fluss.rpc.messages.ListRemoteLogManifestsRequest;
 import org.apache.fluss.rpc.messages.ListRemoteLogManifestsResponse;
 import org.apache.fluss.rpc.messages.PbKvSnapshot;
 import org.apache.fluss.rpc.messages.PbRemoteLogManifestEntry;
+import org.apache.fluss.rpc.messages.RegisterTabletServerRequest;
+import org.apache.fluss.rpc.messages.RegisterTabletServerResponse;
+import org.apache.fluss.rpc.messages.TabletServerHeartbeatRequest;
+import org.apache.fluss.rpc.messages.TabletServerHeartbeatResponse;
+import org.apache.fluss.server.coordinator.raft.AllocateIdRpcServer;
+import org.apache.fluss.server.coordinator.raft.MetadataStreamRpcs;
+import org.apache.fluss.server.coordinator.raft.RaftMetadataClient;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandleStore;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotStore;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.SharedKvFileRegistry;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
+import org.apache.fluss.server.testutils.DualBackendFlussClusters;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.testutils.RpcMessageTestUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.types.DataTypes;
 
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
 import java.util.Collections;
@@ -61,8 +74,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class CoordinatorServiceOrphanRpcsITCase {
 
     @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
-            FlussClusterExtension.builder().setNumOfTabletServers(1).build();
+    public static final DualBackendFlussClusters CLUSTERS =
+            DualBackendFlussClusters.builder().setNumOfTabletServers(1).build();
 
     private static final TablePath PK_TABLE_PATH = TablePath.of("orphan_rpc_test_db", "pk_table");
     private static final TableDescriptor PK_TABLE_DESCRIPTOR =
@@ -80,33 +93,37 @@ class CoordinatorServiceOrphanRpcsITCase {
 
     private static final int MAX_SNAPSHOTS_TO_RETAIN = 2;
 
-    private static long pkTableId;
     @TempDir static Path tempDir;
 
-    @BeforeAll
-    static void setupTables() throws Exception {
-        pkTableId =
-                RpcMessageTestUtils.createTable(
-                        FLUSS_CLUSTER_EXTENSION, PK_TABLE_PATH, PK_TABLE_DESCRIPTOR);
-        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(pkTableId);
+    private FlussClusterExtension flussClusterExtension;
+
+    private void bind(MetadataBackend backend) {
+        flussClusterExtension = CLUSTERS.get(backend);
+    }
+
+    private long ensurePkTable() throws Exception {
+        return RpcMessageTestUtils.createTable(
+                flussClusterExtension, PK_TABLE_PATH, PK_TABLE_DESCRIPTOR);
     }
 
     // -------------------------------------------------------------------------
     // ListRemoteLogManifests
     // -------------------------------------------------------------------------
 
-    @Test
-    void listManifestsForUnpartitionedTable() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void listManifestsForUnpartitionedTable(MetadataBackend backend) throws Exception {
+        bind(backend);
         long tableId = 999_111L;
-        ZooKeeperClient zk = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        zk.upsertRemoteLogManifestHandle(
+        MetadataStoreClient store = flussClusterExtension.metadataStore();
+        store.upsertRemoteLogManifestHandle(
                 new TableBucket(tableId, 0),
                 new RemoteLogManifestHandle(new FsPath("oss://bucket-0/m.manifest"), 100L));
-        zk.upsertRemoteLogManifestHandle(
+        store.upsertRemoteLogManifestHandle(
                 new TableBucket(tableId, 1),
                 new RemoteLogManifestHandle(new FsPath("oss://bucket-1/m.manifest"), 200L));
 
-        CoordinatorGateway gateway = FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
         ListRemoteLogManifestsRequest request = new ListRemoteLogManifestsRequest();
         request.setTableId(tableId);
         ListRemoteLogManifestsResponse response = gateway.listRemoteLogManifests(request).get();
@@ -117,9 +134,11 @@ class CoordinatorServiceOrphanRpcsITCase {
                 .containsExactlyInAnyOrder(100L, 200L);
     }
 
-    @Test
-    void listManifestsForUnknownTableReturnsEmpty() throws Exception {
-        CoordinatorGateway gateway = FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void listManifestsForUnknownTableReturnsEmpty(MetadataBackend backend) throws Exception {
+        bind(backend);
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
         ListRemoteLogManifestsRequest request = new ListRemoteLogManifestsRequest();
         request.setTableId(999_999L);
         ListRemoteLogManifestsResponse response = gateway.listRemoteLogManifests(request).get();
@@ -131,8 +150,11 @@ class CoordinatorServiceOrphanRpcsITCase {
     // ListKvSnapshots
     // -------------------------------------------------------------------------
 
-    @Test
-    void listSnapshotsReturnsRetainedSubset() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void listSnapshotsReturnsRetainedSubset(MetadataBackend backend) throws Exception {
+        bind(backend);
+        long pkTableId = ensurePkTable();
         TableBucket tb = new TableBucket(pkTableId, 0);
         CompletedSnapshotStore store = createTestStore(snapshot -> false);
         for (long snapId = 1L; snapId <= 4L; snapId++) {
@@ -140,7 +162,7 @@ class CoordinatorServiceOrphanRpcsITCase {
         }
         injectStore(tb, store);
 
-        CoordinatorGateway gateway = FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
         ListKvSnapshotsRequest request = new ListKvSnapshotsRequest();
         request.setTableId(pkTableId);
         ListKvSnapshotsResponse response = gateway.listKvSnapshots(request).get();
@@ -156,8 +178,11 @@ class CoordinatorServiceOrphanRpcsITCase {
                 .containsExactlyInAnyOrder(3L, 4L);
     }
 
-    @Test
-    void listSnapshotsReturnsStillInUseBeyondRetention() throws Exception {
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void listSnapshotsReturnsStillInUseBeyondRetention(MetadataBackend backend) throws Exception {
+        bind(backend);
+        long pkTableId = ensurePkTable();
         TableBucket tb = new TableBucket(pkTableId, 1);
         CompletedSnapshotStore store = createTestStore(snapshot -> snapshot.getSnapshotID() == 1L);
         for (long snapId = 1L; snapId <= 4L; snapId++) {
@@ -165,7 +190,7 @@ class CoordinatorServiceOrphanRpcsITCase {
         }
         injectStore(tb, store);
 
-        CoordinatorGateway gateway = FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
         ListKvSnapshotsRequest request = new ListKvSnapshotsRequest();
         request.setTableId(pkTableId);
         ListKvSnapshotsResponse response = gateway.listKvSnapshots(request).get();
@@ -180,14 +205,94 @@ class CoordinatorServiceOrphanRpcsITCase {
                 .containsExactlyInAnyOrder(1L, 3L, 4L);
     }
 
-    @Test
-    void listSnapshotsForUnknownTableFails() {
-        CoordinatorGateway gateway = FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void listSnapshotsForUnknownTableFails(MetadataBackend backend) {
+        bind(backend);
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
         ListKvSnapshotsRequest request = new ListKvSnapshotsRequest();
         request.setTableId(999_888L);
 
         assertThatThrownBy(() -> gateway.listKvSnapshots(request).get())
                 .isInstanceOf(ExecutionException.class);
+    }
+
+    // -------------------------------------------------------------------------
+    // FetchMetadata / RegisterTabletServer / heartbeat / AllocateId — Raft-backed coordinators
+    // serve these; ZooKeeper coordinators fail cleanly with UnsupportedOperationException.
+    // -------------------------------------------------------------------------
+
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void fetchMetadataOnCoordinatorGateway(MetadataBackend backend) throws Exception {
+        bind(backend);
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
+        FetchMetadataRequest request = MetadataStreamRpcs.buildFetchRequest(1, 1L, 0L, 100, 0);
+        if (backend == MetadataBackend.ZOOKEEPER) {
+            assertThatThrownBy(() -> gateway.fetchMetadata(request).get())
+                    .isInstanceOf(ExecutionException.class);
+        } else {
+            FetchMetadataResponse response = gateway.fetchMetadata(request).get();
+            assertThat(response.getLeaderEpoch()).isPositive();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void registerTabletServerOnCoordinatorGateway(MetadataBackend backend) throws Exception {
+        bind(backend);
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
+        RegisterTabletServerRequest request = new RegisterTabletServerRequest();
+        request.setServerId(99);
+        request.setRegisterTimestamp(1L);
+        request.setListeners("FLUSS://localhost:19099");
+        if (backend == MetadataBackend.ZOOKEEPER) {
+            assertThatThrownBy(() -> gateway.registerTabletServer(request).get())
+                    .isInstanceOf(ExecutionException.class);
+        } else {
+            RegisterTabletServerResponse response = gateway.registerTabletServer(request).get();
+            assertThat(response.getLeaderEpoch()).isPositive();
+            MetadataStoreClient store = flussClusterExtension.metadataStore();
+            if (store instanceof RaftMetadataClient) {
+                ((RaftMetadataClient) store).fenceTabletServer(99);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void tabletServerHeartbeatOnCoordinatorGateway(MetadataBackend backend) throws Exception {
+        bind(backend);
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
+        TabletServerHeartbeatRequest request = new TabletServerHeartbeatRequest();
+        request.setServerId(0);
+        request.setLeaderEpoch(0L);
+        if (backend == MetadataBackend.ZOOKEEPER) {
+            assertThatThrownBy(() -> gateway.tabletServerHeartbeat(request).get())
+                    .isInstanceOf(ExecutionException.class);
+        } else {
+            TabletServerHeartbeatResponse response = gateway.tabletServerHeartbeat(request).get();
+            assertThat(response.getLeaderEpoch()).isPositive();
+            assertThat(response.isRegistered()).isTrue();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void allocateIdOnCoordinatorGateway(MetadataBackend backend) throws Exception {
+        bind(backend);
+        CoordinatorGateway gateway = flussClusterExtension.newCoordinatorClient();
+        AllocateIdRequest request = new AllocateIdRequest();
+        request.setIdKind(AllocateIdRpcServer.KIND_WRITER);
+        request.setCount(1L);
+        if (backend == MetadataBackend.ZOOKEEPER) {
+            assertThatThrownBy(() -> gateway.allocateId(request).get())
+                    .isInstanceOf(ExecutionException.class);
+        } else {
+            AllocateIdResponse response = gateway.allocateId(request).get();
+            assertThat(response.getCount()).isEqualTo(1L);
+            assertThat(response.getStartId()).isGreaterThanOrEqualTo(0L);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -207,7 +312,7 @@ class CoordinatorServiceOrphanRpcsITCase {
 
     private void injectStore(TableBucket tb, CompletedSnapshotStore store) {
         CompletedSnapshotStoreManager storeManager =
-                FLUSS_CLUSTER_EXTENSION
+                flussClusterExtension
                         .getCoordinatorServer()
                         .getCoordinatorEventProcessor()
                         .completedSnapshotStoreManager();

@@ -53,7 +53,7 @@ import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.predicate.PredicateBuilder;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.ImmutableMap;
@@ -376,7 +376,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
             throws Throwable {
         long tableId =
                 createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         Map<Long, String> partitionNameByIds =
                 waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
         Long partitionId = partitionNameByIds.keySet().stream().sorted().findFirst().get();
@@ -594,7 +594,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     @Test
     void testBatchPartitionFilterOnlyGeneratesMatchingPartitionSplits() throws Throwable {
         createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         Map.Entry<Long, String> targetPartition =
                 waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH)
                         .entrySet()
@@ -884,7 +884,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     void testNewPartitionsUseEarliestOffset() throws Throwable {
         int numSubtasks = 3;
         createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         try (MockSplitEnumeratorContext<SourceSplitBase> context =
                         new MockSplitEnumeratorContext<>(numSubtasks);
                 MockWorkExecutor workExecutor = new MockWorkExecutor(context);
@@ -975,7 +975,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
         int numSubtasks = 3;
         long tableId =
                 createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         Map<Long, String> partitions = waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
 
         // Pick one partition to simulate as an unassigned split from previous checkpoint.
@@ -1093,7 +1093,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                         ? DEFAULT_AUTO_PARTITIONED_PK_TABLE_DESCRIPTOR
                         : DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR;
         long tableId = createTable(DEFAULT_TABLE_PATH, tableDescriptor);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         try (MockSplitEnumeratorContext<SourceSplitBase> context =
                         new MockSplitEnumeratorContext<>(numSubtasks);
                 MockWorkExecutor workExecutor = new MockWorkExecutor(context);
@@ -1283,7 +1283,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                         : DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR;
         long tableId = createTable(DEFAULT_TABLE_PATH, tableDescriptor);
 
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         Map<Long, String> partitionNameByIds =
                 waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
         assertThat(partitionNameByIds.size()).isEqualTo(2);
@@ -1470,7 +1470,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
         int numSubtasks = 3;
         long tableId =
                 createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        MetadataStoreClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.metadataStore();
         Map<Long, String> partitions = waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
 
         // Pick one partition to simulate as "dropped after checkpoint"

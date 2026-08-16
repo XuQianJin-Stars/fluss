@@ -42,6 +42,18 @@ final class DistShellScriptTest {
                 .contains("log4j.properties");
     }
 
+    @Test
+    void testLocalClusterGatesZooKeeperOnAddress() throws Exception {
+        String script = readBinScript("local-cluster.sh");
+        assertThat(script).contains("Skipping ZooKeeper");
+        assertThat(script).contains("zookeeper.address");
+    }
+
+    @Test
+    void testFlussCliScriptDispatchesToFlussCli() throws Exception {
+        assertThat(readBinScript("fluss")).contains("org.apache.fluss.server.tools.FlussCli");
+    }
+
     private static String readBinScript(String scriptName) throws IOException {
         Path scriptPath =
                 Paths.get(

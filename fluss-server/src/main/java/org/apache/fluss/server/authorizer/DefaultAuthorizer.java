@@ -31,6 +31,7 @@ import org.apache.fluss.security.acl.OperationType;
 import org.apache.fluss.security.acl.PermissionType;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.security.acl.ResourceType;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperUtils;
@@ -43,6 +44,8 @@ import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -64,7 +67,6 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.security.acl.Resource.TABLE_SPLITTER;
-import static org.apache.fluss.server.zk.ZooKeeperClient.UNKNOWN_VERSION;
 
 /**
  * A default authorization manager that leverages ZooKeeper to store access control lists (ACLs).
@@ -121,8 +123,15 @@ public class DefaultAuthorizer extends AbstractAuthorizer implements FatalErrorH
     private final Set<FlussPrincipal> superUsers;
     private final boolean principalIgnoreCase;
 
-    private final ZooKeeperClient zooKeeperClient;
-    private final ZkNodeChangeNotificationWatcher aclChangeNotificationWatcher;
+    private final MetadataStoreClient metadataStoreClient;
+
+    /**
+     * Live ACL-change watcher. Only present on the ZooKeeper backend, where ACL changes propagate
+     * via sequential change-notification znodes. On the Raft backend ACL changes are carried by the
+     * metadata stream (a stream-based notifier is a follow-up T6-2 slice), so this is {@code null}.
+     */
+    @Nullable private final ZkNodeChangeNotificationWatcher aclChangeNotificationWatcher;
+
     private final Object lock = new Object();
 
     // Main cache: Stores the mapping between resources and access control entries, sorted by
@@ -137,26 +146,40 @@ public class DefaultAuthorizer extends AbstractAuthorizer implements FatalErrorH
         this.superUsers = parseSuperUsers(configuration);
         this.principalIgnoreCase =
                 configuration.get(ConfigOptions.SECURITY_ACL_PRINCIPAL_IGNORE_CASE);
-        if (context.getZooKeeperClient().isPresent()) {
-            this.zooKeeperClient = context.getZooKeeperClient().get();
+
+        // Prefer the backend-neutral metadata store client; fall back to a self-started ZooKeeper
+        // client when the context provides none (legacy standalone-authorizer path).
+        Optional<MetadataStoreClient> providedClient = context.getMetadataStoreClient();
+        if (providedClient.isPresent()) {
+            this.metadataStoreClient = providedClient.get();
         } else {
-            this.zooKeeperClient = ZooKeeperUtils.startZookeeperClient(configuration, this);
+            this.metadataStoreClient = ZooKeeperUtils.startZookeeperClient(configuration, this);
         }
-        this.aclChangeNotificationWatcher =
-                new ZkNodeChangeNotificationWatcher(
-                        zooKeeperClient,
-                        AclChangesNode.path(),
-                        AclChangeNotificationNode.prefix(),
-                        configuration
-                                .get(ConfigOptions.ACL_NOTIFICATION_EXPIRATION_TIME)
-                                .toMillis(),
-                        new ZkNotificationHandler(),
-                        SystemClock.getInstance());
+
+        // The change-notification watcher is a ZooKeeper-only mechanism. On the Raft backend the
+        // ACL record append is itself the notification (carried by the metadata stream), so no
+        // separate watcher is built here.
+        if (this.metadataStoreClient instanceof ZooKeeperClient) {
+            this.aclChangeNotificationWatcher =
+                    new ZkNodeChangeNotificationWatcher(
+                            (ZooKeeperClient) this.metadataStoreClient,
+                            AclChangesNode.path(),
+                            AclChangeNotificationNode.prefix(),
+                            configuration
+                                    .get(ConfigOptions.ACL_NOTIFICATION_EXPIRATION_TIME)
+                                    .toMillis(),
+                            new ZkNotificationHandler(),
+                            SystemClock.getInstance());
+        } else {
+            this.aclChangeNotificationWatcher = null;
+        }
     }
 
     @Override
     public void startup() throws Exception {
-        aclChangeNotificationWatcher.start();
+        if (aclChangeNotificationWatcher != null) {
+            aclChangeNotificationWatcher.start();
+        }
         loadCache();
     }
 
@@ -337,7 +360,7 @@ public class DefaultAuthorizer extends AbstractAuthorizer implements FatalErrorH
         synchronized (lock) {
             ResourceType[] resourceTypes = ResourceType.values();
             for (ResourceType resourceType : resourceTypes) {
-                List<String> resourceNames = zooKeeperClient.listResourcesByType(resourceType);
+                List<String> resourceNames = metadataStoreClient.listResourcesByType(resourceType);
                 for (String resourceName : resourceNames) {
                     Resource resource = new Resource(resourceType, resourceName);
                     VersionedAcls versionedAcls = getAclsFromZk(resource);
@@ -388,15 +411,15 @@ public class DefaultAuthorizer extends AbstractAuthorizer implements FatalErrorH
                 if (!newAces.isEmpty()) {
                     if (currentVersionedAcls.exists()) {
                         updateVersion =
-                                zooKeeperClient.updateResourceAcl(
+                                metadataStoreClient.updateResourceAcl(
                                         resource, newAces, currentVersionedAcls.zkVersion);
                     } else {
-                        zooKeeperClient.createResourceAcl(resource, newAces);
+                        metadataStoreClient.createResourceAcl(resource, newAces);
                     }
 
                 } else {
                     LOG.trace("Deleting path for {} because it had no ACLs remaining", resource);
-                    zooKeeperClient.conditionalDeleteResourceAcl(
+                    metadataStoreClient.conditionalDeleteResourceAcl(
                             resource, currentVersionedAcls.zkVersion);
                 }
                 writeComplete = true;
@@ -468,9 +491,29 @@ public class DefaultAuthorizer extends AbstractAuthorizer implements FatalErrorH
         }
     }
 
+    /**
+     * Reconciles the ACL cache to exactly {@code snapshot} (the Raft metadata-stream notifier path
+     * driven by {@code AclChangeStreamNotifier} — the cross-process equivalent of the ZooKeeper
+     * change-notification watcher). Resources present in the snapshot are upserted into the cache;
+     * resources currently cached but absent from the snapshot were deleted upstream and are
+     * dropped. Idempotent.
+     */
+    public void reconcileAclCache(Map<Resource, VersionedAcls> snapshot) {
+        synchronized (lock) {
+            Set<Resource> removed = new HashSet<>(aclCache.keySet());
+            removed.removeAll(snapshot.keySet());
+            for (Resource resource : removed) {
+                updateCache(resource, new VersionedAcls(0, Collections.emptySet()));
+            }
+            for (Map.Entry<Resource, VersionedAcls> entry : snapshot.entrySet()) {
+                updateCache(entry.getKey(), entry.getValue());
+            }
+        }
+    }
+
     private void updateAclChangedFlag(Resource resource) {
         try {
-            zooKeeperClient.insertAclChangeNotification(resource);
+            metadataStoreClient.insertAclChangeNotification(resource);
         } catch (Exception e) {
             LOG.error("Failed to update acl change flag for {}", resource, e);
             throw new IllegalStateException(
@@ -588,7 +631,7 @@ public class DefaultAuthorizer extends AbstractAuthorizer implements FatalErrorH
     }
 
     private VersionedAcls getAclsFromZk(Resource resource) throws Exception {
-        return zooKeeperClient.getResourceAclWithVersion(resource);
+        return metadataStoreClient.getResourceAclWithVersion(resource);
     }
 
     private static Set<FlussPrincipal> parseSuperUsers(Configuration configuration) {
@@ -688,29 +731,6 @@ public class DefaultAuthorizer extends AbstractAuthorizer implements FatalErrorH
                     + ", resourceType="
                     + resourceType
                     + '}';
-        }
-    }
-
-    /**
-     * VersionedAcls is a wrapper class that holds a set of AccessControlEntry objects along with
-     * zknode version.
-     */
-    public static class VersionedAcls {
-        public Set<AccessControlEntry> acls;
-        int zkVersion;
-
-        public VersionedAcls(int zkVersion, Set<AccessControlEntry> acls) {
-            this.zkVersion = zkVersion;
-            this.acls = acls;
-        }
-
-        boolean exists() {
-            return zkVersion != UNKNOWN_VERSION;
-        }
-
-        @Override
-        public String toString() {
-            return "VersionedAcls{" + "acls=" + acls + ", zkVersion=" + zkVersion + '}';
         }
     }
 }

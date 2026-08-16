@@ -34,8 +34,14 @@ import org.apache.fluss.utils.types.Tuple2;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.client.program.MiniClusterClient;
+import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.runtime.client.JobStatusMessage;
+import org.apache.flink.runtime.minicluster.MiniCluster;
+import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.util.TestStreamEnvironment;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.ExplainDetail;
 import org.apache.flink.table.api.TableEnvironment;
@@ -43,7 +49,9 @@ import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.api.config.ExecutionConfigOptions;
-import org.apache.flink.test.util.AbstractTestBase;
+import org.apache.flink.test.junit5.InjectClusterClient;
+import org.apache.flink.test.junit5.InjectMiniCluster;
+import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.types.Row;
 import org.apache.flink.types.RowKind;
 import org.apache.flink.util.CloseableIterator;
@@ -75,11 +83,28 @@ import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.as
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsWithTimeout;
 import static org.apache.fluss.flink.utils.FlinkTestBase.waitUntilPartitions;
 import static org.apache.fluss.server.testutils.FlussClusterExtension.BUILTIN_DATABASE;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Test for {@link FlinkTableSink} inherit AbstractTestBase for resource cleanup. */
-abstract class FlinkTableSinkITCase extends AbstractTestBase {
+/** Test for {@link FlinkTableSink}. */
+abstract class FlinkTableSinkITCase {
+    /**
+     * Dedicated MiniCluster. {@code AbstractTestBase} defaults job parallelism to the slot count,
+     * so a leftover streaming INSERT occupies every slot and the next job fails with {@code
+     * NoResourceAvailableException} (e.g. {@code testFirstRowMergeEngine}).
+     */
+    @RegisterExtension
+    public static final MiniClusterExtension MINI_CLUSTER_EXTENSION =
+            new MiniClusterExtension(
+                    new MiniClusterResourceConfiguration.Builder()
+                            .setNumberTaskManagers(2)
+                            .setNumberSlotsPerTaskManager(8)
+                            .setConfiguration(
+                                    new org.apache.flink.configuration.Configuration()
+                                            .set(CoreOptions.DEFAULT_PARALLELISM, 1))
+                            .build());
+
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
             FlussClusterExtension.builder().setNumOfTabletServers(3).build();
@@ -100,11 +125,11 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
     }
 
     @BeforeEach
-    void before() throws Exception {
+    void before(@InjectMiniCluster MiniCluster miniCluster) throws Exception {
         // open a catalog so that we can get table from the catalog
         String bootstrapServers = FLUSS_CLUSTER_EXTENSION.getBootstrapServers();
-        // create table environment
-        env = StreamExecutionEnvironment.getExecutionEnvironment();
+        TestStreamEnvironment.setAsContext(miniCluster, 1);
+        env = new TestStreamEnvironment(miniCluster, 1);
         env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
 
         tEnv = StreamTableEnvironment.create(env);
@@ -134,9 +159,24 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
     }
 
     @AfterEach
-    void after() throws Exception {
+    void after(@InjectClusterClient MiniClusterClient clusterClient) throws Exception {
         tEnv.useDatabase(BUILTIN_DATABASE);
-        tEnv.executeSql(String.format("drop database %s cascade", DEFAULT_DB));
+        tEnv.executeSql(String.format("drop database %s cascade", DEFAULT_DB)).await();
+        for (JobStatusMessage job : clusterClient.listJobs().get()) {
+            if (!job.getJobState().isTerminalState()) {
+                try {
+                    clusterClient.cancel(job.getJobId()).get();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        retry(
+                Duration.ofSeconds(30),
+                () -> {
+                    for (JobStatusMessage job : clusterClient.listJobs().get()) {
+                        assertThat(job.getJobState().isTerminalState()).isTrue();
+                    }
+                });
     }
 
     @ParameterizedTest
@@ -759,7 +799,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                                     + " 'table.auto-partition.time-unit' = 'year')",
                             tableName));
             partitions =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath)
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath)
                             .values();
         } else {
             tEnv.executeSql(
@@ -777,7 +817,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                     String.format(
                             "alter table %s add partition (c = '%s')", tableName, currentYear));
             partitions =
-                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath, 1)
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.metadataStore(), tablePath, 1)
                             .values();
         }
 
@@ -1007,7 +1047,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         tableName));
         Collection<String> partitions =
                 waitUntilPartitions(
-                                FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(),
+                                FLUSS_CLUSTER_EXTENSION.metadataStore(),
                                 TablePath.of(DEFAULT_DB, tableName))
                         .values();
         String partition = partitions.iterator().next();
@@ -1173,7 +1213,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         t2));
         Collection<String> partitions =
                 waitUntilPartitions(
-                                FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(),
+                                FLUSS_CLUSTER_EXTENSION.metadataStore(),
                                 TablePath.of(DEFAULT_DB, t2))
                         .values();
         String partition1 = partitions.iterator().next();

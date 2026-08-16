@@ -53,6 +53,17 @@ public class MetricNames {
     public static final String EVENT_QUEUE_TIME_MS = "eventQueueTimeMs";
     public static final String EVENT_PROCESSING_TIME_MS = "eventProcessingTimeMs";
 
+    // for coordinator Raft quorum (design §5.12)
+    /** Encoded role: 0=follower, 1=candidate, 2=leader, -1=unknown/unavailable. */
+    public static final String RAFT_ROLE = "raftRole";
+
+    public static final String RAFT_TERM = "raftTerm";
+    public static final String RAFT_COMMIT_INDEX = "raftCommitIndex";
+    public static final String RAFT_APPLIED_INDEX = "raftAppliedIndex";
+    public static final String RAFT_APPLY_LAG = "raftApplyLag";
+    /** Max (commit − matchIndex) across followers; 0 when not leader / unavailable. */
+    public static final String RAFT_FOLLOWER_LAG = "raftFollowerLag";
+
     // for kv tablet which reported by coordinator
     public static final String KV_NUM_SNAPSHOTS = "numKvSnapshots";
     public static final String KV_ALL_SNAPSHOT_SIZE = "allKvSnapshotSize";

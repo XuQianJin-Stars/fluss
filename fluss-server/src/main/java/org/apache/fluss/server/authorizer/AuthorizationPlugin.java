@@ -20,6 +20,7 @@ package org.apache.fluss.server.authorizer;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.plugin.Plugin;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 
 import java.util.Optional;
@@ -38,7 +39,25 @@ public interface AuthorizationPlugin extends Plugin {
         /** Get configuration of fluss server to authorize. */
         Configuration getConfiguration();
 
-        /** Get zookeeper client to store authorization information. */
+        /**
+         * Get zookeeper client to store authorization information.
+         *
+         * @deprecated use {@link #getMetadataStoreClient()} which is backend-neutral (ZooKeeper or
+         *     Raft). Retained for source compatibility; returns empty on non-ZooKeeper backends.
+         */
+        @Deprecated
         Optional<ZooKeeperClient> getZooKeeperClient();
+
+        /**
+         * Get the backend-neutral metadata store client to store authorization information.
+         *
+         * <p>The default implementation widens {@link #getZooKeeperClient()} so existing {@link
+         * Context} implementations remain source-compatible ({@code ZooKeeperClient} already
+         * implements {@link MetadataStoreClient}). Backends that are not ZooKeeper-backed override
+         * this to supply their own client.
+         */
+        default Optional<MetadataStoreClient> getMetadataStoreClient() {
+            return getZooKeeperClient().<MetadataStoreClient>map(client -> client);
+        }
     }
 }

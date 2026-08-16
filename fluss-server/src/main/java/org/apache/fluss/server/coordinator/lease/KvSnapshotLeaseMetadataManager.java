@@ -22,7 +22,7 @@ import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FSDataOutputStream;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
-import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadata;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotTableLease;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotTableLeaseJsonSerde;
@@ -48,10 +48,10 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 public class KvSnapshotLeaseMetadataManager {
     private static final Logger LOG = LoggerFactory.getLogger(KvSnapshotLeaseMetadataManager.class);
 
-    private final ZooKeeperClient zkClient;
+    private final MetadataStoreClient zkClient;
     private final String remoteDataDir;
 
-    public KvSnapshotLeaseMetadataManager(ZooKeeperClient zkClient, String remoteDataDir) {
+    public KvSnapshotLeaseMetadataManager(MetadataStoreClient zkClient, String remoteDataDir) {
         this.zkClient = zkClient;
         this.remoteDataDir = remoteDataDir;
     }

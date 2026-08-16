@@ -26,6 +26,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.TableNotExistException;
+import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.memory.LazyMemorySegmentPool;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.PreAllocatedPagedOutputView;
@@ -320,6 +321,9 @@ public final class RecordAccumulator {
     public void reEnqueue(ReadyWriteBatch readyWriteBatch) {
         WriteBatch batch = readyWriteBatch.writeBatch();
         batch.reEnqueued();
+        // Reset the expire clock so a retried batch is not immediately aborted for age
+        // accumulated while it was in-flight.
+        batch.resetQueuedTime(clock.milliseconds());
         Deque<WriteBatch> deque =
                 getOrCreateDeque(readyWriteBatch.tableBucket(), batch.physicalTablePath());
         synchronized (deque) {
@@ -338,11 +342,60 @@ public final class RecordAccumulator {
         }
     }
 
+    /**
+     * Abort batches that have sat in the accumulator longer than {@code requestTimeoutMs} without
+     * being sent. This covers records stuck behind unknown leaders or pending dynamic partition
+     * creation, so {@link #awaitFlushCompletion()} cannot block forever.
+     *
+     * <p>In-flight batches (already drained, waiting on an RPC) are not expired here. Those
+     * complete via the request timeout and the sender retry path; aborting them races the RPC and
+     * prevents failover retries after a leader dies.
+     */
+    public void abortExpiredBatches(long requestTimeoutMs) {
+        long nowMs = clock.milliseconds();
+        for (WriteBatch batch : incomplete.copyAll()) {
+            if (batch.isDone() || batch.queuedTimeMs(nowMs) < requestTimeoutMs) {
+                continue;
+            }
+            if (isInFlight(batch)) {
+                continue;
+            }
+            TimeoutException timeout =
+                    new TimeoutException(
+                            String.format(
+                                    "Expiring %d record(s) for %s bucket %d after %d ms",
+                                    batch.getRecordCount(),
+                                    batch.physicalTablePath(),
+                                    batch.bucketId(),
+                                    requestTimeoutMs));
+            LOG.warn(timeout.getMessage());
+            abortBatch(timeout, batch);
+        }
+    }
+
+    /**
+     * Returns true if {@code batch} has been drained and is not currently sitting in its
+     * accumulator deque (i.e. it is waiting on an in-flight produce/put RPC).
+     */
+    private boolean isInFlight(WriteBatch batch) {
+        Deque<WriteBatch> dq = getDeque(batch.physicalTablePath(), batch.bucketId());
+        if (dq == null) {
+            return true;
+        }
+        synchronized (dq) {
+            return !dq.contains(batch);
+        }
+    }
+
     private void abortBatch(final Exception reason, WriteBatch batch) {
         Deque<WriteBatch> dq = getDeque(batch.physicalTablePath(), batch.bucketId());
-        synchronized (dq) {
+        if (dq != null) {
+            synchronized (dq) {
+                batch.abortRecordAppends();
+                dq.remove(batch);
+            }
+        } else {
             batch.abortRecordAppends();
-            dq.remove(batch);
         }
         batch.abort(reason);
         deallocate(batch);
@@ -493,9 +546,9 @@ public final class RecordAccumulator {
                 LOG.debug(
                         "Partition not exists for {}, bucket will not be set to ready",
                         physicalTablePath);
-                // TODO: we shouldn't add unready partitions to unknownLeaderTables,
-                //  because it cases PartitionNotExistException later
-                unknownLeaderTables.add(physicalTablePath);
+                // Do not put this path into unknownLeaderTables: a metadata refresh cannot
+                // resolve a partition that has not been created yet, and doing so busy-loops
+                // 30s metadata RPCs while flush waits forever.
                 return nextReadyCheckDelayMs;
             }
         }

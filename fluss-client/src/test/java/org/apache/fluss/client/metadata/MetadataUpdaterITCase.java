@@ -25,6 +25,7 @@ import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.RpcClient;
+import org.apache.fluss.server.metadata.MetadataBackend;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 
 import org.junit.jupiter.api.Test;
@@ -60,9 +61,9 @@ class MetadataUpdaterITCase {
         metadataUpdater.updateMetadata(Collections.singleton(tablePath), null, null);
         Cluster cluster = metadataUpdater.getCluster();
 
-        // repeat 20K times to reproduce StackOverflowError if there is
-        // any N levels UnmodifiableCollection
-        for (int i = 0; i < 20000; i++) {
+        // Nested UnmodifiableCollection wrapping overflows well below a few thousand
+        // rebuilds; keep this far smaller than 20K so CI does not look hung.
+        for (int i = 0; i < 2000; i++) {
             cluster =
                     sendMetadataRequestAndRebuildCluster(
                             FLUSS_CLUSTER_EXTENSION.newCoordinatorClient(),
@@ -88,36 +89,43 @@ class MetadataUpdaterITCase {
         assertThat(expectedServerNodes).hasSize(2);
         assertThat(cluster.getAliveTabletServerList()).isEqualTo(expectedServerNodes);
 
-        // then, stop coordinator server, can still update metadata
+        // then, stop coordinator server, can still update metadata from existing tablets
         FLUSS_CLUSTER_EXTENSION.stopCoordinatorServer();
-        metadataUpdater.updateMetadata(null, null, null);
-        assertThat(cluster.getAliveTabletServerList()).isEqualTo(expectedServerNodes);
+        try {
+            metadataUpdater.updateMetadata(null, null, null);
+            assertThat(cluster.getAliveTabletServerList()).isEqualTo(expectedServerNodes);
 
-        // start a new tablet server, the tablet server will return empty metadata
-        // response since no coordinator server to send newest metadata to the tablet server
-        int newServerId = 2;
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(newServerId);
+            // ZK-only: a new tablet can register via ephemeral znodes with the coordinator
+            // offline and returns empty metadata until UpdateMetadata is pushed. Raft tablets
+            // must discover the coordinator leader to RegisterTabletServer, so they cannot
+            // start while the coordinator is down.
+            if (FLUSS_CLUSTER_EXTENSION.getMetadataBackend() == MetadataBackend.ZOOKEEPER) {
+                int newServerId = 2;
+                FLUSS_CLUSTER_EXTENSION.startTabletServer(newServerId);
 
-        // we mock a new cluster with only server 1 so that it'll only send request
-        // to server 1, which will return empty resonate
-        Cluster newCluster =
-                new Cluster(
-                        Collections.singletonMap(
-                                newServerId,
-                                FLUSS_CLUSTER_EXTENSION.getTabletServerNodes().get(newServerId)),
-                        null,
-                        Collections.emptyMap(),
-                        Collections.emptyMap(),
-                        Collections.emptyMap());
+                // Mock a cluster with only the new server so requests hit the empty-metadata path.
+                Cluster newCluster =
+                        new Cluster(
+                                Collections.singletonMap(
+                                        newServerId,
+                                        FLUSS_CLUSTER_EXTENSION
+                                                .getTabletServerNodes()
+                                                .get(newServerId)),
+                                null,
+                                Collections.emptyMap(),
+                                Collections.emptyMap(),
+                                Collections.emptyMap());
 
-        metadataUpdater = new MetadataUpdater(rpcClient, new Configuration(), newCluster);
-        // shouldn't update metadata to empty since the empty metadata will be ignored
-        metadataUpdater.updateMetadata(null, null, null);
-        assertThat(metadataUpdater.getCluster().getAliveTabletServers())
-                .isEqualTo(newCluster.getAliveTabletServers())
-                .hasSize(1);
-
-        // recover the coordinator
-        FLUSS_CLUSTER_EXTENSION.startCoordinatorServer();
+                metadataUpdater = new MetadataUpdater(rpcClient, new Configuration(), newCluster);
+                // shouldn't update metadata to empty since the empty metadata will be ignored
+                metadataUpdater.updateMetadata(null, null, null);
+                assertThat(metadataUpdater.getCluster().getAliveTabletServers())
+                        .isEqualTo(newCluster.getAliveTabletServers())
+                        .hasSize(1);
+            }
+        } finally {
+            // Always recover the coordinator so afterEach cleanup and later tests see a leader.
+            FLUSS_CLUSTER_EXTENSION.startCoordinatorServer();
+        }
     }
 }

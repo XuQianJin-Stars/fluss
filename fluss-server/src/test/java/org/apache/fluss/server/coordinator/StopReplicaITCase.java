@@ -27,19 +27,20 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.server.metadata.MetadataBackend;
+import org.apache.fluss.server.metadata.MetadataStoreClient;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.testutils.DualBackendFlussClusters;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.testutils.RpcMessageTestUtils;
-import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.types.DataTypes;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.File;
 import java.nio.file.Path;
@@ -59,40 +60,41 @@ import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** ITCase for stop replica. */
+/** ITCase for stop replica. Runs on ZooKeeper and Raft. */
 public class StopReplicaITCase {
     @RegisterExtension
-    public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
-            FlussClusterExtension.builder()
+    public static final DualBackendFlussClusters CLUSTERS =
+            DualBackendFlussClusters.builder()
                     .setNumOfTabletServers(3)
                     .setClusterConf(initConfig())
                     .build();
 
-    private ZooKeeperClient zkClient;
+    private FlussClusterExtension flussClusterExtension;
+    private MetadataStoreClient zkClient;
     private CoordinatorGateway coordinatorGateway;
 
-    @BeforeEach
-    void beforeEach() {
-        zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        coordinatorGateway = FLUSS_CLUSTER_EXTENSION.newCoordinatorClient();
+    private void bind(MetadataBackend backend) {
+        flussClusterExtension = CLUSTERS.get(backend);
+        zkClient = flussClusterExtension.metadataStore();
+        coordinatorGateway = flussClusterExtension.newCoordinatorClient();
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testStopReplica(boolean isPkTable) throws Exception {
+    @MethodSource("org.apache.fluss.server.testutils.DualBackendFlussClusters#backendsAndBooleans")
+    void testStopReplica(MetadataBackend backend, boolean isPkTable) throws Exception {
+        bind(backend);
         TablePath tablePath = isPkTable ? DATA1_TABLE_PATH_PK : DATA1_TABLE_PATH;
         TableDescriptor tableDescriptor =
                 isPkTable ? DATA1_TABLE_DESCRIPTOR_PK : DATA1_TABLE_DESCRIPTOR;
 
         // wait until all the gateway has same metadata because the follower fetcher manager need
         // to get the leader address from server metadata while make follower.
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllGatewayHasSameMetadata();
+        flussClusterExtension.waitUntilAllGatewayHasSameMetadata();
 
         long tableId =
-                RpcMessageTestUtils.createTable(
-                        FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+                RpcMessageTestUtils.createTable(flussClusterExtension, tablePath, tableDescriptor);
         TableBucket tb = new TableBucket(tableId, 0);
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        flussClusterExtension.waitUntilAllReplicaReady(tb);
 
         List<Integer> isr = waitAndGetIsr(tb);
         List<Path> tableDirs = assertReplicaExistAndGetTableOrPartitionDirs(tb, isr, isPkTable);
@@ -107,10 +109,9 @@ public class StopReplicaITCase {
 
         // create this table again.
         tableId =
-                RpcMessageTestUtils.createTable(
-                        FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+                RpcMessageTestUtils.createTable(flussClusterExtension, tablePath, tableDescriptor);
         TableBucket tb1 = new TableBucket(tableId, 0);
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb1);
+        flussClusterExtension.waitUntilAllReplicaReady(tb1);
 
         isr = waitAndGetIsr(tb1);
         tableDirs = assertReplicaExistAndGetTableOrPartitionDirs(tb1, isr, isPkTable);
@@ -124,10 +125,9 @@ public class StopReplicaITCase {
 
         // create this table even if the drop table operation may not be completed.
         tableId =
-                RpcMessageTestUtils.createTable(
-                        FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+                RpcMessageTestUtils.createTable(flussClusterExtension, tablePath, tableDescriptor);
         TableBucket tb2 = new TableBucket(tableId, 0);
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb2);
+        flussClusterExtension.waitUntilAllReplicaReady(tb2);
 
         List<Integer> isr2 = waitAndGetIsr(tb2);
         List<Path> tableDirs2 = assertReplicaExistAndGetTableOrPartitionDirs(tb2, isr2, isPkTable);
@@ -143,29 +143,32 @@ public class StopReplicaITCase {
         retryUtilReplicaNotExist(tb, isr2, tableDirs2);
     }
 
-    @Test
-    void testDropTableCleansOrphanDirsOnTabletServerRestart() throws Exception {
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllGatewayHasSameMetadata();
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testDropTableCleansOrphanDirsOnTabletServerRestart(MetadataBackend backend)
+            throws Exception {
+        bind(backend);
+        flussClusterExtension.waitUntilAllGatewayHasSameMetadata();
 
         TablePath tablePath = TablePath.of("test_db_stop_replica", "test_orphan_table");
         long tableId =
                 RpcMessageTestUtils.createTable(
-                        FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR);
+                        flussClusterExtension, tablePath, DATA1_TABLE_DESCRIPTOR);
         TableBucket tb = new TableBucket(tableId, 0);
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        flussClusterExtension.waitUntilAllReplicaReady(tb);
 
         List<Integer> isr = waitAndGetIsr(tb);
 
         // Write data so that actual segment files exist on every replica.
-        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leader = flussClusterExtension.waitAndGetLeader(tb);
         TabletServerGateway leaderGateway =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+                flussClusterExtension.newTabletServerClientForNode(leader);
         MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
         leaderGateway.produceLog(newProduceLogRequest(tableId, 0, 1, records)).get();
 
         int offlineServerId = isr.get(0);
         ReplicaManager replicaManager =
-                FLUSS_CLUSTER_EXTENSION.getTabletServerById(offlineServerId).getReplicaManager();
+                flussClusterExtension.getTabletServerById(offlineServerId).getReplicaManager();
         Replica replica = replicaManager.getReplicaOrException(tb);
         Path offlineTsTableDir = replica.getTabletParentDir();
         File offlineTsLogDir = replica.getLogTablet().getLogDir();
@@ -174,8 +177,8 @@ public class StopReplicaITCase {
         // Verify actual data files (.log, .index) exist under the log directory.
         assertThat(offlineTsLogDir.listFiles()).isNotEmpty();
 
-        FLUSS_CLUSTER_EXTENSION.stopTabletServer(offlineServerId);
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(2);
+        flussClusterExtension.stopTabletServer(offlineServerId);
+        flussClusterExtension.assertHasTabletServerNumber(2);
 
         coordinatorGateway
                 .dropTable(
@@ -184,8 +187,8 @@ public class StopReplicaITCase {
                 .get();
         assertThat(zkClient.tableExist(tablePath)).isFalse();
 
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(offlineServerId);
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+        flussClusterExtension.startTabletServer(offlineServerId);
+        flussClusterExtension.assertHasTabletServerNumber(3);
 
         // Both the log directory (with data files) and the table parent directory
         // should be cleaned at startup via the SchemaNotExistException handler.
@@ -197,9 +200,12 @@ public class StopReplicaITCase {
                 });
     }
 
-    @Test
-    void testDropPartitionCleansOrphanDirsOnTabletServerRestart() throws Exception {
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllGatewayHasSameMetadata();
+    @ParameterizedTest
+    @EnumSource(MetadataBackend.class)
+    void testDropPartitionCleansOrphanDirsOnTabletServerRestart(MetadataBackend backend)
+            throws Exception {
+        bind(backend);
+        flussClusterExtension.waitUntilAllGatewayHasSameMetadata();
 
         TablePath tablePath = TablePath.of("test_db_stop_replica", "test_orphan_partition");
         TableDescriptor tableDescriptor =
@@ -214,31 +220,30 @@ public class StopReplicaITCase {
                         .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 3)
                         .build();
         long tableId =
-                RpcMessageTestUtils.createTable(
-                        FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+                RpcMessageTestUtils.createTable(flussClusterExtension, tablePath, tableDescriptor);
 
         String partitionName = "p1";
         long partitionId =
                 RpcMessageTestUtils.createPartition(
-                        FLUSS_CLUSTER_EXTENSION,
+                        flussClusterExtension,
                         tablePath,
                         new PartitionSpec(Collections.singletonMap("b", partitionName)),
                         false);
         TableBucket tb = new TableBucket(tableId, partitionId, 0);
-        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        flussClusterExtension.waitUntilAllReplicaReady(tb);
 
         List<Integer> isr = waitAndGetIsr(tb);
 
         // Write data so that actual segment files exist on every replica.
-        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        int leader = flussClusterExtension.waitAndGetLeader(tb);
         TabletServerGateway leaderGateway =
-                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+                flussClusterExtension.newTabletServerClientForNode(leader);
         MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
         leaderGateway.produceLog(newProduceLogRequest(tableId, 0, 1, records)).get();
 
         int offlineServerId = isr.get(0);
         ReplicaManager replicaManager =
-                FLUSS_CLUSTER_EXTENSION.getTabletServerById(offlineServerId).getReplicaManager();
+                flussClusterExtension.getTabletServerById(offlineServerId).getReplicaManager();
         Replica replica = replicaManager.getReplicaOrException(tb);
         Path offlineTsPartitionDir = replica.getTabletParentDir();
         File offlineTsLogDir = replica.getLogTablet().getLogDir();
@@ -246,8 +251,8 @@ public class StopReplicaITCase {
         assertThat(offlineTsLogDir).exists();
         assertThat(offlineTsLogDir.listFiles()).isNotEmpty();
 
-        FLUSS_CLUSTER_EXTENSION.stopTabletServer(offlineServerId);
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(2);
+        flussClusterExtension.stopTabletServer(offlineServerId);
+        flussClusterExtension.assertHasTabletServerNumber(2);
 
         coordinatorGateway
                 .dropPartition(
@@ -257,8 +262,8 @@ public class StopReplicaITCase {
                                 false))
                 .get();
 
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(offlineServerId);
-        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+        flussClusterExtension.startTabletServer(offlineServerId);
+        flussClusterExtension.assertHasTabletServerNumber(3);
 
         // Both the log directory (with data files) and the partition parent
         // directory should be cleaned at startup via the PartitionNotExistException handler.
@@ -284,7 +289,7 @@ public class StopReplicaITCase {
         List<Path> tableDirs = new ArrayList<>();
         for (int replicaId : isr) {
             ReplicaManager replicaManager =
-                    FLUSS_CLUSTER_EXTENSION.getTabletServerById(replicaId).getReplicaManager();
+                    flussClusterExtension.getTabletServerById(replicaId).getReplicaManager();
             assertThat(replicaManager.getReplica(tableBucket))
                     .isInstanceOf(ReplicaManager.OnlineReplica.class);
             Replica replica = replicaManager.getReplicaOrException(tableBucket);
@@ -296,7 +301,7 @@ public class StopReplicaITCase {
             if (isKvTable) {
                 // wait the replica become leader, so that we can get the kv tablet
                 Replica kvReplica =
-                        FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(replica.getTableBucket());
+                        flussClusterExtension.waitAndGetLeaderReplica(replica.getTableBucket());
                 assertThat(kvReplica.getKvTablet()).isNotNull();
                 assertThat(kvReplica.getKvTablet().getKvTabletDir()).exists();
             }
@@ -317,7 +322,7 @@ public class StopReplicaITCase {
                     isr.forEach(
                             replicaId -> {
                                 ReplicaManager replicaManager =
-                                        FLUSS_CLUSTER_EXTENSION
+                                        flussClusterExtension
                                                 .getTabletServerById(replicaId)
                                                 .getReplicaManager();
                                 assertThat(replicaManager.getReplica(tableBucket))

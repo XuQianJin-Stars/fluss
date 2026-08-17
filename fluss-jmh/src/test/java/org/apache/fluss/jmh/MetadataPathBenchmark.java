@@ -28,6 +28,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 
+import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -228,14 +229,15 @@ public class MetadataPathBenchmark {
     /**
      * Runs this benchmark with the documented short JMH flags.
      *
-     * @param args unused
+     * @param args optional JMH include regex (default: this class)
      */
     public static void main(String[] args) throws RunnerException {
+        String include =
+                args.length > 0
+                        ? args[0]
+                        : ".*" + MetadataPathBenchmark.class.getSimpleName() + ".*";
         try {
-            new Runner(
-                            MetadataJmhSupport.shortRunOptions(
-                                    ".*" + MetadataPathBenchmark.class.getSimpleName() + ".*"))
-                    .run();
+            new Runner(MetadataJmhSupport.shortRunOptions(include)).run();
         } finally {
             MetadataJmhSupport.closeShared();
         }

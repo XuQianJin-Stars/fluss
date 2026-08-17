@@ -884,14 +884,15 @@ public class MetadataStoreBenchmark {
     /**
      * Runs this benchmark with the documented short JMH flags.
      *
-     * @param args unused
+     * @param args optional JMH include regex (default: this class)
      */
     public static void main(String[] args) throws RunnerException {
+        String include =
+                args.length > 0
+                        ? args[0]
+                        : ".*" + MetadataStoreBenchmark.class.getSimpleName() + ".*";
         try {
-            new Runner(
-                            MetadataJmhSupport.shortRunOptions(
-                                    ".*" + MetadataStoreBenchmark.class.getSimpleName() + ".*"))
-                    .run();
+            new Runner(MetadataJmhSupport.shortRunOptions(include)).run();
         } finally {
             MetadataJmhSupport.closeShared();
         }

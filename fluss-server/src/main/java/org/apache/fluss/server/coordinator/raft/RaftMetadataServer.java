@@ -121,9 +121,7 @@ public class RaftMetadataServer implements AutoCloseable {
         server.start();
     }
 
-    /**
-     * Maps Fluss config options to Ratis timing knobs and optional TLS.
-     */
+    /** Maps Fluss config options to Ratis timing knobs and optional TLS. */
     @VisibleForTesting
     RaftProperties buildRaftProperties() {
         RaftProperties p = new RaftProperties();

@@ -88,6 +88,8 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * End-to-end test for {@link RaftMetadataClient} (T4-1) against a real single-node embedded Ratis
@@ -691,8 +693,11 @@ class RaftMetadataClientITCase {
             assertThat(client.getPartitionIdAndIncrement()).isEqualTo(0L);
 
             // ---- requireLeader fencing: a non-leader client rejects reads/writes (§5.7) ----
-            followerSelector = new RaftLeaderSelector("standby", server, sm, 20_000);
-            // not wired to the state machine and never started => isLeader() stays false
+            // Mock isLeader() rather than sharing the live RaftMetadataServer: the real
+            // selector probes raftDivisionIsLeader(), so a second selector on the same server
+            // would report leader and skip the fence.
+            followerSelector = mock(RaftLeaderSelector.class);
+            when(followerSelector.isLeader()).thenReturn(false);
             RaftMetadataClient follower =
                     new RaftMetadataClient(
                             writer, store, followerSelector, tableIds, partitionIds, writerIds);
@@ -752,6 +757,49 @@ class RaftMetadataClientITCase {
             assertThat(metaClient.getTable(tablePath)).contains(reg);
         } finally {
             metaClient.close();
+        }
+    }
+
+    @Test
+    void testCreateTableAndPartitionBatchAreReadableAfterApply() throws Exception {
+        int port = freePort();
+        String address = "127.0.0.1:" + port;
+        Configuration conf = new Configuration();
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_VOTERS.key(), address);
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_NODE_ID.key(), address);
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_DIR, raftDir.toString());
+        conf.set(ConfigOptions.COORDINATOR_RAFT_ELECTION_TIMEOUT, Duration.ofMillis(500));
+        conf.set(ConfigOptions.COORDINATOR_RAFT_FIRST_ELECTION_TIMEOUT, Duration.ofMillis(150));
+
+        try (RaftMetadataClient client = RaftMetadataClient.create(conf)) {
+            waitUntil(20_000, client::isLeader, "node did not become raft leader");
+
+            TablePath tablePath = TablePath.of("db", "orders");
+            Schema schema = Schema.newBuilder().column("id", DataTypes.INT()).build();
+            TableDescriptor descriptor =
+                    TableDescriptor.builder().schema(schema).distributedBy(3).build();
+            TableAssignment assignment =
+                    TableAssignment.builder().add(0, BucketAssignment.of(1, 2, 3)).build();
+            long tableId = client.getTableIdAndIncrement();
+            TableRegistration reg =
+                    TableRegistration.newTable(tableId, "file:///tmp/remote", descriptor);
+            client.registerTableSchemaAssignmentAndMetadata(tablePath, schema, assignment, reg);
+
+            assertThat(client.getTable(tablePath)).contains(reg);
+            assertThat(client.getSchemaById(tablePath, 1)).contains(new SchemaInfo(schema, 1));
+            assertThat(client.getTableAssignment(tableId)).contains(assignment);
+
+            PartitionAssignment partitionAssignment =
+                    new PartitionAssignment(tableId, assignment.getBucketAssignments());
+            client.registerPartitionAssignmentAndMetadata(
+                    101L, "p1", partitionAssignment, "file:///tmp/remote", tablePath, tableId);
+            assertThat(client.getPartition(tablePath, "p1"))
+                    .hasValueSatisfying(
+                            p -> {
+                                assertThat(p.getPartitionId()).isEqualTo(101L);
+                                assertThat(p.getTableId()).isEqualTo(tableId);
+                            });
+            assertThat(client.getPartitionAssignment(101L)).contains(partitionAssignment);
         }
     }
 

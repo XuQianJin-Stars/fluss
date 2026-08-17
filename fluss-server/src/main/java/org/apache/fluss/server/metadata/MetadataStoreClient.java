@@ -220,6 +220,35 @@ public interface MetadataStoreClient extends AutoCloseable {
     /** Deletes a table registration. */
     void deleteTable(TablePath tablePath) throws Exception;
 
+    /**
+     * Registers a table's first schema, optional bucket assignment, and table metadata together.
+     *
+     * <p>Callers must allocate {@code tableRegistration.tableId} via {@link
+     * #getTableIdAndIncrement()} <em>before</em> this method so that a Raft {@code
+     * ALLOCATE_ID_RANGE} has been committed and applied before any record that embeds the new id
+     * (no-reuse, §5.3.3).
+     *
+     * <p>The ZooKeeper backend writes the keys sequentially (no {@code appendAll}). The Raft
+     * backend pipelines independent log entries and waits once for apply (analysis §8.2).
+     *
+     * @param tablePath the table path
+     * @param schema the first schema
+     * @param tableAssignment bucket assignment, or {@code null} for a partitioned table
+     * @param tableRegistration table metadata that already embeds the allocated table id
+     */
+    default void registerTableSchemaAssignmentAndMetadata(
+            TablePath tablePath,
+            Schema schema,
+            @Nullable TableAssignment tableAssignment,
+            TableRegistration tableRegistration)
+            throws Exception {
+        registerFirstSchema(tablePath, schema);
+        if (tableAssignment != null) {
+            registerTableAssignment(tableRegistration.tableId, tableAssignment);
+        }
+        registerTable(tablePath, tableRegistration, false);
+    }
+
     // ---- schema ----
 
     /** Registers a table's first schema; returns its schema id. */

@@ -6,10 +6,10 @@
 
 | Field | Information |
 |-------|-------------|
-| **Document Status** | Draft (v3.16 — FetchMetadata async park JMH re-run; §8.4 latest Admin `getTableInfo`) |
+| **Document Status** | Draft (v3.17 — appendAll pipeline JMH; §8.4 `registerPartition` / Admin `createTable`) |
 | **Authors** | Fluss Development Team |
 | **Created Date** | 2026-06-29 |
-| **Last Updated** | 2026-08-16 |
+| **Last Updated** | 2026-08-17 |
 | **Raft Engine** | Apache Ratis (embedded) |
 | **Target Version** | Future Release |
 | **JIRA/Issue** | FLUSS-XXX |
@@ -2836,7 +2836,7 @@ class RaftClusterITCase {
 > loopback JMH baseline** (embedded Curator `TestingServer` vs single-voter Ratis), not a 3-voter
 > production cluster. Cross-AZ write latency was not measured (bounded below by majority RTT).
 
-#### Environment (measured 2026-08-16)
+#### Environment (measured 2026-08-16; **registerPartition / createTable / metadataWrite re-run 2026-08-17**)
 
 | Field | Value |
 |-------|-------|
@@ -2856,12 +2856,12 @@ export JAVA_HOME=/path/to/jdk-11
 ./mvnw -pl fluss-jmh exec:java
 ```
 
-#### Original metric table (targets kept; measured column filled)
+Score is JMH AverageTime (3 measurement iterations); ± is JMH 99.9% CI (wide with n=3 — treat as a point estimate). `@Fork(0)` reuses one store backend and one Admin cluster per backend for the JVM (avoids Ratis port leaks). Delete-style store rows include a preceding unique-key create unless noted. Raft point-reads of a single key are typically ~1 µs (in-process KvStore). Raft **prefix scans** (`list*`, `getPartitions`, `getCurrentSchemaId`, …) are **~1–3 µs** after the 2026-08-16 `scanPrefixEntries` prefix iterator (RocksDB seek+stop / in-memory `subMap`). Snapshot-list rows that were not in that re-run use the same iterator and are shown in that class. See `raft-vs-zk-metadata-perf-analysis.md` §8.6. FetchMetadata async park (analysis §8.3 / §8.7) was re-measured the same day: it does not change store rows; warm Admin `getTableInfo` stayed **89 µs**. **2026-08-17 appendAll pipeline** (analysis §8.2 / §8.8): tables below use that re-run as canonical — store `registerPartition` **8768 µs**, Admin `createTable` **9309 µs**, store `registerTable` **8477 µs**. Pre-pipeline Raft 16993 / 24713 live in revision 3.17, not in the tables.
 
 | Metric | ZK Mode (measured, 1-node) | Raft Mode (3-voter NVMe *target*) | Conditions | Measured notes (this run) |
 |--------|----------------------------|-----------------------------------|------------|---------------------------|
 | Leader election time | ~5s (field, historical) | &lt;1s | 3 voters, `election.timeout=1s` | **Not in 1-node JMH.** `RaftLeaderElectionTimingITCase` (3-voter loopback): soft assert &lt;5s under CI; logs ms each run |
-| Metadata write latency (p50) | **4.8 ms** store `registerTable` | &lt;5ms | same-AZ, NVMe, majority fsync+RTT&lt;1ms | JMH AverageTime ≈ p50 on unimodal data: ZK **4815 µs/op**, Raft 1-voter **8582 µs/op** (`MetadataStoreBenchmark.metadataWrite`). 1-voter Raft still fsyncs the local log; 3-voter + RTT will be higher |
+| Metadata write latency (p50) | **4.7 ms** store `registerTable` | &lt;5ms | same-AZ, NVMe, majority fsync+RTT&lt;1ms | JMH AverageTime ≈ p50 on unimodal data: ZK **4733 µs/op**, Raft 1-voter **8477 µs/op** (`MetadataStoreBenchmark.metadataWrite`, 2026-08-17). 1-voter Raft still fsyncs the local log; 3-voter + RTT will be higher |
 | Metadata write latency (cross-AZ) | — | ~= majority RTT + fsync | bounded by physics | not measured |
 | Metadata read latency (leader, p50) | **102 µs** store `getTable` | &lt;1ms | leader-local KvStore read (5.7) | ZK **102 µs/op**, Raft **1.6 µs/op** (`MetadataStoreBenchmark.metadataRead`) — Raft is an in-process KvStore get |
 | Startup time (single node) | **99 ms** coordinator+ZK | &lt;10s (includes snapshot load) | coordinator + metadata backend, 0 tablet servers | ZK **99.3 ms**, Raft **194 ms** (`CoordinatorStartupBenchmark`, empty store; not a snapshot-reload case) |
@@ -2871,7 +2871,7 @@ export JAVA_HOME=/path/to/jdk-11
 
 #### JMH comparison (same machine, same flags)
 
-Score is JMH AverageTime (3 measurement iterations); ± is JMH 99.9% CI (wide with n=3 — treat as a point estimate). `@Fork(0)` reuses one store backend and one Admin cluster per backend for the JVM (avoids Ratis port leaks). Delete-style store rows include a preceding unique-key create unless noted. Raft point-reads of a single key are typically ~1 µs (in-process KvStore). Raft **prefix scans** (`list*`, `getPartitions`, `getCurrentSchemaId`, …) are **~1–3 µs** after the 2026-08-16 `scanPrefixEntries` prefix iterator (RocksDB seek+stop / in-memory `subMap`). Snapshot-list rows that were not in that re-run use the same iterator and are shown in that class. See `raft-vs-zk-metadata-perf-analysis.md` §8.6. FetchMetadata async park (analysis §8.3 / §8.7) was re-measured the same day: it does not change store rows; warm Admin `getTableInfo` stayed **89 µs**.
+Score is JMH AverageTime (3 measurement iterations); ± is JMH 99.9% CI (wide with n=3 — treat as a point estimate). `@Fork(0)` reuses one store backend and one Admin cluster per backend for the JVM (avoids Ratis port leaks). Delete-style store rows include a preceding unique-key create unless noted. Raft point-reads of a single key are typically ~1 µs (in-process KvStore). Raft **prefix scans** (`list*`, `getPartitions`, `getCurrentSchemaId`, …) are **~1–3 µs** after the 2026-08-16 `scanPrefixEntries` prefix iterator (RocksDB seek+stop / in-memory `subMap`). Snapshot-list rows that were not in that re-run use the same iterator and are shown in that class. See `raft-vs-zk-metadata-perf-analysis.md` §8.6. FetchMetadata async park (analysis §8.3 / §8.7) was re-measured the same day: it does not change store rows; warm Admin `getTableInfo` stayed **89 µs**. **2026-08-17 appendAll** (analysis §8.2 / §8.8): canonical `registerPartition` **8768 µs**, Admin `createTable` **9309 µs**, `registerTable` **8477 µs**.
 
 ##### Admin / RPC path (`MetadataPathBenchmark`, 1 coordinator + 1 tablet server)
 
@@ -2885,7 +2885,7 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 | `getDatabaseInfo` | 174 | 68 | |
 | `databaseExists` | 166 | 62 | |
 | `listDatabases` | 245 | 70 | Admin list |
-| `createTable` | 46581 | 24713 | full DDL (assignment + ISR + tablet RPC) |
+| `createTable` | 40293 | 9309 | full DDL; 8.2 `appendAll` after id alloc |
 | `alterTable` | 351 | 81 | set `client.connect-timeout` (idempotent after first) |
 | `dropTable` | 89312 | 43684 | create+drop |
 | `getTableInfo` | 421 | 89 | Warm cluster. Isolated first Admin read still **~105 ms** (`metadata.stream.max-wait=100ms`); async park does not shrink that wait |
@@ -2916,14 +2916,14 @@ Warm cluster (shared session). `createTable` / `dropTable` remain the heavy DDL 
 
 | Operation | ZK µs | Raft µs | Notes |
 |-----------|------:|--------:|-------|
-| `registerTable` (`metadataWrite`) | 4815 | 8582 | 1-voter local fsync; write path unchanged by prefix iterator |
+| `registerTable` (`metadataWrite`) | 4733 | 8477 | 1-voter local fsync; single append (appendAll does not apply) |
 | `updateTable` | 4669 | 8379 | |
 | `deleteTable` | 9373 | 16268 | create+delete |
 | `getTable` (`metadataRead`) | 102 | 1.6 | in-process KvStore get |
 | `getTables` | 107 | 1.6 | batch of 1 |
 | `tableExist` | 102 | 0.85 | |
 | `listTables` | 101 | 1.39 | |
-| `registerPartition` | 13973 | 16993 | assignment + metadata txn (2 keys) |
+| `registerPartition` | 14888 | 8768 | two independent keys, one apply wait |
 | `deletePartition` | 19131 | 24953 | create+delete metadata |
 | `getPartition` | 101 | 1.1 | |
 | `getPartitions` | 99 | 1.57 | |
@@ -3441,6 +3441,7 @@ A: Not in v1. Only the leader serves authoritative reads/writes (5.7); non-leade
 | 2026-08-16 | 3.14 | **§8.4 catalog = post-prefix-iterator numbers only.** Canonical JMH tables no longer present pre-patch Raft prefix ~330 µs or Admin `getTableInfo` 842 µs as current. Snapshot-list rows not in the evening re-run share `scanPrefixEntries` with list* (~1 µs class). 3.13 remains the patch history. |
 | 2026-08-16 | 3.15 | **FetchMetadata async park.** `MetadataStreamService.fetchAsync` + stream pool / timeout scheduler; apply thread only enqueues (`onApplied`). Netty workers no longer `wait(maxWaitMs)`. Analysis §8.3/§8.7. |
 | 2026-08-16 | 3.16 | **§8.4 Admin `getTableInfo` after async-park JMH.** Re-ran `MetadataPathBenchmark` (same short flags). Warm Raft **89 µs** (unchanged vs 3.14); ZK **421 µs** replaces 356. Isolated first Admin read still **~105 ms** — parking unblocks Netty workers, it does not shorten `max-wait`. Store list*/`getTable`/`registerTable` confirmed unchanged. |
+| 2026-08-17 | 3.17 | **appendAll pipeline (analysis §8.2).** `RaftJournalWriter.appendAll` + `RaftMetadataClient.appendAll`: N independent log entries, one apply wait. Wired `registerPartition` (2 keys) and `createTable` after `getTableIdAndIncrement`. No MultiOp type. Canonical §8.4 JMH: store `registerPartition` Raft **8768 µs** (was 16993); Admin `createTable` **9309 µs** (was 24713); `registerTable` **8477 µs** (catalog 8582, noise). ZK on those benches: **14888** / **40293** / **4733**. |
 
 ---
 

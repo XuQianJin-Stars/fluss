@@ -424,31 +424,19 @@ public class MetadataManager {
             }
         }
 
-        // register schema to zk
-        // first register a schema to the zk, if then register the table
-        // to zk fails, there's no harm to register a new schema to zk again
-        try {
-            zookeeperClient.registerFirstSchema(tablePath, tableToCreate.getSchema());
-        } catch (Exception e) {
-            throw new FlussRuntimeException(
-                    "Fail to register schema when creating table " + tablePath, e);
-        }
-
-        // register the table, we have registered the schema whose path have contained the node for
-        // the table, then we won't need to create the node to store the table
+        // Allocate tableId first so Raft ALLOCATE_ID_RANGE is applied before any record that
+        // embeds the id (no-reuse, §5.3.3). Then register schema + optional assignment + table
+        // together: ZooKeeper still writes sequentially; Raft pipelines independent log entries
+        // and waits once for apply (analysis §8.2). If the batch fails after schema is committed,
+        // re-registering schema on retry is harmless (same as today's ZK path).
         return uncheck(
                 () -> {
-                    // generate a table id
                     long tableId = zookeeperClient.getTableIdAndIncrement();
-                    if (tableAssignment != null) {
-                        // register table assignment
-                        zookeeperClient.registerTableAssignment(tableId, tableAssignment);
-                    }
-                    // register the table
-                    zookeeperClient.registerTable(
+                    zookeeperClient.registerTableSchemaAssignmentAndMetadata(
                             tablePath,
-                            TableRegistration.newTable(tableId, remoteDataDir, tableToCreate),
-                            false);
+                            tableToCreate.getSchema(),
+                            tableAssignment,
+                            TableRegistration.newTable(tableId, remoteDataDir, tableToCreate));
                     return tableId;
                 },
                 "Fail to create table " + tablePath);

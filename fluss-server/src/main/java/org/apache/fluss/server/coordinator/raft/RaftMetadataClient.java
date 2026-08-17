@@ -140,8 +140,10 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * #updateLeaderAndIsr} is not needed for correctness and is intentionally ignored here (a stale
  * leader's append is rejected by Ratis with {@code NotLeaderException}).
  *
- * <p><b>Thread rule (§5.6):</b> every mutating call does {@code writer.append(...).get()} on the
- * caller's (RPC / timer / id-allocation) thread, never on the Ratis apply loop.
+ * <p><b>Thread rule (§5.6):</b> mutating calls do {@code writer.append(...).get()} or {@code
+ * writer.appendAll(...).get()} on the caller's (RPC / timer / id-allocation) thread, never on the
+ * Ratis apply loop. Multi-key DDL uses {@link #appendAll} so independent log entries share one
+ * apply wait (analysis §8.2).
  *
  * <p>This client is constructed with its already-built Raft components (dependency-injected); the
  * factory that bootstraps the full Raft stack from {@code Configuration} and wires it into {@code
@@ -338,8 +340,8 @@ public class RaftMetadataClient implements MetadataStoreClient {
      *
      * <p><b>Peer-id convention:</b> a voter's {@link RaftPeerId} is derived from its address as
      * {@code host_port} (the {@code ':'} replaced by {@code '_'}), while the {@link RaftPeer} keeps
-     * the real {@code host:port} transport address. {@code coordinator.raft.node.id} names the local
-     * node's {@code host:port} (see {@link #resolveLocalPeerId}).
+     * the real {@code host:port} transport address. {@code coordinator.raft.node.id} names the
+     * local node's {@code host:port} (see {@link #resolveLocalPeerId}).
      */
     private static RaftGroup resolveRaftGroup(Configuration conf) {
         String votersCsv = conf.getOptional(ConfigOptions.COORDINATOR_RAFT_VOTERS).orElse(null);
@@ -1142,6 +1144,41 @@ public class RaftMetadataClient implements MetadataStoreClient {
     }
 
     /**
+     * Registers first schema, optional assignment, and table as independent log entries, waiting
+     * once for apply. {@code tableRegistration.tableId} must already have been allocated (and any
+     * {@code ALLOCATE_ID_RANGE} applied) by the caller.
+     */
+    @Override
+    public void registerTableSchemaAssignmentAndMetadata(
+            TablePath tablePath,
+            Schema schema,
+            @Nullable TableAssignment tableAssignment,
+            TableRegistration tableRegistration)
+            throws Exception {
+        List<MetadataRecord> records = new ArrayList<>();
+        records.add(
+                new MetadataRecord(
+                        MetadataRecord.Type.REGISTER_SCHEMA,
+                        schemaKeyBytes(tablePath, DEFAULT_SCHEMA_ID),
+                        schema.toJsonBytes()));
+        if (tableAssignment != null) {
+            records.add(
+                    new MetadataRecord(
+                            MetadataRecord.Type.UPDATE_TABLE_ASSIGNMENT,
+                            longToBytes(tableRegistration.tableId),
+                            JsonSerdeUtils.writeValueAsBytes(
+                                    tableAssignment, TableAssignmentJsonSerde.INSTANCE)));
+        }
+        records.add(
+                new MetadataRecord(
+                        MetadataRecord.Type.REGISTER_TABLE,
+                        tablePathBytes(tablePath),
+                        JsonSerdeUtils.writeValueAsBytes(
+                                tableRegistration, TableRegistrationJsonSerde.INSTANCE)));
+        appendAll(records);
+    }
+
+    /**
      * Deletes a table registration.
      *
      * <p>Also deletes partition and schema registrations under this path first, mirroring {@code
@@ -1378,12 +1415,13 @@ public class RaftMetadataClient implements MetadataStoreClient {
 
     /**
      * Registers a partition's assignment (keyed by partition id) and its metadata (keyed by name),
-     * mirroring {@code ZooKeeperClient.registerPartitionAssignmentAndMetadata}. ZooKeeper did this
-     * in one multi-op transaction; on Raft the two records are appended in order with the
-     * name-keyed REGISTER_PARTITION written LAST, so a crash between the two appends leaves at most
-     * an orphan assignment but never a partition visible to {@link #getPartition}/{@link
-     * #getPartitions} without its assignment. (A single composite record would make this atomic; it
-     * is a possible future hardening but not required for reader-visible consistency.)
+     * mirroring {@code ZooKeeperClient.registerPartitionAssignmentAndMetadata}. ZooKeeper does this
+     * in one multi-op transaction. Raft sends two independent log entries (assignment, then
+     * name-keyed {@code REGISTER_PARTITION}) and waits once for both to apply (analysis §8.2).
+     *
+     * <p>{@code REGISTER_PARTITION} is still last, so a reader never sees a partition without its
+     * assignment. If a later entry fails, Ratis may already have committed a prefix (orphan
+     * assignment, same as a crash between today's serial appends).
      */
     public void registerPartitionAssignmentAndMetadata(
             long partitionId,
@@ -1393,22 +1431,25 @@ public class RaftMetadataClient implements MetadataStoreClient {
             TablePath tablePath,
             long tableId)
             throws Exception {
-        requireLeader();
         byte[] assignmentPayload =
                 JsonSerdeUtils.writeValueAsBytes(
                         partitionAssignment, PartitionAssignmentJsonSerde.INSTANCE);
-        append(
-                MetadataRecord.Type.UPDATE_PARTITION_ASSIGNMENT,
-                longToBytes(partitionId),
-                assignmentPayload);
         byte[] registrationPayload =
                 JsonSerdeUtils.writeValueAsBytes(
                         new PartitionRegistration(tableId, partitionId, remoteDataDir),
                         PartitionRegistrationJsonSerde.INSTANCE);
-        append(
-                MetadataRecord.Type.REGISTER_PARTITION,
-                partitionKeyBytes(tablePath, partitionName),
-                registrationPayload);
+        List<MetadataRecord> records = new ArrayList<>(2);
+        records.add(
+                new MetadataRecord(
+                        MetadataRecord.Type.UPDATE_PARTITION_ASSIGNMENT,
+                        longToBytes(partitionId),
+                        assignmentPayload));
+        records.add(
+                new MetadataRecord(
+                        MetadataRecord.Type.REGISTER_PARTITION,
+                        partitionKeyBytes(tablePath, partitionName),
+                        registrationPayload));
+        appendAll(records);
     }
 
     /** Deletes a partition's metadata record (its assignment is removed separately by id). */
@@ -2534,6 +2575,25 @@ public class RaftMetadataClient implements MetadataStoreClient {
         // append resolves after commit+local-apply; NO separate store.apply (single-writer,
         // §5.1.4).
         writer.append(new MetadataRecord(type, key, payload)).get();
+    }
+
+    /**
+     * Sends {@code records} as independent log entries and waits once for apply. {@link
+     * #requireLeader()} is taken once for the batch. If any entry fails, a prefix of the batch may
+     * already be committed (see {@link RaftJournalWriter#appendAll}).
+     */
+    private void appendAll(List<MetadataRecord> records) throws Exception {
+        requireLeader();
+        try {
+            writer.appendAll(records).get();
+        } catch (Exception e) {
+            LOG.error(
+                    "Batched metadata append of {} independent log entries failed; "
+                            + "a prefix of the batch may already be committed and applied.",
+                    records.size(),
+                    e);
+            throw e;
+        }
     }
 
     private static byte[] coordinatorLeaderKey() {

@@ -19,11 +19,11 @@
 
 | 字段 | 内容 |
 |------|------|
-| **性质** | 分析报告。§8 是代码级实现指南；**8.4 prefix iterator 与 8.3 FetchMetadata 异步停车已落地**，其余仍是 sketch。 |
-| **对照设计文档** | [`zookeeper-removal-design.md`](zookeeper-removal-design.md) **§8.4**（v3.16，2026-08-16 FetchMetadata async JMH 复跑） |
+| **性质** | 分析报告。§8 是代码级实现指南；**8.4 prefix iterator、8.3 FetchMetadata 异步停车、8.2 appendAll pipeline 已落地**；8.1 仍是 sketch。 |
+| **对照设计文档** | [`zookeeper-removal-design.md`](zookeeper-removal-design.md) **§8.4**（v3.17，2026-08-17 appendAll pipeline JMH） |
 | **分支** | `feature/zookeeper-removal-raft` |
-| **测量日期** | 2026-08-16 |
-| **结论一句话** | 在 1-voter loopback 上，Raft **单条 durable 写**大约是 ZK TestingServer 的 **1.7–1.8×**（`registerTable` 4815µs vs 8582µs）。这不是「Raft 实现写坏了」，而是 **每条写都走完整 commit-apply 流水线 + 空队列立即 fsync + `.get()` 等到本地 apply**；读路径和 block 分配 ID 反而更快。**不能把这组数字外推到 3 节点跨 AZ 生产集群。** |
+| **测量日期** | 2026-08-16 catalog；**2026-08-17** 复跑 `registerPartition` / Admin `createTable` / `metadataWrite` 对照 |
+| **结论一句话** | 在 1-voter loopback 上，Raft **单条 durable 写**大约是 ZK TestingServer 的 **1.7–1.8×**（`registerTable` 4815µs vs 8582µs；2026-08-17 复跑 4733 / **8477**）。多 key DDL 在 8.2 `appendAll` 后不再串行 `.get()`：`registerPartition` Raft **8768µs**（原 16993）；Admin `createTable` **9309µs**（原 24713）。这不是「Raft 实现写坏了」，而是 **每条写都走完整 commit-apply 流水线 + 空队列立即 fsync + `.get()` 等到本地 apply**；读路径和 block 分配 ID 反而更快。**不能把这组数字外推到 3 节点跨 AZ 生产集群。** |
 
 本文只解释 **JMH 里 Raft 明显更慢的那些操作**，并附「Raft 更快」对照，避免把 catalog 读成「Raft 全面更慢」。
 
@@ -73,13 +73,13 @@
 | **ID** | `SequenceIdAllocationBenchmark` | ZK 1:1 CAS vs Raft `blockSize=1` vs `blockSize=64` |
 | **启动** | `CoordinatorStartupBenchmark` | 0 tablet；`FlussClusterExtension.start()` 等到 leader 可服务 |
 
-**读 catalog 时：** `createTable` Raft 更快（24.7ms vs 46.6ms）**不能**用来否定 `registerTable` Raft 更慢（8.6ms vs 4.8ms）。前者被 tablet DDL 主导，后者才是共识写。
+**读当前数字时：** `createTable` Raft 更快（**9309µs** vs ZK **40293µs**）**不能**用来否定 `registerTable` Raft 更慢（8.5ms vs 4.7ms）。前者被 tablet DDL 主导，后者才是共识写。
 
 ---
 
 ## 2. 哪些操作 Raft 更慢
 
-判定：「明显更慢」= Raft/ZK ≳ **1.3×**，或绝对差 ≳ **1ms**（写）/ ≳ **200µs**（读）。数字全部来自 §8.4 2026-08-16 catalog。
+判定：「明显更慢」= Raft/ZK ≳ **1.3×**，或绝对差 ≳ **1ms**（写）/ ≳ **200µs**（读）。单 key 写带是 §8.4 2026-08-16 catalog；`registerPartition` / Admin `createTable` 是 **2026-08-17** `appendAll` 复跑（§8.8）。
 
 ### 2.1 Store-level：单 key durable 写（共识热路径）
 
@@ -119,7 +119,7 @@ JMH 的 delete 行 **包含前面的 unique-key create**（`MetadataStoreBenchma
 |------|------:|--------:|--------:|----------------|
 | `deleteDatabase` | 9827 | 17731 | 1.80× | create+delete ≈ 2× 单写 |
 | `deleteTable` | 9373 | 16268 | 1.74× | create + `deleteTable` 先扫 schema/partition 再逐条 append |
-| `registerPartition` | 13973 | 16993 | 1.22× | Raft **两次串行 append**（assignment 然后 metadata）；ZK 一次 `transaction()` |
+| `registerPartition` | **14888** | **8768** | **0.59×** | 8.2 `appendAll`：两 key 一次 apply wait（落地前 13973 / 16993 / 1.22×） |
 | `deletePartition` | 19131 | 24953 | 1.30× | create（2 append）+ delete |
 | `deleteTableAssignment` | 9626 | 25441 | 2.64× | create + 级联 `DELETE_LEADER_AND_ISR`（每个 bucket 一条）+ `DELETE_TABLE_ASSIGNMENT` |
 | `deletePartitionAssignment` | 19557 | 32866 | 1.68× | 先 `registerPartitionAssignmentAndMetadata`（2 append）再删 assignment |
@@ -132,7 +132,7 @@ JMH 的 delete 行 **包含前面的 unique-key create**（`MetadataStoreBenchma
 | `deleteProducerSnapshotIfVersion` | 9431 | 16597 | 1.76× | |
 | `deleteTableBucketSnapshot` | 9355 | 16535 | 1.77× | |
 
-`registerPartition` 的倍数只有 1.22×，是因为 ZK 这条本身就贵（父节点 create + 2-op transaction，13973µs），Raft 两次 8.5ms append 叠成 ~17ms，差距被 ZK 的「已经很慢」缩小。语义上 Raft 仍然更吃亏：**ZK 一次 round-trip 提交两 key，Raft 两次 commit-apply**。
+`registerPartition` 在 8.2 落地前倍数只有 1.22×，是因为 ZK 这条本身就贵（父节点 create + 2-op transaction，~14ms），Raft 两次 8.5ms append 叠成 ~17ms。**2026-08-17 `appendAll` 后 Raft 8768µs**，落到单条 append 带，并快于本次 ZK 复跑 14888µs。语义上仍不是 ZK 那样的 multi-op 原子事务：两条独立 log entry，失败时 Ratis 可能已经 commit 了前缀。
 
 ### 2.3 Store-level：前缀扫描读
 
@@ -165,7 +165,7 @@ JMH 的 delete 行 **包含前面的 unique-key create**（`MetadataStoreBenchma
 | `dropDatabase` | 11382 | 16338 | 1.44× | 接近 store create+delete |
 | **`getTableInfo`** | **421**（warm） | **89**（warm） | **0.21×** | prefix iterator 后 Raft 更快。§8.3 异步停车 **没有**再缩短 warm 路径（仍 89µs）。孤立第一条 Admin 读仍叠夹具 `max-wait=100ms`（本次 **104749µs**） |
 
-Admin 写里，只有「几乎等于一次 metadata store 写」的 database DDL 跟着共识变慢。`createTable` 24.7ms vs 46.6ms 已经不是共识在主导。
+Admin 写里，只有「几乎等于一次 metadata store 写」的 database DDL 跟着共识变慢。`createTable` **9309µs** vs **40293µs**（8.2 `appendAll` 后）已经不是共识在主导。
 
 ### 2.5 启动与 1:1 ID
 
@@ -184,7 +184,7 @@ Admin 写里，只有「几乎等于一次 metadata store 写」的 database DDL
 
 | 操作 | ZK µs | Raft µs | 说明 |
 |------|------:|--------:|------|
-| `createTable` | 46581 | 24713 | 全量 DDL：assignment + ISR + tablet RPC |
+| `createTable` | 40293 | **9309** | 全量 DDL。8.2 把 schema+assignment+table 收成一次 apply wait（catalog Raft 24713）。ZK 40293 vs catalog 46581 是本次复跑，不是 ZK 代码改动 |
 | `dropTable` | 89312 | 43684 | create+drop |
 | `createPartition` | 28827 | 16999 | 1-bucket partitioned log |
 | `dropPartition` | 57902 | 26147 | |
@@ -628,7 +628,7 @@ ZK 每个 id 一次 CAS（~5ms）。Raft 一次 `ALLOCATE_ID_RANGE` append（~8m
 
 ### 5.4 重 DDL 为什么 Raft 可以更快
 
-`createTable` 46ms vs 25ms：共识写只占其中一次（或几次）8ms 级 append，其余是 tablet 建副本、ISR、RPC。ZK 模式 tablet 靠 ZK watch / 多次 znode；Raft 模式 metadata stream + 更少的父节点 create。`listPartitionInfos` 18.5ms vs 0.5ms 更极端：ZK 树走访 vs 本地结构。
+`createTable` **40293µs** vs **9309µs**：8.2 把 schema+assignment+table 收成一次 apply wait（落地前 Raft 24713µs）；其余是 tablet 建副本、ISR、RPC。ZK 模式 tablet 靠 ZK watch / 多次 znode；Raft 模式 metadata stream + 更少的父节点 create。`listPartitionInfos` 18.5ms vs 0.5ms 更极端：ZK 树走访 vs 本地结构。
 
 **用户可感知的建表，本次 1-node JMH 上 Raft 并不慢。** 慢的是 **纯 metadata store 写** 和 **database 这种几乎等于纯 store 写的 Admin API**。
 
@@ -654,10 +654,10 @@ ZK 每个 id 一次 CAS（~5ms）。Raft 一次 `ALLOCATE_ID_RANGE` append（~8m
 
 1. **Raft 输在「单条 durable 元数据写」和「把 Raft 当 1:1 CAS」。** `registerTable` 4815µs vs 8582µs 是代表性数字；同带上几乎所有单 append 写都是 ~1.7×。  
 2. **根因是设计内的：** 纯 commit-apply、每条写 `awaitApplied`、Ratis 空队列立即 fsync、gRPC 即使 loopback、apply 再写 RocksDB。不是漏了索引或「实现比 ZK 拙劣一截」那么简单。  
-3. **Raft 赢在点读、block ID、以及被 tablet DDL 主导的 `createTable`/`dropTable`。** 用 Admin 建表数字说「Raft 更快」或用 store `registerTable` 说「Raft 不能用」，都是错的层。  
+3. **Raft 赢在点读、block ID、以及被 tablet DDL 主导的 `createTable`/`dropTable`。** 当前 Admin `createTable` Raft **9309µs** vs ZK **40293µs**。用建表数字说「Raft 更快」或用 store `registerTable` 说「Raft 不能用」，都是错的层。  
 4. **`getTableInfo` 曾慢是读路径实现（全表 `entries()`），不是 fsync。** prefix iterator 落地后 warm Raft **89µs** &lt; ZK **421µs**。§8.3 异步停车后再测：warm **仍 89µs**（没有变快）；孤立冷跑 **仍 ~105ms**（`metadata.stream.max-wait=100ms`）。停车只是不占 Netty worker，不缩短 wait。  
 5. **1-node JMH 不能验收 §8.4 的 3-voter NVMe 目标（写 p50 &lt;5ms）。** 1-voter 已经 8.6ms；3-voter 同 AZ 若 RTT+fsync 做得好，有可能回到 5ms 附近，**需要另测**；跨 AZ 由物理 RTT 决定。  
-6. **生产 Java 仍未改。** 代码级怎么改见 **§8**（prefix iterator、FetchMetadata 异步停车、writer pipeline、`async-flush`；明确禁止 `unsafe-flush`）。任何一项都有正确性或运维代价。
+6. **8.2 / 8.3 / 8.4 已落地**（JMH 见 §8.6–§8.8）；写路径还剩 **8.1 `async-flush`**。明确禁止 `unsafe-flush`。任何一项都有正确性或运维代价。
 
 ### 7.2 建议的生产对齐测法（只建议，不改仓库）
 
@@ -676,17 +676,17 @@ ZK 每个 id 一次 CAS（~5ms）。Raft 一次 `ALLOCATE_ID_RANGE` append（~8m
 
 在那套数字出来之前，唯一站得住的说法是：
 
-> 在 2026-08-16 的 1-voter loopback JMH 上，Raft 单条 metadata 写约为 ZK TestingServer 的 1.7×（8.6ms vs 4.8ms）；点读和默认块分配 ID 明显更快；完整 `createTable` 在该环境反而 Raft 更快。这不能证明生产 3-voter 已经达标或未达标。
+> 在 2026-08-16 catalog、**2026-08-17** `appendAll` 复跑的 1-voter loopback JMH 上，Raft 单条 metadata 写约为 ZK TestingServer 的 1.7×（8.5ms vs 4.7ms）；点读和默认块分配 ID 明显更快；完整 `createTable` Raft **9309µs** vs ZK **40293µs**，`registerPartition` Raft **8768µs** vs ZK **14888µs**。这不能证明生产 3-voter 已经达标或未达标。
 
 ---
 
 ## 8. 代码级实现指南
 
-本节把 §4 / §7.1 的推论落到 **具体类、方法和可编译的 Java 8 patch sketch**。**8.4 与 8.3 已落地**；8.1 / 8.2 仍是 sketch。验证走现有 JMH（`MetadataStoreBenchmark` / `MetadataPathBenchmark`，`@Threads(1)` AverageTime µs/op），并标明哪一行会动、哪一行根本动不了。
+本节把 §4 / §7.1 的推论落到 **具体类、方法和可编译的 Java 8 patch sketch**。**8.4、8.3、8.2 已落地**；8.1 仍是 sketch。验证走现有 JMH（`MetadataStoreBenchmark` / `MetadataPathBenchmark`，`@Threads(1)` AverageTime µs/op），并标明哪一行会动、哪一行根本动不了。
 
 约束与现有代码一致：源码 Java 8（禁止 `var` / `List.of` / `Stream.toList`）；shaded Ratis 包名 `org.apache.fluss.shaded.ratis.org.apache.ratis.*`；apply 线程规则见设计文档 **§5.6**。
 
-落地顺序：**8.4 prefix iterator（S，已落地）→ 8.3 FetchMetadata 异步停车（M，已落地）→ 8.1 仅 `async-flush` 属性（S）+ 8.2 writer pipeline（M）**。不要先开 `unsafe-flush`。不要先加 `MULTI_OP` 记录类型（见 8.2.3）。
+落地顺序：**8.4 prefix iterator（S，已落地）→ 8.3 FetchMetadata 异步停车（M，已落地）→ 8.2 writer pipeline（M，已落地）→ 8.1 仅 `async-flush` 属性（S）**。不要先开 `unsafe-flush`。不要先加 `MULTI_OP` 记录类型（见 8.2.3）。
 
 ---
 
@@ -810,7 +810,7 @@ RaftServerConfigKeys.Log.setAsyncFlushEnabled(p, true);
 | | |
 |--|--|
 | **工作量** | **S**（只加 `setAsyncFlushEnabled` + 一项 IT 确认 1-voter 仍能选主、写后读）。Pipeline 见 8.2，**M**。 |
-| **JMH** | `MetadataStoreBenchmark.metadataWrite` / `registerTable` / `updateTable` / `registerDatabase`：**不要预期** `@Threads(1)` 有显著下降。`MetadataPathBenchmark.createTable`：属性单独改 **几乎不动**（24.7ms 被 tablet DDL 主导；其中 3 次 store append 仍串行 `.get()`）。 |
+| **JMH** | `MetadataStoreBenchmark.metadataWrite` / `registerTable` / `updateTable` / `registerDatabase`：**不要预期** `@Threads(1)` 有显著下降。`MetadataPathBenchmark.createTable`：属性单独改 **几乎不动**（现 **9309µs**，8.2 已把 3 次 store append 收成一次 wait；`async-flush` 不改变 `@Threads(1)` `.get()`）。 |
 | **生产风险** | `async-flush`：低–中（Ratis 支持的安全重叠；需 3-voter 看 commit 延迟与 flush 线程异常路径）。`unsafe-flush`：**不可接受**（静默丢元数据）。 |
 
 现有 JMH 命令（不改 JMH 源码）：
@@ -825,6 +825,8 @@ RaftServerConfigKeys.Log.setAsyncFlushEnabled(p, true);
 ---
 
 ### 8.2 一次 DDL 内 pipeline / 批量多条 metadata record
+
+**已落地（2026-08-17）。** `RaftJournalWriter.appendAll` 对 N 条独立 log entry FIFO `append` 后 `allOf` 一次 apply wait。`RaftMetadataClient`：`registerPartitionAssignmentAndMetadata`（两 key）和 `registerTableSchemaAssignmentAndMetadata`（schema + 可选 assignment + table）。`MetadataManager.createTable` 先 `getTableIdAndIncrement()`（`ALLOCATE_ID_RANGE` 必须先 apply），再调 batched register。ZooKeeper 走接口 default：仍逐步 `registerFirstSchema` / `registerTableAssignment` / `registerTable`，没有 `appendAll`。无新 `Type.MULTI_OP`。失败时异常写明「prefix may already be committed」。JMH 见 **§8.8**。
 
 #### 8.2.1 当前调用链：`createTable` 四步，每步一次同步写
 
@@ -886,7 +888,7 @@ RaftServerConfigKeys.Log.setAsyncFlushEnabled(p, true);
 
 依赖：步骤 3/4 需要步骤 2 的 `tableId`。步骤 1 与 2 **无数据依赖**（schema 键是 `tablePath`，不是 `tableId`）。ZK 注释已写明：schema 先注册、表后失败「再注册一次 schema 无害」—— **今天的 createTable 也不是原子事务**。
 
-`registerPartition` 同构：JMH 注明「assignment + metadata txn (2 keys)」，Raft 16993µs ≈ 两次 8.5ms append。
+`registerPartition` 同构：JMH 注明「assignment + metadata txn (2 keys)」。落地前 Raft **16993µs** ≈ 两次 8.5ms append；**落地后见 §8.8（8768µs）**。
 
 #### 8.2.2 现有 `MetadataRecord.Type`：没有 MultiOp / batch
 
@@ -955,7 +957,7 @@ private void appendAll(List<MetadataRecord> records) throws Exception {
 | | |
 |--|--|
 | **工作量** | **M**（writer + client API + `createTable`/`registerPartition` 接线 + 失败部分提交测试）。`MULTI_OP` 是 **L**，不建议作为 perf PR。 |
-| **JMH** | `MetadataPathBenchmark.createTable`：store 部分从 ~3 次 8.5ms 串行 fsync 变成 ~1 次；绝对值仍被 tablet ISR 主导，可能从 24.7ms 掉几个 ms，**不要预期腰斩**。`MetadataStoreBenchmark.registerPartition`（16993µs）：两 key → 一次 flush，**最干净的 batch 验收行**。`registerFirstSchema`+`registerTable` 各自单行 **不变**（仍是一条 append）。`metadataWrite` **不变**。 |
+| **JMH** | 落地后实测见 **§8.8**：`registerPartition` Raft **8768µs**（原 16993）；Admin `createTable` **9309µs**（原 24713，比「掉几个 ms」预期更深）；`metadataWrite` **8477µs**（单条，噪声内 vs catalog 8582）。`registerFirstSchema`+`registerTable` 各自单行 **不变**（仍是一条 append）。 |
 | **生产风险** | 中。部分失败语义与今天 ZK 相同（schema 可能留下）；pipeline 后失败窗口更短但诊断要按「一批」来。Ratis 客户端对同 group 的有序 `async().send` 必须保持 FIFO（Ratis 默认 ordered stream）。IT：`RaftMetadataClientITCase` 建表后 `getTable` / `getSchemaById` / assignment 三件套仍可见。 |
 
 ```bash
@@ -1230,12 +1232,12 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 | # | 优化 | 工作量 | 现有 JMH 上预期 | 生产风险 | 不要做的事 |
 |---|------|--------|-----------------|----------|------------|
 | 8.1 属性 | `async-flush=true` | **S** | `metadataWrite` **基本不变** | 低–中 | **`unsafe-flush`**；幻想调 `force.sync.num` 修好串行 `.get()` |
-| 8.1+8.2 writer | `appendAll` pipeline | **M** | `registerPartition` 接近腰斩；`createTable` 掉数 ms；`metadataWrite` 仍单条 | 中（部分失败窗口） | apply 上 `.get()`；未 apply 的 id 外泄 |
+| 8.1+8.2 writer | `appendAll` pipeline | **M** | `registerPartition` Raft **8768µs**（原 16993）；Admin `createTable` **9309µs**（原 24713）；`metadataWrite` **8477µs**（单条） | 中（部分失败窗口） | apply 上 `.get()`；未 apply 的 id 外泄 |
 | 8.2 MultiOp 类型 | 新 `Type` + codec | **L** | 与 pipeline 同类，额外原子性 | 高（混版本 / stream） | 当 perf 第一刀 |
 | 8.3 FetchMetadata async | future + scheduler | **M** | **无直接 JMH 行**；`getTableInfo` warm 仍 89µs，孤立仍 ~105ms | 中（双 complete / apply 误 complete） | 在 apply 线程 `complete` RPC 或扫 log |
 | 8.4 prefix iterator | `KvStore.scanPrefixEntries` | **S** | 所有 ~330µs prefix 行；`getTableInfo` 主修复 | **低** | 继续用 `entries()` 做 list |
 
-**已落地：8.4 prefix iterator（§8.6）+ 8.3 FetchMetadata async（§8.7）。** 8.4 救 store list* / warm `getTableInfo`；8.3 让 tablet long-poll 不再占满 8 个 Netty worker（**不**缩短 `max-wait`，warm `getTableInfo` 仍 89µs）。写路径仍先 pipeline（8.2）再考虑 `async-flush`（8.1）；**永远不要**为分数打开 `unsafe-flush`。
+**已落地：8.4 prefix iterator（§8.6）+ 8.3 FetchMetadata async（§8.7）+ 8.2 appendAll pipeline（§8.8）。** 8.4 救 store list* / warm `getTableInfo`；8.3 让 tablet long-poll 不再占满 8 个 Netty worker；8.2 让一次 DDL 内多 key 只等一次 apply（`registerPartition` / `createTable`）。写路径再考虑 `async-flush`（8.1）；**永远不要**为分数打开 `unsafe-flush`。
 
 ---
 
@@ -1307,13 +1309,31 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 
 ---
 
+### 8.8 Third-cut：appendAll pipeline（2026-08-17）
+
+实现：`RaftJournalWriter.appendAll` 发出 N 条独立 log entry，然后一次 `allOf` 等到全部 local apply。`RaftMetadataClient.registerPartitionAssignmentAndMetadata` 两 key；`registerTableSchemaAssignmentAndMetadata` 在 id 已分配之后 pipeline schema + 可选 assignment + table。`MetadataManager.createTable` 先 `getTableIdAndIncrement()`。ZooKeeper 用接口 default，逐步写，无 `appendAll`。无新 `MetadataRecord.Type`。
+
+**Flags：** warmup 2×1s，measurement 3×1s，`@Fork(0)`，1 thread，AverageTime µs/op。JAVA_HOME = TencentKona 11.0.23。只复跑会动的行 + `metadataWrite` 对照。
+
+| 操作 | ZK catalog | ZK 复跑 | Raft before | Raft after | 说明 |
+|------|----------:|--------:|------------:|-----------:|------|
+| store `registerPartition` | 13973 | **14888** | 16993 | **8768** | 两 key → 一次 apply wait，落到单 append 带 |
+| Admin `createTable` | 46581 | **40293** | 24713 | **9309** | schema+assignment+table 一次 wait；ZK 降幅是复跑噪声，不是 ZK 代码 |
+| store `metadataWrite`（`registerTable`） | 4815 | **4733** | 8582 | **8477** | **单条 append，不应动**；噪声内 |
+
+诚实结论：`registerPartition` 接近腰斩并快于 ZK transaction。Admin `createTable` 掉了约 15ms（三次串行 ~8.5ms store 写收成一次），仍含 tablet ISR/RPC，但本机这次 store 占比比 catalog 更大。**`metadataWrite` 没有变快。** `createPartition` Admin / `deletePartition` store 未复跑，不要把 8768 填进那些行。
+
+验收：`RaftJournalWriterTest`、`RaftMetadataClientAppendAllTest`、`MetadataManagerCreateTableTest`、`RaftMetadataClientITCase`（含 batched create/partition + 既有 surface）。
+
+---
+
 ## 附录：关键代码索引
 
 | 主题 | 位置 |
 |------|------|
 | 实测表 | `zookeeper-removal-design.md` §8.4 |
 | JMH | `fluss-jmh/src/test/java/org/apache/fluss/jmh/MetadataStoreBenchmark.java` 等 |
-| Raft 写 | `RaftMetadataClient.append`、`RaftJournalWriter.append`、`FlussMetadataStateMachine.applyTransaction` |
+| Raft 写 | `RaftMetadataClient.append` / `appendAll`、`RaftJournalWriter.append` / `appendAll`、`FlussMetadataStateMachine.applyTransaction` |
 | Ratis 属性 | `RaftMetadataServer.buildRaftProperties`（未设 force.sync / async-flush / unsafe-flush） |
 | Ratis flush 默认 | Apache Ratis 2.4.1 `Log.FORCE_SYNC_NUM_DEFAULT=128`；`ASYNC_FLUSH_ENABLED_DEFAULT=false`；`UNSAFE_FLUSH_ENABLED_DEFAULT=false`；`SegmentedRaftLogWorker.shouldFlush` |
 | ZK 写 | `ZooKeeperClient.registerTable` |
@@ -1323,4 +1343,4 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 | stream max-wait | `ConfigOptions.COORDINATOR_METADATA_STREAM_MAX_WAIT`（默认 500ms；IT/JMH 集群 100ms） |
 | FetchMetadata 停车（已落地） | `MetadataStreamRpcServer.fetchMetadata` → `MetadataStreamService.fetchAsync`；timeout scheduler + metadata-stream pool；`onApplied` 只 enqueue（§8.7） |
 | Prefix iterator（已落地） | `MetadataKvStore.scanPrefixEntries`；`RaftMetadataStore` 委托；JMH before/after 见 **§8.6** |
-| 实现指南 | 本文 **§8**（8.3 / 8.4 已落地，其余仍是 sketch） |
+| 实现指南 | 本文 **§8**（8.2 / 8.3 / 8.4 已落地；8.1 仍是 sketch） |

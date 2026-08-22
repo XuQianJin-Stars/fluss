@@ -156,4 +156,4 @@ Fluss can be deployed in several ways:
 
 **NOTE**:
 - Local Cluster is for testing purpose only.
-- Raft is the default metadata backend; ZooKeeper is deprecated.
+- Raft requires `coordinator.seed.nodes`; ZooKeeper requires `zookeeper.address`. Setting neither or both fails at startup.

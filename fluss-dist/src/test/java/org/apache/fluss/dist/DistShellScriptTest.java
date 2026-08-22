@@ -47,6 +47,8 @@ final class DistShellScriptTest {
         String script = readBinScript("local-cluster.sh");
         assertThat(script).contains("Skipping ZooKeeper");
         assertThat(script).contains("zookeeper.address");
+        assertThat(script).contains("coordinator.seed.nodes");
+        assertThat(script).contains("Set exactly one of");
     }
 
     @Test

@@ -25,7 +25,7 @@
 | **§5.4.2 TabletServer liveness** (ZK ephemeral parity) | **Done** | Heartbeat lease + leadership `seedRegisteredServers` + controlled-shutdown `fenceImmediately`; `MetadataUpdateITCase` on Raft |
 | **§6.2 Phase 2** (Testing) | **Done** | Raft test clusters + dual-backend + chaos/perf ITs in-repo |
 | **§6.2 Phase 4** (Preview docs) | **Done** | Website Raft deploy + feedback channel; Apache RC = release process |
-| **§6.2 Phase 5** (Raft as default) | **Done** | Neither-key default = **RAFT**; ZK deprecated; migration guides published |
+| **§6.2 Phase 5** (Raft as default) | **Superseded** | Neither-key no longer defaults to RAFT: **fail-fast** if neither `zookeeper.address` nor `coordinator.seed.nodes` is set. Raft is opt-in via seed nodes. |
 | **§6.2 Phase 6** (delete ZK) | **Not started** | ZK mode still supported (deprecated); shaded ZK + znode path remain |
 | **§5.9–5.12 / §9.4 extras** | **Done** | TLS, metrics, RocksDB KvStore, metadata.version, add/remove-voter, unsafe-recover |
 | **Gossip / liveMigration / `--watch`** | **Done** | §5.4.4 gossip; §6.3 `LiveMigrator`; `fluss raft status --watch` |
@@ -1787,9 +1787,10 @@ public class RaftMetadataClient implements MetadataStoreClient {
 
 New file: `fluss-server/src/main/java/org/apache/fluss/server/metadata/MetadataBackend.java`
 
-> **Implemented (2026-08-08):** default is **RAFT** when neither key is set. Existing ZK clusters
-> must keep `zookeeper.address` set (and must **not** set `coordinator.seed.nodes`). Setting both
-> keys fails fast with `IllegalConfigurationException`.
+> **Implemented:** exactly one of `zookeeper.address` or `coordinator.seed.nodes` must be set.
+> Neither and both fail fast with `IllegalConfigurationException`. Existing ZK clusters
+> must keep `zookeeper.address` set (and must **not** set `coordinator.seed.nodes`). Raft is
+> opt-in via seed nodes.
 
 ```java
 public enum MetadataBackend {
@@ -1798,24 +1799,19 @@ public enum MetadataBackend {
 
     /**
      * Backend resolution. Prefer an explicit key: zookeeper.address → ZOOKEEPER,
-     * coordinator.seed.nodes → RAFT. Neither set → RAFT (current default on the Raft-removal
-     * branch). Both set → IllegalConfigurationException.
+     * coordinator.seed.nodes → RAFT. Neither or both → IllegalConfigurationException.
      */
     public static MetadataBackend from(org.apache.fluss.config.Configuration conf) {
         boolean hasZk = conf.getOptional(ConfigOptions.ZOOKEEPER_ADDRESS).isPresent();
         boolean hasRaft = conf.getOptional(ConfigOptions.COORDINATOR_SEED_NODES).isPresent();
-        if (hasZk && hasRaft) {
+        if (hasZk == hasRaft) {
             throw new IllegalConfigurationException(
                     "Set exactly one of zookeeper.address or coordinator.seed.nodes.");
         }
         if (hasRaft) {
             return RAFT;
         }
-        if (hasZk) {
-            return ZOOKEEPER;
-        }
-        // Neither set: Raft is the default (Phase 5 / §9.1 Next Major behavior on this branch).
-        return RAFT;
+        return ZOOKEEPER;
     }
 }
 ```
@@ -1837,8 +1833,7 @@ flowchart TB
     CFG["Configuration"] --> MB["MetadataBackend.from"]
     MB -->|"zookeeper.address only"| ZK["ZOOKEEPER"]
     MB -->|"coordinator.seed.nodes only"| RAFT["RAFT"]
-    MB -->|"neither key"| RAFT
-    MB -->|"both keys"| ERR["IllegalConfigurationException"]
+    MB -->|"neither or both keys"| ERR["IllegalConfigurationException"]
     ZK --> ZKC["ZooKeeperClient + CoordinatorLeaderElection"]
     RAFT --> RMC["RaftMetadataClient + RaftLeaderSelector"]
     ZKC --> IFACE["MetadataStoreClient"]
@@ -2178,7 +2173,8 @@ stream-subscriber lag remain follow-ups.
 
 > **Status (2026-08-08): implemented** on `feature/zookeeper-removal-raft`. Selector is
 > `MetadataBackend.from(Configuration)` (not the illustrative `MetadataBackendConfig` sketch below).
-> Default is **RAFT** when neither key is set; see §5.5.4.
+> Exactly one of `zookeeper.address` or `coordinator.seed.nodes` must be set (fail-fast otherwise);
+> see §5.5.4.
 
 During transition, support both ZK and Raft modes:
 
@@ -2199,8 +2195,8 @@ public class MetadataBackendConfig {
         } else if (config.containsKey("coordinator.seed.nodes")) {
             return BackendType.RAFT;
         } else {
-            // Default to RAFT in future versions
-            return BackendType.RAFT;
+            throw new IllegalConfigurationException(
+                    "Set exactly one of zookeeper.address or coordinator.seed.nodes.");
         }
     }
 }
@@ -2556,7 +2552,7 @@ method names identical). No body changes in ZK mode.
 
 **Configuration**
 - [x] `ConfigOptions.java` — add `coordinator.seed.nodes`, `coordinator.raft.*` (Appendix 11.2)
-- [x] `MetadataBackend.from()` validation (5.5.4); default **RAFT**
+- [x] `MetadataBackend.from()` validation (5.5.4); fail-fast if neither or both keys are set
 - [~] mark `zookeeper.*` `@Deprecated` — docs/conf deprecate; full annotation sweep optional
 
 **Build**
@@ -3063,8 +3059,8 @@ Block allocation matches §5.3: 64 ids per Raft append is ~64× faster than one-
 | Fluss Version | ZK Mode | Raft Mode | Default |
 |---------------|---------|-----------|---------|
 | Current (main / released) | Supported | N/A | ZK |
-| This branch (`feature/zookeeper-removal-raft`) | **Deprecated** (supported) | Supported | **Raft** |
-| Next release after merge | Deprecated (supported) | Supported | Raft |
+| This branch (`feature/zookeeper-removal-raft`) | **Deprecated** (supported) | Supported | **None** (fail-fast; Raft via `coordinator.seed.nodes`) |
+| Next release after merge | Deprecated (supported) | Supported | None (fail-fast; Raft opt-in) |
 | Future major | Removed | Supported | Raft |
 
 ### 9.2 Deployment Guide (Raft Mode)
@@ -3204,7 +3200,7 @@ flowchart TB
 | Cross-process watch gap underestimated | High | Medium | Metadata stream (5.8) scoped as its own task (7.2 Task 5) |
 | Performance degradation | Medium | Low | Benchmarking with stated conditions (8.4); block-allocated ids (5.3) |
 | Data loss during migration | High | Low | Re-scan-diff (not watch CDC) + byte-level validation + write-fence window (6.3) |
-| Silent backend switch on config gap | Medium | Medium | Default backend = **Raft** on this branch (5.5.4); existing ZK clusters **must** keep `zookeeper.address` |
+| Silent backend switch on config gap | Medium | Low | Fail-fast if neither or both keys are set (5.5.4); existing ZK clusters keep `zookeeper.address` |
 | Split-brain in Raft | High | Low | Raft term fencing (5.1.6); Ratis quorum |
 | **Unauthenticated Raft peer port** | High | Medium | TLS + mutual auth on the raft transport; firewall to coordinators only (5.9) |
 | **Permanent quorum loss (majority down)** | High | Low | Odd sizing + guarded unsafe-recovery CLI; backup/DR (5.10, 9.4) |
@@ -3403,7 +3399,7 @@ A: KRaft is tightly coupled with Kafka. Fluss needs a lightweight, embeddable so
 A: No, during migration you need to choose one mode. The migration tool helps transition.
 
 **Q: What happens to my existing ZK-based deployment?**
-A: It continues to work in ZK mode as long as `zookeeper.address` remains set (and `coordinator.seed.nodes` is not). Use the migration tool when ready to switch. On the Raft-removal branch the **default** backend is Raft when neither key is set (5.5.4 / §9.1) — upgrades of ZK clusters must keep an explicit `zookeeper.address`.
+A: It continues to work in ZK mode as long as `zookeeper.address` remains set (and `coordinator.seed.nodes` is not). Use the migration tool when ready to switch. Neither key set (or both) fails at startup (5.5.4 / §9.1).
 
 **Q: Is Raft mode production-ready?**
 A: Dual-support + Raft-default are implemented on `feature/zookeeper-removal-raft` and covered by extension ITs. Treat GA readiness as gated by remaining Task 8 depth, §5.9–5.12 ops surfaces, and Phase 6 deletion. Follow release notes.
@@ -3442,6 +3438,7 @@ A: Not in v1. Only the leader serves authoritative reads/writes (5.7); non-leade
 | 2026-08-16 | 3.15 | **FetchMetadata async park.** `MetadataStreamService.fetchAsync` + stream pool / timeout scheduler; apply thread only enqueues (`onApplied`). Netty workers no longer `wait(maxWaitMs)`. Analysis §8.3/§8.7. |
 | 2026-08-16 | 3.16 | **§8.4 Admin `getTableInfo` after async-park JMH.** Re-ran `MetadataPathBenchmark` (same short flags). Warm Raft **89 µs** (unchanged vs 3.14); ZK **421 µs** replaces 356. Isolated first Admin read still **~105 ms** — parking unblocks Netty workers, it does not shorten `max-wait`. Store list*/`getTable`/`registerTable` confirmed unchanged. |
 | 2026-08-17 | 3.17 | **appendAll pipeline (analysis §8.2).** `RaftJournalWriter.appendAll` + `RaftMetadataClient.appendAll`: N independent log entries, one apply wait. Wired `registerPartition` (2 keys) and `createTable` after `getTableIdAndIncrement`. No MultiOp type. Canonical §8.4 JMH: store `registerPartition` Raft **8768 µs** (was 16993); Admin `createTable` **9309 µs** (was 24713); `registerTable` **8477 µs** (catalog 8582, noise). ZK on those benches: **14888** / **40293** / **4733**. |
+| 2026-08-22 | 3.18 | **Fail-fast metadata backend selection (§5.5.4).** `MetadataBackend.from()` requires exactly one of `zookeeper.address` / `coordinator.seed.nodes`; neither and both throw `IllegalConfigurationException`. Raft is opt-in. `local-cluster.sh` matches. |
 
 ---
 

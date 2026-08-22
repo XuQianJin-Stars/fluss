@@ -22,7 +22,8 @@
 #
 # Default is the embedded Raft coordinator quorum. Set coordinator.seed.nodes
 # (and leave zookeeper.address unset). For a ZooKeeper cluster instead, comment
-# out the Raft block and set zookeeper.address.
+# out the Raft block and set zookeeper.address. Setting both keys, or setting
+# neither, fails at startup.
 
 coordinator.seed.nodes: localhost:9123
 coordinator.raft.voters: localhost:9124

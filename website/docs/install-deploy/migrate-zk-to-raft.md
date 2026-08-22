@@ -17,9 +17,10 @@ upgrading to that major.
 
 | Mode | Status |
 |------|--------|
-| Raft (default) | Supported |
+| Raft (`coordinator.seed.nodes`) | Supported |
 | ZooKeeper (`zookeeper.address`) | Deprecated but supported |
 | Both keys set | Rejected at startup |
+| Neither key set | Rejected at startup |
 
 Client bootstrap (`bootstrap.servers`) and Admin/DDL APIs are unchanged — only server coordination
 config and ops CLI change.

@@ -117,11 +117,11 @@ The logging-related environment options (`env.log.dir`, `env.log.level`, `env.lo
 | zookeeper.client.config-path                    | String   | (None)  | The file path from which the ZooKeeper client reads its configuration. This allows each ZooKeeper client instance to load its own configuration file, instead of relying on shared JVM-level environment settings. This enables fine-grained control over ZooKeeper client behavior.                                                                                                                                                                                                                                            |
 | zookeeper.client.max-inflight-requests          | String   | 100     | The maximum number of unacknowledged requests the client will send to ZooKeeper before blocking.                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
-## Coordinator Raft (default metadata backend)
+## Coordinator Raft (opt-in metadata backend)
 
-Raft is the default when neither `zookeeper.address` nor `coordinator.seed.nodes`
-is set. Prefer setting the Raft keys explicitly. ZooKeeper remains available by
-setting `zookeeper.address` and omitting seed nodes (setting both is rejected).
+Set exactly one of `zookeeper.address` or `coordinator.seed.nodes`. Raft is selected
+by setting seed nodes (and omitting the ZooKeeper address). Setting both, or setting
+neither, is rejected at startup so an incomplete config cannot silently pick a backend.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|

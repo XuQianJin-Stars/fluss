@@ -842,9 +842,9 @@ public class ConfigOptions {
                     .noDefaultValue()
                     .withDescription(
                             "Deprecated. The ZooKeeper address for the legacy metadata backend. "
-                                    + "Prefer coordinator.seed.nodes / coordinator.raft.voters "
-                                    + "(Raft is the default). ZooKeeper mode will be removed in a "
-                                    + "future major release.");
+                                    + "Set exactly one of this key or coordinator.seed.nodes "
+                                    + "(Raft). Setting neither or both fails at startup. "
+                                    + "ZooKeeper mode will be removed in a future major release.");
 
     /** The root path under which Fluss stores its entries in ZooKeeper. */
     public static final ConfigOption<String> ZOOKEEPER_ROOT =
@@ -951,7 +951,8 @@ public class ConfigOptions {
                     .withDescription(
                             "Comma-separated coordinator host:port seed list for TabletServers and "
                                     + "clients. Presence of this (and absence of zookeeper.address) "
-                                    + "selects Raft mode.");
+                                    + "selects Raft mode. Set exactly one of this key or "
+                                    + "zookeeper.address; setting neither or both fails at startup.");
 
     /** Static voter set ({@code host:port}) forming the coordinator Raft quorum. */
     public static final ConfigOption<String> COORDINATOR_RAFT_VOTERS =

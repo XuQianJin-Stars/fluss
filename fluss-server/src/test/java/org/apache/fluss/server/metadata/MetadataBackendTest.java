@@ -44,8 +44,11 @@ class MetadataBackendTest {
     }
 
     @Test
-    void testDefaultsToRaftWhenNeitherSet() {
-        assertThat(MetadataBackend.from(new Configuration())).isEqualTo(MetadataBackend.RAFT);
+    void testThrowsWhenNeitherSet() {
+        assertThatThrownBy(() -> MetadataBackend.from(new Configuration()))
+                .isInstanceOf(IllegalConfigurationException.class)
+                .hasMessageContaining(ConfigOptions.ZOOKEEPER_ADDRESS.key())
+                .hasMessageContaining(ConfigOptions.COORDINATOR_SEED_NODES.key());
     }
 
     @Test

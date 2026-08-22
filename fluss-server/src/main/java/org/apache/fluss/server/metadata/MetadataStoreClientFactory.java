@@ -29,9 +29,9 @@ import org.apache.fluss.server.zk.ZooKeeperUtils;
  *
  * <p>The ZooKeeper backend returns the existing {@code ZooKeeperClient} (which {@code implements
  * MetadataStoreClient}); the Raft backend bootstraps a {@link RaftMetadataClient} (§5.5.3), which
- * starts an embedded Ratis server from the configured voter set. Because {@link
- * MetadataBackend#from} defaults to {@code ZOOKEEPER}, the Raft path is only reachable when a user
- * explicitly opts in via {@code coordinator.seed.nodes}.
+ * starts an embedded Ratis server from the configured voter set. {@link MetadataBackend#from}
+ * requires exactly one of {@code zookeeper.address} or {@code coordinator.seed.nodes}; the Raft
+ * path is only reachable when a user explicitly opts in via seed nodes.
  *
  * <p><b>Scope note (T4-2):</b> this factory produces a working, self-contained {@code
  * RaftMetadataClient}. Threading it into {@code CoordinatorServer} and its downstream managers (the

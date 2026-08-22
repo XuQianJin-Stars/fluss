@@ -41,6 +41,14 @@ class MetadataStoreClientFactoryTest {
     }
 
     @Test
+    void testNeitherBackendConfiguredIsRejected() {
+        assertThatThrownBy(() -> MetadataStoreClientFactory.create(new Configuration(), null))
+                .isInstanceOf(IllegalConfigurationException.class)
+                .hasMessageContaining(ConfigOptions.ZOOKEEPER_ADDRESS.key())
+                .hasMessageContaining(ConfigOptions.COORDINATOR_SEED_NODES.key());
+    }
+
+    @Test
     void testBothBackendsConfiguredIsRejected() {
         Configuration conf = new Configuration();
         conf.setString(ConfigOptions.ZOOKEEPER_ADDRESS, "localhost:2181");

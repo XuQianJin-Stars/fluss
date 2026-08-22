@@ -42,6 +42,16 @@ uses_zookeeper_backend() {
         | grep -vqE '^[[:space:]]*zookeeper\.address:[[:space:]]*$'
 }
 
+# Returns 0 if server.yaml has a non-empty coordinator.seed.nodes (Raft metadata backend).
+uses_raft_backend() {
+    local config_file="${FLUSS_CONF_DIR}/server.yaml"
+    if [[ ! -f "$config_file" ]]; then
+        return 1
+    fi
+    grep -E '^[[:space:]]*coordinator\.seed\.nodes:' "$config_file" \
+        | grep -vqE '^[[:space:]]*coordinator\.seed\.nodes:[[:space:]]*$'
+}
+
 # Function to get bind.listeners for tablet server with random ports (0)
 get_bind_listeners_with_random_ports() {
     local config_file="${FLUSS_CONF_DIR}/server.yaml"
@@ -63,12 +73,20 @@ case $STARTSTOP in
     (start)
         echo "Starting cluster."
 
-        # Dual-support: only launch ZooKeeper when zookeeper.address is configured.
-        # Raft mode uses coordinator.seed.nodes instead (see zookeeper-removal-design.md §7.4.2).
+        # Dual-support: require exactly one metadata backend key (same rule as
+        # MetadataBackend.from). Launch ZooKeeper only for the ZK backend.
+        if uses_zookeeper_backend && uses_raft_backend; then
+            echo "ERROR: Set exactly one of zookeeper.address or coordinator.seed.nodes in server.yaml."
+            exit 1
+        fi
+        if ! uses_zookeeper_backend && ! uses_raft_backend; then
+            echo "ERROR: Set exactly one of zookeeper.address or coordinator.seed.nodes in server.yaml."
+            exit 1
+        fi
         if uses_zookeeper_backend; then
             "$FLUSS_BIN_DIR"/fluss-daemon.sh start zookeeper "${FLUSS_CONF_DIR}"/zookeeper.properties
         else
-            echo "Skipping ZooKeeper (no zookeeper.address; assuming Raft metadata backend)."
+            echo "Skipping ZooKeeper (coordinator.seed.nodes set; Raft metadata backend)."
         fi
 
         # Start single Coordinator Server on this machine

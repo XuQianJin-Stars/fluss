@@ -3339,6 +3339,26 @@ public static final ConfigOption<Long> COORDINATOR_RAFT_ID_BLOCK_SIZE =
     .defaultValue(1000L)
     .withDescription("Number of sequence ids reserved per Raft round-trip (see 5.3.2).");
 
+// Batch size for pipelined appends (cascade deletes, batch leader-and-isr). Raising this reduces
+// the number of sequential apply waits for per-bucket batches; the Ratis in-flight client request
+// cap is raised in lockstep (see RaftMetadataServer#applyAppendPipelineProperties).
+public static final ConfigOption<Integer> COORDINATOR_RAFT_APPEND_CHUNK_SIZE =
+    key("coordinator.raft.append-chunk-size")
+    .intType()
+    .defaultValue(64)
+    .withDescription("Maximum number of metadata records sent as one pipelined batch before "
+        + "waiting for them to be applied.");
+
+// Lets concurrent metadata appends share one fsync. Appends are still acknowledged only AFTER
+// their flush completes, so this is NOT unsafe-flush (which acks before the flush and can
+// silently lose acknowledged metadata; Fluss never enables it). No effect for a serial writer.
+public static final ConfigOption<Boolean> COORDINATOR_RAFT_ASYNC_FLUSH_ENABLED =
+    key("coordinator.raft.async-flush.enabled")
+    .booleanType()
+    .defaultValue(false)
+    .withDescription("Whether Raft log fsync may complete asynchronously so that concurrent "
+        + "metadata appends share one fsync.");
+
 // --- Raft TLS (§5.9); firewall coordinator.raft.port (9124) to coordinators only ---
 public static final ConfigOption<Boolean> COORDINATOR_RAFT_TLS_ENABLED =
     key("coordinator.raft.tls.enabled").booleanType().defaultValue(false)

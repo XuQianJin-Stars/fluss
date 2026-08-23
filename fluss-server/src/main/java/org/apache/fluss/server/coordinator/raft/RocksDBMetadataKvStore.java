@@ -106,7 +106,18 @@ public class RocksDBMetadataKvStore implements MetadataKvStore {
 
         DBOptions dbOptions = new DBOptions().setCreateIfMissing(true);
         ColumnFamilyOptions columnFamilyOptions = new ColumnFamilyOptions();
-        WriteOptions writeOptions = new WriteOptions();
+        // Durability is anchored ENTIRELY on the Raft log fsync + state-machine snapshot, never on
+        // this RocksDB instance (analysis §8.9.3 B1). Neither recovery path reads back the
+        // persisted column family: FlussMetadataStateMachine.load() calls
+        // RaftMetadataStore.restoreFromSnapshot(), whose first step is kvStore.clear() — so an
+        // existing snapshot wholesale replaces the on-disk contents and the log tail is replayed on
+        // top; with no snapshot, lastAppliedIndex stays -1 and the whole log is replayed (put and
+        // delete are idempotent, so any residue is overwritten). The WAL therefore contributes
+        // nothing to recovery and only costs one extra user-space write plus memtable bookkeeping
+        // per apply — and apply latency is charged directly to every writer through awaitApplied
+        // (§4.3). Do NOT "compensate" by enabling WAL sync here: that would add a second fsync to
+        // the write path without changing what recovery reads.
+        WriteOptions writeOptions = new WriteOptions().setDisableWAL(true);
         ColumnFamilyHandle defaultCf = null;
         RocksDB db = null;
         try {

@@ -67,6 +67,7 @@ import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -104,6 +105,30 @@ public class MetadataStoreBenchmark {
     private static final String SEED_PRODUCER = "prod-seed";
     private static final String SEED_ACL_DB = "jmhacl";
 
+    /**
+     * Buckets per ISR batch. Sized above {@link
+     * org.apache.fluss.server.coordinator.raft.RaftJournalWriter}'s append chunk (64) so the
+     * chunked-pipeline path is exercised, and in the range of a real partitioned table's bucket
+     * count on failover (analysis §8.9.2).
+     */
+    private static final int ISR_BATCH_BUCKETS = 100;
+
+    /** Bucket-id base for ISR batch rows; kept clear of the seeded/unique-bucket ranges. */
+    private static final int ISR_BATCH_BUCKET_BASE = 500_000;
+
+    /**
+     * Threads for {@link #concurrentUpdateLeaderAndIsr}. Fixed rather than {@code Threads.MAX} so
+     * the row is comparable across machines; 8 is enough to keep the Ratis log worker queue
+     * non-empty, which is the precondition for fsync coalescing (§8.12.3).
+     */
+    private static final int CONCURRENT_WRITE_THREADS = 8;
+
+    /** Bucket-id base for the concurrent write row; disjoint from every other range. */
+    private static final int CONCURRENT_BUCKET_BASE = 700_000;
+
+    /** Distinct buckets cycled through by the concurrent row (pre-registered in setup). */
+    private static final int CONCURRENT_BUCKET_SLOTS = 512;
+
     /** {@code ZOOKEEPER} or {@code RAFT}. */
     @Param({"ZOOKEEPER", "RAFT"})
     public String backend;
@@ -118,6 +143,9 @@ public class MetadataStoreBenchmark {
     private CoordinatorAddress seedCoordinator;
     private static final AtomicLong GLOBAL_SEQ = new AtomicLong();
     private final AtomicLong seq = new AtomicLong();
+    /** Shared across the concurrent row's threads so they spread over distinct buckets. */
+    private final AtomicLong concurrentSeq = new AtomicLong();
+
     private final AtomicInteger schemaIdSeq = new AtomicInteger(2);
     private final AtomicInteger snapshotIdSeq = new AtomicInteger(2);
 
@@ -171,6 +199,22 @@ public class MetadataStoreBenchmark {
                 seedBucket, MetadataJmhSupport.remoteLogManifestHandle());
         store.registerTableBucketSnapshot(seedBucket, MetadataJmhSupport.bucketSnapshot(1L));
         store.upsertLakeTable(SEED_TABLE_ID, MetadataJmhSupport.lakeTable(), false);
+        // Pre-create the buckets used by batchUpdateLeaderAndIsr: the ZooKeeper batch path issues
+        // setData and needs existing znodes, which also makes the benchmark idempotent on both
+        // backends (see that method's javadoc).
+        for (int i = 0; i < ISR_BATCH_BUCKETS; i++) {
+            store.registerLeaderAndIsr(
+                    new TableBucket(SEED_TABLE_ID, ISR_BATCH_BUCKET_BASE + i),
+                    MetadataJmhSupport.leaderAndIsr(),
+                    MetadataJmhSupport.MATCH_ANY_VERSION);
+        }
+        // Same reason for the concurrent write row: updateLeaderAndIsr is setData on ZooKeeper.
+        for (int i = 0; i < CONCURRENT_BUCKET_SLOTS; i++) {
+            store.registerLeaderAndIsr(
+                    new TableBucket(SEED_TABLE_ID, CONCURRENT_BUCKET_BASE + i),
+                    MetadataJmhSupport.leaderAndIsr(),
+                    MetadataJmhSupport.MATCH_ANY_VERSION);
+        }
         store.getTableIdAndIncrement();
     }
 
@@ -178,6 +222,12 @@ public class MetadataStoreBenchmark {
     @TearDown(Level.Trial)
     public void teardown() {
         // Shared store lives for the in-process JVM (avoids Ratis port leaks between trials).
+        // Print the Raft append attribution accumulated over this trial (analysis §8.9.1): how much
+        // of a metadata write is the Ratis round-trip (send→reply: gRPC loopback, log append,
+        // fsync,
+        // majority ack) versus the commit-to-apply handoff. JMH only reports the end-to-end score,
+        // so without this the 8.5ms band cannot be decomposed.
+        MetadataJmhSupport.printAppendAttribution(session);
     }
 
     private long nextId() {
@@ -502,6 +552,58 @@ public class MetadataStoreBenchmark {
     @Benchmark
     public Optional<LeaderAndIsr> getLeaderAndIsr() throws Exception {
         return store.getLeaderAndIsr(seedBucket);
+    }
+
+    /**
+     * Batch-update leader-and-isr for {@value #ISR_BATCH_BUCKETS} buckets — the shape the
+     * coordinator uses on failover / ISR shrink ({@code TableBucketStateMachine}, {@code
+     * ReplicaStateMachine}, {@code CoordinatorEventProcessor}).
+     *
+     * <p>ZooKeeper commits the batch in Curator transactions ({@code setData} per bucket). Raft
+     * sends independent log entries and waits once for apply (analysis §8.9.2); before that
+     * batching it was one commit-blocking append per bucket, i.e. N sequential round-trips. This
+     * row exists so that regression is visible — the single-key {@code updateLeaderAndIsr} row
+     * cannot show it.
+     *
+     * <p>Buckets are pre-registered in {@link #seedCatalog()} because the ZooKeeper path uses
+     * {@code setData} and requires existing znodes. Both backends are therefore idempotent here,
+     * which is what lets this run under {@code AverageTime}. {@code
+     * batchRegisterLeaderAndIsrForTablePartition} is deliberately NOT benchmarked: the ZooKeeper
+     * implementation uses non-idempotent {@code create} (including a parent-node create), so
+     * repeated invocation would fail with {@code NodeExists} rather than measure anything.
+     */
+    @Benchmark
+    public void batchUpdateLeaderAndIsr() throws Exception {
+        Map<TableBucket, LeaderAndIsr> batch = new LinkedHashMap<>(ISR_BATCH_BUCKETS);
+        LeaderAndIsr leaderAndIsr = MetadataJmhSupport.leaderAndIsr();
+        for (int i = 0; i < ISR_BATCH_BUCKETS; i++) {
+            batch.put(new TableBucket(SEED_TABLE_ID, ISR_BATCH_BUCKET_BASE + i), leaderAndIsr);
+        }
+        store.batchUpdateLeaderAndIsr(batch, MetadataJmhSupport.MATCH_ANY_VERSION);
+    }
+
+    /**
+     * Concurrent single-key writes — the only shape in which {@code raft.server.log.async-flush}
+     * can help (analysis §8.1.3 / §9.0 #8).
+     *
+     * <p>Every other write row here is {@code @Threads(1)} and serially awaits apply, so each
+     * append pays a full fsync with nothing to batch it against. §8.12.3 showed the Ratis log
+     * worker DOES coalesce fsyncs once entries queue up (a 100-bucket batch needed only 0.049
+     * fsyncs per append versus 2.0 when serial), so concurrency is the other route to that
+     * coalescing — and this row is what makes the effect measurable.
+     *
+     * <p>Each thread writes a disjoint bucket range so neither backend does cross-thread conflict
+     * resolution; what is measured is purely the write pipeline under concurrency. Thread count is
+     * fixed (not {@code Threads.MAX}) to keep results comparable across machines.
+     */
+    @Benchmark
+    @Threads(CONCURRENT_WRITE_THREADS)
+    public void concurrentUpdateLeaderAndIsr() throws Exception {
+        int slot = (int) (concurrentSeq.getAndIncrement() % CONCURRENT_BUCKET_SLOTS);
+        store.updateLeaderAndIsr(
+                new TableBucket(SEED_TABLE_ID, CONCURRENT_BUCKET_BASE + slot),
+                MetadataJmhSupport.leaderAndIsr(),
+                MetadataJmhSupport.MATCH_ANY_VERSION);
     }
 
     /** Batch get of the seeded bucket's leader-and-isr. */

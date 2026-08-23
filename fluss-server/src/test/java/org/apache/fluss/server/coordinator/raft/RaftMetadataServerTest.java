@@ -19,6 +19,7 @@ package org.apache.fluss.server.coordinator.raft;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.shaded.ratis.org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.conf.Parameters;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.conf.RaftProperties;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.grpc.GrpcConfigKeys;
@@ -84,6 +85,81 @@ class RaftMetadataServerTest {
                 .isEqualTo(1000L);
         assertThat(GrpcConfigKeys.TLS.enabled(p)).isFalse();
         assertThat(newServer(conf).buildTlsParameters()).isNull();
+    }
+
+    /**
+     * The Ratis in-flight client request cap must always leave room for a full append chunk plus
+     * the single-record appends sharing the same client, otherwise a large batch would fail with
+     * ResourceUnavailableException instead of being throttled (analysis §8.9.2). The cap is {@code
+     * max(ratisDefault, 2 * chunkSize)}, so it is never lowered below Ratis' own default.
+     */
+    @Test
+    void testDefaultChunkSizeGivesTwoChunksOfHeadroom() {
+        Configuration conf = new Configuration();
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_DIR, "/tmp/fluss-raft-chunk-default");
+
+        RaftProperties p = newServer(conf).buildRaftProperties();
+
+        int chunk = conf.get(ConfigOptions.COORDINATOR_RAFT_APPEND_CHUNK_SIZE);
+        assertThat(RaftClientConfigKeys.Async.outstandingRequestsMax(p))
+                .isEqualTo(2 * chunk)
+                .isGreaterThanOrEqualTo(
+                        RaftClientConfigKeys.Async.OUTSTANDING_REQUESTS_MAX_DEFAULT);
+    }
+
+    /**
+     * A chunk size small enough that Ratis' own default already suffices must not lower the cap.
+     */
+    @Test
+    void testSmallChunkSizeKeepsRatisOutstandingDefault() {
+        Configuration conf = new Configuration();
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_DIR, "/tmp/fluss-raft-chunk-small");
+        conf.set(ConfigOptions.COORDINATOR_RAFT_APPEND_CHUNK_SIZE, 8);
+
+        RaftProperties p = newServer(conf).buildRaftProperties();
+
+        assertThat(RaftClientConfigKeys.Async.outstandingRequestsMax(p))
+                .isEqualTo(RaftClientConfigKeys.Async.OUTSTANDING_REQUESTS_MAX_DEFAULT);
+    }
+
+    /**
+     * async-flush is off unless asked for, and enabling it must never enable unsafe-flush: the
+     * latter acknowledges an append before its flush completes and can silently lose acknowledged
+     * metadata.
+     */
+    @Test
+    void testAsyncFlushDefaultsOffAndNeverEnablesUnsafeFlush() {
+        Configuration conf = new Configuration();
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_DIR, "/tmp/fluss-raft-flush-default");
+
+        RaftProperties p = newServer(conf).buildRaftProperties();
+
+        assertThat(RaftServerConfigKeys.Log.asyncFlushEnabled(p)).isFalse();
+        assertThat(RaftServerConfigKeys.Log.unsafeFlushEnabled(p)).isFalse();
+    }
+
+    @Test
+    void testAsyncFlushCanBeEnabledWithoutUnsafeFlush() {
+        Configuration conf = new Configuration();
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_DIR, "/tmp/fluss-raft-flush-async");
+        conf.set(ConfigOptions.COORDINATOR_RAFT_ASYNC_FLUSH_ENABLED, true);
+
+        RaftProperties p = newServer(conf).buildRaftProperties();
+
+        assertThat(RaftServerConfigKeys.Log.asyncFlushEnabled(p)).isTrue();
+        // Ratis throws if both are set; unsafe-flush must stay off no matter what.
+        assertThat(RaftServerConfigKeys.Log.unsafeFlushEnabled(p)).isFalse();
+    }
+
+    @Test
+    void testLargeChunkSizeRaisesRatisOutstandingCap() {
+        Configuration conf = new Configuration();
+        conf.setString(ConfigOptions.COORDINATOR_RAFT_DIR, "/tmp/fluss-raft-chunk-large");
+        conf.set(ConfigOptions.COORDINATOR_RAFT_APPEND_CHUNK_SIZE, 512);
+
+        RaftProperties p = newServer(conf).buildRaftProperties();
+
+        assertThat(RaftClientConfigKeys.Async.outstandingRequestsMax(p)).isEqualTo(1024);
     }
 
     @Test

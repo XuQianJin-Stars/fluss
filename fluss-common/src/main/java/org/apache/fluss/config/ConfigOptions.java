@@ -1054,6 +1054,50 @@ public class ConfigOptions {
                             "Number of sequence ids reserved per Raft round-trip (see 5.3.2).");
 
     /**
+     * Batch size for pipelined metadata appends (cascade deletes, batch leader-and-isr updates).
+     *
+     * <p>Entries in a batch are sent as independent Raft log entries and awaited once per chunk, so
+     * a larger chunk means fewer sequential apply waits — a 100-bucket ISR batch costs two waits at
+     * the default 64 versus one at 100. The Ratis client's in-flight request cap is raised in
+     * lockstep with this value, so it must not be increased without that coupling (see {@code
+     * RaftMetadataServer#buildRaftProperties}).
+     */
+    public static final ConfigOption<Integer> COORDINATOR_RAFT_APPEND_CHUNK_SIZE =
+            key("coordinator.raft.append-chunk-size")
+                    .intType()
+                    .defaultValue(64)
+                    .withDescription(
+                            "Maximum number of metadata records sent as one pipelined batch before "
+                                    + "waiting for them to be applied. Larger values reduce the "
+                                    + "number of sequential apply waits for per-bucket batches at "
+                                    + "the cost of more in-flight Raft requests.");
+
+    /**
+     * Whether the Raft log may acknowledge an append once the write reaches the OS and let the
+     * fsync complete asynchronously, allowing concurrent appends to share one fsync.
+     *
+     * <p>Metadata writes are fsync-dominated: a single append costs ~2 fsyncs (its own data entry
+     * plus the commit-index metadata entry Ratis appends on every commit advance), each of which is
+     * milliseconds. The Raft log worker already coalesces fsyncs when entries queue up, so this
+     * only matters when several writers are in flight at once; a serial writer has nothing to
+     * coalesce with and will see no improvement.
+     *
+     * <p>This is Ratis' {@code raft.server.log.async-flush.enabled} and is <b>not</b> the same as
+     * {@code unsafe-flush}: an append is still only acknowledged after the flush completes, so a
+     * crash cannot silently lose an acknowledged write. Fluss never enables {@code unsafe-flush},
+     * which would drop that guarantee.
+     */
+    public static final ConfigOption<Boolean> COORDINATOR_RAFT_ASYNC_FLUSH_ENABLED =
+            key("coordinator.raft.async-flush.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether Raft log fsync may complete asynchronously so that concurrent "
+                                    + "metadata appends share one fsync. Appends are still only "
+                                    + "acknowledged after their flush completes. Has no effect for a "
+                                    + "single serial writer.");
+
+    /**
      * Heartbeat lease timeout after which a TabletServer is fenced (replaces the ZooKeeper
      * ephemeral-node session, see 5.4.2).
      */

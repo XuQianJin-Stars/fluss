@@ -22,6 +22,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.RaftConfigKeys;
+import org.apache.fluss.shaded.ratis.org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.conf.Parameters;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.conf.RaftProperties;
 import org.apache.fluss.shaded.ratis.org.apache.ratis.grpc.GrpcConfigKeys;
@@ -149,8 +150,42 @@ public class RaftMetadataServer implements AutoCloseable {
         RaftServerConfigKeys.setStorageDir(
                 p,
                 Collections.singletonList(new File(conf.get(ConfigOptions.COORDINATOR_RAFT_DIR))));
+        applyAppendPipelineProperties(p);
         applyTlsProperties(p);
         return p;
+    }
+
+    /**
+     * Raises the Ratis in-flight request caps so a full append chunk always fits.
+     *
+     * <p>{@code RaftJournalWriter} sends a chunk of up to {@code
+     * coordinator.raft.append-chunk-size} entries before waiting for them to apply. Ratis
+     * independently caps outstanding async client requests at {@code
+     * RaftClientConfigKeys.Async.OUTSTANDING_REQUESTS_MAX} (default 100) and queues server-side
+     * writes at {@code Write.ELEMENT_LIMIT} / {@code Log.QUEUE_ELEMENT_LIMIT} (default 4096 each);
+     * exceeding the client cap makes {@code async().send} fail with {@code
+     * ResourceUnavailableException} or block the sending thread. Keeping the client cap at least
+     * one chunk (plus headroom for the concurrent single-record appends that share this client)
+     * means a chunk-size increase cannot silently start failing.
+     */
+    private void applyAppendPipelineProperties(RaftProperties p) {
+        int chunkSize = conf.get(ConfigOptions.COORDINATOR_RAFT_APPEND_CHUNK_SIZE);
+        int required =
+                Math.max(
+                        RaftClientConfigKeys.Async.OUTSTANDING_REQUESTS_MAX_DEFAULT, 2 * chunkSize);
+        RaftClientConfigKeys.Async.setOutstandingRequestsMax(p, required);
+
+        // Lets concurrent appends share one fsync: the log worker still acknowledges only after the
+        // flush completes, it just does not serialize writers behind it. Metadata writes are
+        // fsync-dominated (~2 fsyncs per append: the data entry plus Ratis' commit-index metadata
+        // entry), so this is the only lever left for concurrent writers — a serial writer has
+        // nothing
+        // to coalesce with. NEVER pair this with Log.setUnsafeFlushEnabled, which acknowledges
+        // before
+        // the flush and can silently lose acknowledged metadata; Ratis rejects enabling both
+        // anyway.
+        RaftServerConfigKeys.Log.setAsyncFlushEnabled(
+                p, conf.get(ConfigOptions.COORDINATOR_RAFT_ASYNC_FLUSH_ENABLED));
     }
 
     /** Wires {@link GrpcConfigKeys.TLS} keys from {@code coordinator.raft.tls.*} (§5.9). */

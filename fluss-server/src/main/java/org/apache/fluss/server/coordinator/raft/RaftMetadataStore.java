@@ -46,10 +46,19 @@ public class RaftMetadataStore {
         return watchService;
     }
 
-    /** Deterministic mutation. Dispatch is a plain switch over record type. */
+    /**
+     * Deterministic mutation. Dispatch is a plain switch over record type.
+     *
+     * <p>The {@code oldValue} pre-read exists only to feed {@link MetadataWatchService} callbacks,
+     * so it is skipped when no watch matches this key (analysis §8.9.4 C1). Only three watchers
+     * register today (table/schema/partition, tablet-server, coordinator), so most record types
+     * avoid an extra KvStore lookup per applied entry — and apply latency is charged to every
+     * writer through {@code awaitApplied} (§4.3).
+     */
     public void apply(MetadataRecord record) {
         byte[] key = MetadataKeys.keyOf(record);
-        byte[] oldValue = kvStore.get(key);
+        boolean watched = watchService.hasWatch(key);
+        byte[] oldValue = watched ? kvStore.get(key) : null;
         switch (record.type()) {
                 // Removal types: delete the key. (FENCE_TABLET_SERVER removes a membership key.)
             case DELETE_DATABASE:
@@ -69,12 +78,16 @@ public class RaftMetadataStore {
             case DELETE_SERVER_TAGS:
             case DELETE_REBALANCE_TASK:
                 kvStore.delete(key);
-                watchService.fireWatch(key, oldValue, null);
+                if (watched) {
+                    watchService.fireWatch(key, oldValue, null);
+                }
                 break;
                 // All other types (REGISTER_*, UPDATE_*, ALLOCATE_ID_RANGE) are plain key puts.
             default:
                 kvStore.put(key, record.payload());
-                watchService.fireWatch(key, oldValue, record.payload());
+                if (watched) {
+                    watchService.fireWatch(key, oldValue, record.payload());
+                }
                 break;
         }
     }

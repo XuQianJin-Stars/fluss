@@ -50,6 +50,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.NavigableMap;
 import java.util.TreeMap;
@@ -131,18 +132,34 @@ public class FlussMetadataStateMachine extends BaseStateMachine {
         }
     }
 
-    /** Serialized by Ratis; the ONLY mutation path for the store on all nodes. */
+    /**
+     * Serialized by Ratis; the ONLY mutation path for the store on all nodes.
+     *
+     * <p>The store mutation and the {@link #lastAppliedIndex} advance happen under {@code this};
+     * the resolved apply waiters are completed <em>after</em> the monitor is released (analysis
+     * §8.9.4 C3). Completing them inside the lock would run every caller's {@code
+     * thenCompose}/{@code whenComplete} continuation on the apply thread <em>while holding the
+     * state-machine monitor</em> — e.g. {@link RaftJournalWriter#appendAll}'s batch bookkeeping —
+     * which both inflates apply-loop latency (every microsecond here is charged to the writer via
+     * {@code awaitApplied}) and risks lock-order inversions (§5.6).
+     */
     @VisibleForTesting
-    synchronized void applyEntry(MetadataRecord record, long index) {
-        if (index <= lastAppliedIndex) {
-            return; // duplicate (retried write)
+    void applyEntry(MetadataRecord record, long index) {
+        final List<CompletableFuture<Long>> resolved;
+        final LongConsumer listener;
+        synchronized (this) {
+            if (index <= lastAppliedIndex) {
+                return; // duplicate (retried write)
+            }
+            store.apply(record); // deterministic mutation of the KvStore + fire local watches
+            lastAppliedIndex = index;
+            resolved = drainAppliedWaiters(index);
+            listener = applyListener;
         }
-        store.apply(record); // deterministic mutation of the KvStore + fire local watches
-        lastAppliedIndex = index;
-        completeAppliedWaiters(index);
+        // Outside the monitor: caller continuations must not run under the state-machine lock.
+        completeAll(resolved, index);
         // Wake cross-process long-poll subscribers parked at the high watermark (§5.8.2). This is a
         // pure notification: the listener re-reads the freshly-appended tail from the Raft log.
-        LongConsumer listener = applyListener;
         if (listener != null) {
             listener.accept(index);
         }
@@ -194,15 +211,35 @@ public class FlussMetadataStateMachine extends BaseStateMachine {
     @Override
     public void notifyTermIndexUpdated(long term, long index) {
         super.notifyTermIndexUpdated(term, index);
-        completeAppliedWaiters(index);
+        final List<CompletableFuture<Long>> resolved;
+        synchronized (this) {
+            resolved = drainAppliedWaiters(index);
+        }
+        completeAll(resolved, index); // outside the monitor (§8.9.4 C3)
     }
 
-    private synchronized void completeAppliedWaiters(long index) {
-        NavigableMap<Long, CompletableFuture<Long>> done = appliedWaiters.headMap(index, true);
-        for (CompletableFuture<Long> w : done.values()) {
-            w.complete(index);
+    /**
+     * Removes and returns every waiter whose target index is {@code <= index}. Callers MUST invoke
+     * {@link #completeAll} outside the monitor.
+     */
+    @GuardedBy("this")
+    private List<CompletableFuture<Long>> drainAppliedWaiters(long index) {
+        if (appliedWaiters.isEmpty()) {
+            return Collections.emptyList();
         }
+        NavigableMap<Long, CompletableFuture<Long>> done = appliedWaiters.headMap(index, true);
+        if (done.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<CompletableFuture<Long>> resolved = new ArrayList<>(done.values());
         done.clear();
+        return resolved;
+    }
+
+    private static void completeAll(List<CompletableFuture<Long>> waiters, long index) {
+        for (int i = 0; i < waiters.size(); i++) {
+            waiters.get(i).complete(index);
+        }
     }
 
     // ---- snapshot / log compaction (§5.2.5) ----

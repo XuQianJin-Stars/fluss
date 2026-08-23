@@ -24,6 +24,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -126,5 +128,93 @@ class FlussMetadataStateMachineTest {
         assertThat(pending.get(1, TimeUnit.SECONDS)).isEqualTo(4);
         assertThat(sm.lastAppliedIndex()).isEqualTo(-1);
         assertThat(sm.awaitApplied(4).get(1, TimeUnit.SECONDS)).isEqualTo(4);
+    }
+
+    /**
+     * Waiter continuations must NOT run while the apply thread holds the state-machine monitor
+     * (analysis §8.9.4 C3). Completing inside the lock would let any caller continuation — e.g.
+     * {@code RaftJournalWriter.appendAll}'s batch bookkeeping — execute under the monitor,
+     * inflating apply latency and risking lock-order inversions. The continuation here asserts it
+     * can take the monitor itself, which only holds if the lock was already released.
+     */
+    @Test
+    void testAppliedWaiterContinuationRunsOutsideStateMachineLock() throws Exception {
+        FlussMetadataStateMachine sm = newStateMachine();
+        AtomicBoolean lockWasFree = new AtomicBoolean();
+        CompletableFuture<Long> done =
+                sm.awaitApplied(1)
+                        .thenApply(
+                                index -> {
+                                    lockWasFree.set(!Thread.holdsLock(sm));
+                                    // Would deadlock (or at least prove re-entrancy) if the apply
+                                    // thread still held the monitor from another thread's view;
+                                    // taking it here documents the lock is available.
+                                    synchronized (sm) {
+                                        return index;
+                                    }
+                                });
+
+        sm.applyEntry(tableRecord("a", "1"), 1);
+
+        assertThat(done.get(5, TimeUnit.SECONDS)).isEqualTo(1);
+        assertThat(lockWasFree).isTrue();
+    }
+
+    /** Same guarantee for the Raft-config path that resolves waiters without a store mutation. */
+    @Test
+    void testNotifyTermIndexUpdatedCompletesWaiterOutsideLock() throws Exception {
+        FlussMetadataStateMachine sm = newStateMachine();
+        AtomicBoolean lockWasFree = new AtomicBoolean();
+        CompletableFuture<Long> done =
+                sm.awaitApplied(9)
+                        .thenApply(
+                                index -> {
+                                    lockWasFree.set(!Thread.holdsLock(sm));
+                                    return index;
+                                });
+
+        sm.notifyTermIndexUpdated(2, 9);
+
+        assertThat(done.get(5, TimeUnit.SECONDS)).isEqualTo(9);
+        assertThat(lockWasFree).isTrue();
+    }
+
+    /** Multiple waiters below the applied index must all resolve from one apply. */
+    @Test
+    void testApplyResolvesAllWaitersUpToIndex() throws Exception {
+        FlussMetadataStateMachine sm = newStateMachine();
+        CompletableFuture<Long> f1 = sm.awaitApplied(1);
+        CompletableFuture<Long> f2 = sm.awaitApplied(2);
+        CompletableFuture<Long> f3 = sm.awaitApplied(3);
+        CompletableFuture<Long> beyond = sm.awaitApplied(4);
+
+        sm.applyEntry(tableRecord("a", "1"), 3);
+
+        assertThat(f1.get(1, TimeUnit.SECONDS)).isEqualTo(3);
+        assertThat(f2.get(1, TimeUnit.SECONDS)).isEqualTo(3);
+        assertThat(f3.get(1, TimeUnit.SECONDS)).isEqualTo(3);
+        assertThat(beyond).isNotCompleted();
+    }
+
+    /**
+     * The apply listener (metadata-stream wakeup) must also fire outside the monitor: it runs on
+     * the single apply thread and is documented as a cheap, non-blocking notification (§5.6 /
+     * §5.8.2).
+     */
+    @Test
+    void testApplyListenerFiresOutsideStateMachineLock() {
+        FlussMetadataStateMachine sm = newStateMachine();
+        AtomicBoolean lockWasFree = new AtomicBoolean();
+        AtomicLong observed = new AtomicLong(-1);
+        sm.setApplyListener(
+                index -> {
+                    lockWasFree.set(!Thread.holdsLock(sm));
+                    observed.set(index);
+                });
+
+        sm.applyEntry(tableRecord("a", "1"), 7);
+
+        assertThat(observed.get()).isEqualTo(7);
+        assertThat(lockWasFree).isTrue();
     }
 }

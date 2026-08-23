@@ -289,7 +289,11 @@ public class RaftMetadataClient implements MetadataStoreClient {
                             .setRaftGroup(group)
                             .setProperties(server.buildRaftProperties())
                             .build();
-            RaftJournalWriter writer = new RaftJournalWriter(raftClient, stateMachine);
+            RaftJournalWriter writer =
+                    new RaftJournalWriter(
+                            raftClient,
+                            stateMachine,
+                            conf.get(ConfigOptions.COORDINATOR_RAFT_APPEND_CHUNK_SIZE));
             long blockSize = conf.get(ConfigOptions.COORDINATOR_RAFT_ID_BLOCK_SIZE);
             RaftMetadataClient client =
                     new RaftMetadataClient(
@@ -344,7 +348,17 @@ public class RaftMetadataClient implements MetadataStoreClient {
      * local node's {@code host:port} (see {@link #resolveLocalPeerId}).
      */
     private static RaftGroup resolveRaftGroup(Configuration conf) {
-        String votersCsv = conf.getOptional(ConfigOptions.COORDINATOR_RAFT_VOTERS).orElse(null);
+        return resolveGroupForVoters(
+                conf.getOptional(ConfigOptions.COORDINATOR_RAFT_VOTERS).orElse(null));
+    }
+
+    /**
+     * Builds the Raft group for a {@code host:port[,host:port...]} voter list, using the same
+     * peer-id scheme as {@link #peerIdForAddress}. Exposed so callers that start bare {@link
+     * RaftMetadataServer} peers (multi-voter tests and benchmarks) agree with this client on peer
+     * identity — a mismatch means no election ever completes.
+     */
+    public static RaftGroup resolveGroupForVoters(@Nullable String votersCsv) {
         if (votersCsv == null || votersCsv.trim().isEmpty()) {
             throw new IllegalConfigurationException(
                     "coordinator.raft.voters is required for the Raft metadata backend.");
@@ -1192,17 +1206,28 @@ public class RaftMetadataClient implements MetadataStoreClient {
      */
     public void deleteTable(TablePath tablePath) throws Exception {
         requireLeader();
-        // Snapshot names/ids up front — each append mutates the live store.
+        // Snapshot names/ids up front — each append mutates the live store. All removals go out as
+        // one batch so a table with many partitions/schemas costs one apply wait, not one per key
+        // (analysis §8.9.2).
+        List<MetadataRecord> records = new ArrayList<>();
         for (String partitionName : new ArrayList<>(partitionEntries(tablePath).keySet())) {
-            append(
-                    MetadataRecord.Type.DELETE_PARTITION,
-                    partitionKeyBytes(tablePath, partitionName),
-                    EMPTY);
+            records.add(
+                    new MetadataRecord(
+                            MetadataRecord.Type.DELETE_PARTITION,
+                            partitionKeyBytes(tablePath, partitionName),
+                            EMPTY));
         }
         for (Integer schemaId : new ArrayList<>(schemaIds(tablePath))) {
-            append(MetadataRecord.Type.DELETE_SCHEMA, schemaKeyBytes(tablePath, schemaId), EMPTY);
+            records.add(
+                    new MetadataRecord(
+                            MetadataRecord.Type.DELETE_SCHEMA,
+                            schemaKeyBytes(tablePath, schemaId),
+                            EMPTY));
         }
-        append(MetadataRecord.Type.DELETE_TABLE, tablePathBytes(tablePath), EMPTY);
+        records.add(
+                new MetadataRecord(
+                        MetadataRecord.Type.DELETE_TABLE, tablePathBytes(tablePath), EMPTY));
+        appendAll(records);
     }
 
     @Override
@@ -1212,9 +1237,7 @@ public class RaftMetadataClient implements MetadataStoreClient {
         requireLeader();
         // expectedZkVersion is intentionally ignored: Raft-term fencing (§5.1.6) replaces the ZK
         // CAS.
-        byte[] payload =
-                JsonSerdeUtils.writeValueAsBytes(leaderAndIsr, LeaderAndIsrJsonSerde.INSTANCE);
-        append(MetadataRecord.Type.UPDATE_LEADER_AND_ISR, tableBucketBytes(tableBucket), payload);
+        appendRecord(leaderAndIsrRecord(tableBucket, leaderAndIsr));
     }
 
     /**
@@ -1230,29 +1253,52 @@ public class RaftMetadataClient implements MetadataStoreClient {
 
     /**
      * Batch-registers leader-and-isr for a partitioned table's buckets. ZooKeeper did this in one
-     * transaction; on Raft each is an ordered commit-blocking append (single-writer, per §5.1.6). A
-     * single composite record is a possible future atomicity hardening.
+     * transaction; on Raft these are independent log entries pipelined into a single apply wait
+     * (§8.9.2), not one commit-blocking append per bucket — a 128-bucket table would otherwise cost
+     * 128 sequential round-trips on the failover path. A single composite record is a possible
+     * future atomicity hardening (§8.2.3 explains why {@code MULTI_OP} is not it).
      */
     public void batchRegisterLeaderAndIsrForTablePartition(
             List<RegisterTableBucketLeadAndIsrInfo> registerList, int expectedZkVersion)
             throws Exception {
         requireLeader();
-        for (RegisterTableBucketLeadAndIsrInfo info : registerList) {
-            updateLeaderAndIsr(info.getTableBucket(), info.getLeaderAndIsr(), expectedZkVersion);
+        if (registerList.isEmpty()) {
+            return;
         }
+        List<MetadataRecord> records = new ArrayList<>(registerList.size());
+        for (RegisterTableBucketLeadAndIsrInfo info : registerList) {
+            records.add(leaderAndIsrRecord(info.getTableBucket(), info.getLeaderAndIsr()));
+        }
+        appendAll(records);
     }
 
     /**
-     * Batch-updates leader-and-isr for the given buckets (per-record ordered append; see {@link
+     * Batch-updates leader-and-isr for the given buckets (pipelined into one apply wait; see {@link
      * #batchRegisterLeaderAndIsrForTablePartition} on atomicity).
      */
     public void batchUpdateLeaderAndIsr(
             Map<TableBucket, LeaderAndIsr> leaderAndIsrList, int expectedZkVersion)
             throws Exception {
         requireLeader();
-        for (Map.Entry<TableBucket, LeaderAndIsr> entry : leaderAndIsrList.entrySet()) {
-            updateLeaderAndIsr(entry.getKey(), entry.getValue(), expectedZkVersion);
+        if (leaderAndIsrList.isEmpty()) {
+            return;
         }
+        List<MetadataRecord> records = new ArrayList<>(leaderAndIsrList.size());
+        for (Map.Entry<TableBucket, LeaderAndIsr> entry : leaderAndIsrList.entrySet()) {
+            records.add(leaderAndIsrRecord(entry.getKey(), entry.getValue()));
+        }
+        appendAll(records);
+    }
+
+    /**
+     * Builds an {@code UPDATE_LEADER_AND_ISR} record. The ZooKeeper {@code expectedZkVersion} CAS
+     * is subsumed by Raft-term fencing (§5.1.6), so it is intentionally not encoded.
+     */
+    private MetadataRecord leaderAndIsrRecord(TableBucket tableBucket, LeaderAndIsr leaderAndIsr) {
+        return new MetadataRecord(
+                MetadataRecord.Type.UPDATE_LEADER_AND_ISR,
+                tableBucketBytes(tableBucket),
+                JsonSerdeUtils.writeValueAsBytes(leaderAndIsr, LeaderAndIsrJsonSerde.INSTANCE));
     }
 
     /** Returns a bucket's leader-and-isr, if present. */
@@ -1497,16 +1543,22 @@ public class RaftMetadataClient implements MetadataStoreClient {
         requireLeader();
         // ZK deleteTableAssignment uses deletingChildrenIfNeeded — cascade LeaderAndIsr for
         // non-partitioned table buckets so completeDeleteTable clears bucket state too.
+        // Batched into one apply wait instead of one per bucket (analysis §8.9.2).
         Optional<TableAssignment> assignment = getTableAssignment(tableId);
+        List<MetadataRecord> records = new ArrayList<>();
         if (assignment.isPresent()) {
             for (Integer bucketId : assignment.get().getBuckets()) {
-                append(
-                        MetadataRecord.Type.DELETE_LEADER_AND_ISR,
-                        tableBucketBytes(new TableBucket(tableId, bucketId)),
-                        EMPTY);
+                records.add(
+                        new MetadataRecord(
+                                MetadataRecord.Type.DELETE_LEADER_AND_ISR,
+                                tableBucketBytes(new TableBucket(tableId, bucketId)),
+                                EMPTY));
             }
         }
-        append(MetadataRecord.Type.DELETE_TABLE_ASSIGNMENT, longToBytes(tableId), EMPTY);
+        records.add(
+                new MetadataRecord(
+                        MetadataRecord.Type.DELETE_TABLE_ASSIGNMENT, longToBytes(tableId), EMPTY));
+        appendAll(records);
     }
 
     /** Returns a partition's bucket assignment, if present. */
@@ -1527,17 +1579,25 @@ public class RaftMetadataClient implements MetadataStoreClient {
     public void deletePartitionAssignment(long partitionId) throws Exception {
         requireLeader();
         // ZK deletePartitionAssignment cascades children (leader_isr); mirror that here.
+        // Batched into one apply wait instead of one per bucket (analysis §8.9.2).
         Optional<PartitionAssignment> assignment = getPartitionAssignment(partitionId);
+        List<MetadataRecord> records = new ArrayList<>();
         if (assignment.isPresent()) {
             long tableId = assignment.get().getTableId();
             for (Integer bucketId : assignment.get().getBuckets()) {
-                append(
-                        MetadataRecord.Type.DELETE_LEADER_AND_ISR,
-                        tableBucketBytes(new TableBucket(tableId, partitionId, bucketId)),
-                        EMPTY);
+                records.add(
+                        new MetadataRecord(
+                                MetadataRecord.Type.DELETE_LEADER_AND_ISR,
+                                tableBucketBytes(new TableBucket(tableId, partitionId, bucketId)),
+                                EMPTY));
             }
         }
-        append(MetadataRecord.Type.DELETE_PARTITION_ASSIGNMENT, longToBytes(partitionId), EMPTY);
+        records.add(
+                new MetadataRecord(
+                        MetadataRecord.Type.DELETE_PARTITION_ASSIGNMENT,
+                        longToBytes(partitionId),
+                        EMPTY));
+        appendAll(records);
     }
 
     /**
@@ -2571,10 +2631,23 @@ public class RaftMetadataClient implements MetadataStoreClient {
         return leaderSelector != null && leaderSelector.isLeader();
     }
 
+    /**
+     * Per-segment append latency attribution (§8.9.1): how much of a metadata write is the Ratis
+     * round-trip versus the commit-to-apply handoff. Diagnostics only.
+     */
+    public AppendLatencyStats appendLatencyStats() {
+        return writer.latencyStats();
+    }
+
     private void append(MetadataRecord.Type type, byte[] key, byte[] payload) throws Exception {
         // append resolves after commit+local-apply; NO separate store.apply (single-writer,
         // §5.1.4).
         writer.append(new MetadataRecord(type, key, payload)).get();
+    }
+
+    /** Single-record variant of {@link #append} for callers that build the record themselves. */
+    private void appendRecord(MetadataRecord record) throws Exception {
+        writer.append(record).get();
     }
 
     /**

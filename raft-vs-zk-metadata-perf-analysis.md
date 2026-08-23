@@ -19,7 +19,7 @@
 
 | 字段 | 内容 |
 |------|------|
-| **性质** | 分析报告。§8 是代码级实现指南；**8.4 prefix iterator、8.3 FetchMetadata 异步停车、8.2 appendAll pipeline 已落地**；8.1 仍是 sketch。 |
+| **性质** | 分析报告。§8 是代码级实现指南；**8.4 / 8.3 / 8.2 已落地**；8.1 仍是 sketch。**§8.9 剩余优化空间的 #1–#6 已落地（§8.10）。§8.11–§8.12 的归因给出最终结论：单写 96.6% 是 fsync，其中一半来自 Ratis 内部的 commit-index metadata entry（Fluss 侧无法消除），gRPC 仅 0.6µs、apply 仅 3.7µs —— 单写路径已到底，剩余方向只有批量化与并发摊薄。优先级见 §9.0。** |
 | **对照设计文档** | [`zookeeper-removal-design.md`](zookeeper-removal-design.md) **§8.4**（v3.17，2026-08-17 appendAll pipeline JMH） |
 | **分支** | `feature/zookeeper-removal-raft` |
 | **测量日期** | 2026-08-16 catalog；**2026-08-17** 复跑 `registerPartition` / Admin `createTable` / `metadataWrite` 对照 |
@@ -682,7 +682,7 @@ ZK 每个 id 一次 CAS（~5ms）。Raft 一次 `ALLOCATE_ID_RANGE` append（~8m
 
 ## 8. 代码级实现指南
 
-本节把 §4 / §7.1 的推论落到 **具体类、方法和可编译的 Java 8 patch sketch**。**8.4、8.3、8.2 已落地**；8.1 仍是 sketch。验证走现有 JMH（`MetadataStoreBenchmark` / `MetadataPathBenchmark`，`@Threads(1)` AverageTime µs/op），并标明哪一行会动、哪一行根本动不了。
+本节把 §4 / §7.1 的推论落到 **具体类、方法和可编译的 Java 8 patch sketch**。**8.4、8.3、8.2 已落地**；8.1 仍是 sketch；**8.9 汇总 8.1–8.4 之外的剩余优化空间（全部未落地），执行顺序见 §9**。验证走现有 JMH（`MetadataStoreBenchmark` / `MetadataPathBenchmark`，`@Threads(1)` AverageTime µs/op），并标明哪一行会动、哪一行根本动不了。
 
 约束与现有代码一致：源码 Java 8（禁止 `var` / `List.of` / `Stream.toList`）；shaded Ratis 包名 `org.apache.fluss.shaded.ratis.org.apache.ratis.*`；apply 线程规则见设计文档 **§5.6**。
 
@@ -1236,6 +1236,9 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 | 8.2 MultiOp 类型 | 新 `Type` + codec | **L** | 与 pipeline 同类，额外原子性 | 高（混版本 / stream） | 当 perf 第一刀 |
 | 8.3 FetchMetadata async | future + scheduler | **M** | **无直接 JMH 行**；`getTableInfo` warm 仍 89µs，孤立仍 ~105ms | 中（双 complete / apply 误 complete） | 在 apply 线程 `complete` RPC 或扫 log |
 | 8.4 prefix iterator | `KvStore.scanPrefixEntries` | **S** | 所有 ~330µs prefix 行；`getTableInfo` 主修复 | **低** | 继续用 `entries()` 做 list |
+| **8.9 剩余空间** | 归因打点 / `appendAll` 推广+分块 / `disableWAL` / 本地直提交 / apply 线程瘦身 | S–M | 见 **§9.1** 逐项 | 低–中（逐项不同） | 未归因就调 flush 旋钮；无分块推广 `appendAll` |
+
+**§8.9 的第 2/3/5/6 项已落地，实测见 §8.10；其余仍未落地。§9 给出执行顺序、验收命令与判定标准。**
 
 **已落地：8.4 prefix iterator（§8.6）+ 8.3 FetchMetadata async（§8.7）+ 8.2 appendAll pipeline（§8.8）。** 8.4 救 store list* / warm `getTableInfo`；8.3 让 tablet long-poll 不再占满 8 个 Netty worker；8.2 让一次 DDL 内多 key 只等一次 apply（`registerPartition` / `createTable`）。写路径再考虑 `async-flush`（8.1）；**永远不要**为分数打开 `unsafe-flush`。
 
@@ -1327,6 +1330,775 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 
 ---
 
+### 8.9 剩余优化空间（8.1–8.4 之外；**全部未落地**）
+
+**性质：** 本节是 §2 里「ZK 仍然更快」那些行的**剩余**杠杆清单，全部是 sketch，**没有任何一项被实现或测量**。凡涉及 Ratis 行为的断言都用 `javap` 对 `fluss-shaded-ratis-1.0-SNAPSHOT.jar`（Ratis 2.4.1）实测过常量与方法签名，见 8.9.1。
+
+**核心判断：** §2.1 那条 **8.2–9.3ms** 的单 append 带是**唯一**根瓶颈。§2.2 的多写行、§2.4 的 database DDL、§2.5 的 1:1 ID、§3.3 的启动里那一次 leader 注册，全都是「N × 单条 append」。因此优化只有两类：**减少 append 条数**（8.9.2）或**压低单条 append 成本**（8.9.3），外加 apply 线程上的搭车开销（8.9.4）。
+
+#### 8.9.1 归因缺口：3.8ms 差值目前没有分解数据
+
+§4 列的五层根因是**推理**，不是测量。关键疑点：ZK `TestingServer` 同样每条 txn fsync（§4.2 已写明），所以 fsync 成本在两边大致相当，**Raft 多出的 ~3.8ms 里 fsync 占比未知**。剩余候选全部未被单独测量：
+
+| 候选 | 量级假设 | 现有数据能否区分 |
+|------|----------|------------------|
+| Ratis gRPC loopback 编解码（`RaftClient.async().send`） | ? | **否** |
+| log worker fsync（`SegmentedRaftLogWorker`） | ? | **否**（ZK 也 fsync，不是净增） |
+| commit → apply 线程切换 | ? | **否** |
+| `store.apply` RocksDB put + WAL | ? | **否** |
+| `awaitApplied` waiter complete + 调用线程 unpark | ? | **否** |
+
+**结论：在打点之前做 8.1 `async-flush` 是盲改。** §8.1.6 自己也写明「不要预期 `metadataWrite` 有显著下降」。建议先加分段计时（Ratis 自带 `RaftServerMetrics` / `raft.server.log.flushTime`，设计 §5.12 已规划），把 `send → reply → applied` 三段分开，再决定投哪一档。**这一项没有 JMH 分数收益，但后续所有取舍都依赖它。**
+
+#### 8.9.2 减少 append 条数：`appendAll` 尚未推广到最差的几行
+
+§8.2 只接了 `createTable` 和 `registerPartition`。**§2.2 里倍数最差的行根本没接**，仍是逐条 `append().get()`：
+
+| JMH 行 | Raft/ZK | 现状 | 串行 append 条数 |
+|--------|--------:|------|------------------|
+| `deleteTableAssignment` | **2.64×**（全表最差） | 每 bucket 一条 `DELETE_LEADER_AND_ISR` + 1 条 assignment | 1 + #buckets |
+| `deletePartitionAssignment` | 1.68× | 同构 | 1 + #buckets |
+| `deleteTable` | 1.74× | 每 partition + 每 schema 各一条 | 1 + #partitions + #schemas |
+
+```1496:1510:fluss-server/src/main/java/org/apache/fluss/server/coordinator/raft/RaftMetadataClient.java
+    public void deleteTableAssignment(long tableId) throws Exception {
+        requireLeader();
+        // ZK deleteTableAssignment uses deletingChildrenIfNeeded — cascade LeaderAndIsr for
+        // non-partitioned table buckets so completeDeleteTable clears bucket state too.
+        Optional<TableAssignment> assignment = getTableAssignment(tableId);
+        if (assignment.isPresent()) {
+            for (Integer bucketId : assignment.get().getBuckets()) {
+                append(
+                        MetadataRecord.Type.DELETE_LEADER_AND_ISR,
+                        tableBucketBytes(new TableBucket(tableId, bucketId)),
+                        EMPTY);
+            }
+        }
+        append(MetadataRecord.Type.DELETE_TABLE_ASSIGNMENT, longToBytes(tableId), EMPTY);
+    }
+```
+
+##### 比 JMH 更重要：ISR 批量路径也在逐条串行（**当前 catalog 完全没测**）
+
+```1249:1256:fluss-server/src/main/java/org/apache/fluss/server/coordinator/raft/RaftMetadataClient.java
+    public void batchUpdateLeaderAndIsr(
+            Map<TableBucket, LeaderAndIsr> leaderAndIsrList, int expectedZkVersion)
+            throws Exception {
+        requireLeader();
+        for (Map.Entry<TableBucket, LeaderAndIsr> entry : leaderAndIsrList.entrySet()) {
+            updateLeaderAndIsr(entry.getKey(), entry.getValue(), expectedZkVersion);
+        }
+    }
+```
+
+`batchRegisterLeaderAndIsrForTablePartition` 同构。对照 ZK：
+
+```533:548:fluss-server/src/main/java/org/apache/fluss/server/zk/ZooKeeperClient.java
+    public void batchRegisterLeaderAndIsrForTablePartition(
+            List<RegisterTableBucketLeadAndIsrInfo> registerList, int expectedZkVersion)
+            throws Exception {
+        if (registerList.isEmpty()) {
+            return;
+        }
+
+        List<CuratorOp> ops = new ArrayList<>(registerList.size());
+        // In transaction API, it is not allowed to use "creatingParentsIfNeeded()"
+        // So we have to create parent dictionary in advance.
+```
+
+ZK 是**一次 Curator transaction**（N 个 op 一次提交）；Raft 是 **N × 8.5ms 串行**。一个 128-bucket 的表 ≈ **1.1 秒**。调用方全在故障转移 / ISR 收缩路径上：
+
+| 调用方 | 位置 |
+|--------|------|
+| `TableBucketStateMachine.batchUpdateLeaderAndIsrWithFallback` | `TableBucketStateMachine.java:245` / `:275` |
+| `TableBucketStateMachine`（partition 注册） | `TableBucketStateMachine.java:552` |
+| `ReplicaStateMachine` | `ReplicaStateMachine.java:491` |
+| `CoordinatorEventProcessor` | `CoordinatorEventProcessor.java:2035` |
+
+**这是目前 Raft 模式最真实的性能风险，而 §8.4 catalog 里没有任何一行覆盖它**（`MetadataStoreBenchmark` 无 `batchUpdateLeaderAndIsr` / `batchRegisterLeaderAndIsrForTablePartition` 基准）。补这个基准的价值可能高于任何单条 append 优化。
+
+##### 推广前的硬约束：现有 `appendAll` 无分块，会撞 Ratis 客户端窗口
+
+`javap` 实测默认值（`fluss-shaded-ratis-1.0-SNAPSHOT.jar`）：
+
+| Ratis 常量 | 实测值 |
+|-----------|-------:|
+| `RaftClientConfigKeys.Async.OUTSTANDING_REQUESTS_MAX_DEFAULT` | **100** |
+| `RaftServerConfigKeys.Write.ELEMENT_LIMIT_DEFAULT` | 4096 |
+| `RaftServerConfigKeys.Log.QUEUE_ELEMENT_LIMIT_DEFAULT` | 4096 |
+
+现有 `appendAll` 一次性把**全部** record `send` 出去，无上限：
+
+```93:101:fluss-server/src/main/java/org/apache/fluss/server/coordinator/raft/RaftJournalWriter.java
+    public CompletableFuture<Long> appendAll(List<MetadataRecord> records) {
+        if (records == null || records.isEmpty()) {
+            throw new IllegalArgumentException("records must not be empty");
+        }
+        List<CompletableFuture<Long>> futures =
+                new ArrayList<CompletableFuture<Long>>(records.size());
+        for (int i = 0; i < records.size(); i++) {
+            futures.add(append(records.get(i)));
+        }
+```
+
+今天最大调用方只有 3 条（schema + assignment + table），安全。**一旦用于 per-bucket（>100 buckets），会超出客户端 outstanding=100**，Ratis 抛 `ResourceUnavailableException` 或阻塞发送线程。
+
+**推广必须同时加分块**（建议 chunk 64，逐块 `allOf().get()`），否则是把 JMH 分数换成生产故障。分块也会放大 8.9.4 的 C3 问题（`whenComplete` 跑在 apply 线程），**C3 应先修**。
+
+语义上：分块后失败窗口从「一批」变成「若干批」，但 ZK 侧 `deletingChildrenIfNeeded` 本来也不是原子的，**不引入新的语义退化**。仍然不需要 `MetadataRecord.Type.MULTI_OP`（§8.2.3 的理由不变）。
+
+#### 8.9.3 压低单条 append 成本（§2.2 里 create+delete 那 12 行的唯一杠杆）
+
+`deleteDatabase` / `deleteRebalanceTask` / `deleteProducerOffsets` 这类行是**两个独立 API 调用**（JMH 的 delete 含前置 create），`appendAll` 救不了，只能降低单条绝对成本。
+
+##### B1. RocksDB WAL 对恢复无贡献 —— 纯开销（建议优先）
+
+```107:109:fluss-server/src/main/java/org/apache/fluss/server/coordinator/raft/RocksDBMetadataKvStore.java
+        DBOptions dbOptions = new DBOptions().setCreateIfMissing(true);
+        ColumnFamilyOptions columnFamilyOptions = new ColumnFamilyOptions();
+        WriteOptions writeOptions = new WriteOptions();
+```
+
+默认 `WriteOptions` = **WAL 开、sync=false**。§3.1 已指出「apply 写 WAL 但不 fsync」，但漏了更强的结论：**这个 WAL 对恢复毫无贡献**。
+
+恢复路径两条，都**不读** RocksDB 的持久化内容：
+
+```265:280:fluss-server/src/main/java/org/apache/fluss/server/coordinator/raft/FlussMetadataStateMachine.java
+    private void load(@Nullable SingleFileSnapshotInfo snapshot) throws IOException {
+        if (snapshot == null) {
+            return; // fresh cluster, nothing to restore
+        }
+        File file = snapshot.getFile().getPath().toFile();
+        if (!file.exists()) {
+            throw new FileNotFoundException("Snapshot file not found: " + file);
+        }
+        List<byte[][]> entries = readEntries(file);
+        synchronized (this) {
+            store.restoreFromSnapshot(entries);
+            TermIndex ti = snapshot.getTermIndex();
+            lastAppliedIndex = ti.getIndex();
+            setLastAppliedTermIndex(ti);
+        }
+    }
+```
+
+- **有 snapshot：** `restoreFromSnapshot` 第一步是 `kvStore.clear()` —— RocksDB 磁盘内容被**整体丢弃并覆盖**，再从 snapshot index+1 重放 log。
+- **无 snapshot：** `lastAppliedIndex = -1`，从 log 起点重放全部；put/delete 幂等，残留被覆盖。
+
+耐久性锚 100% 是 **Raft log fsync + snapshot 文件**（与 §8.1.5 禁止 `unsafe-flush` 的论证一致）。所以 WAL 只是每条 apply 多一次用户态 write + memtable 记账。
+
+**改动：** `writeOptions.setDisableWAL(true)`，不需要新配置项。零正确性代价 —— 比 8.1 `async-flush`（要动 Ratis 耐久性时序）更该先做。省下的量级需实测。
+
+**更激进的同向选项：** metadata store 体量小（snapshot 是单文件全量序列化，`snapshotEntries()` 直接返回 `List<byte[][]>`），KRaft 的对应设计就是**纯内存 image + snapshot**。`InMemoryMetadataKvStore`（`ConcurrentSkipListMap`，含 `scanPrefixEntries`）已是完整实现，今天只用于测试与 follower read view。做成生产可选后端（如 `coordinator.raft.metadata-store=memory|rocksdb`）可彻底消掉 apply 侧 I/O。**前置条件：先量真实 catalog 的堆占用**，否则超大 catalog 有 OOM 风险。
+
+##### B2. 绕过 gRPC loopback：leader 本地直提交
+
+`RaftJournalWriter.append` 走 `raftClient.async().send()` → gRPC，**即使 leader 就是本进程**（§4.1 已列，未给方案）。`javap` 实测 `RaftServer` 直接继承本地提交接口：
+
+```text
+RaftServer extends ... RaftClientProtocol, RaftClientAsynchronousProtocol, AdminProtocol ...
+RaftClientAsynchronousProtocol:
+  CompletableFuture<RaftClientReply> submitClientRequestAsync(RaftClientRequest) throws IOException
+```
+
+且 `RaftClientRequest.newBuilder()` 公开可用（`setClientId` / `setServerId` / `setGroupId` / `setCallId` / `setMessage` / `setType`，配 `RaftClientRequest.writeRequestType()`）。`RaftMetadataClient` 已持有 `ownedServer`，可 `getDivision(RAFT_GROUP_ID)` 判断本地是否 leader。
+
+省掉：protobuf 编解码 + gRPC 两端线程切换 + 客户端滑动窗口记账。
+
+**代价：** 自己维护单调 `callId` 与 `ClientId`；`NotLeaderException` 必须能回退到现有 `raftClient`（follower 或 leadership 转移时）；失去 Ratis 客户端的重试策略。
+
+**这是唯一能同时改善所有 append 行、且不牺牲任何耐久性的手段。** 但幅度完全取决于 8.9.1 的归因结果 —— 若 gRPC 只占 3.8ms 里的一小部分，不值得这个复杂度。**必须先归因。**
+
+##### B3. `async-flush`（= §8.1，重申结论）
+
+`javap` 确认 API 与默认值存在：`Log.setAsyncFlushEnabled`，`ASYNC_FLUSH_ENABLED_DEFAULT=false`，`FORCE_SYNC_NUM_DEFAULT=128`，`UNSAFE_FLUSH_ENABLED_DEFAULT=false`；两者互斥（同开抛 `IllegalStateException`）。
+
+§8.1.3 的判断成立：**`@Threads(1)` 串行 `.get()` 下几乎无效**。它只在并发写下有价值，而**现有 catalog 没有 `@Threads(N)` 写用例**，所以今天连验收手段都不存在。优先级应低于 B1，且必须配一个并发写 JMH 才能验收。§8.1.5 禁止 `unsafe-flush` 的理由不变，无需重新讨论。
+
+#### 8.9.4 apply 线程上的搭车开销（都在写延迟关键路径内）
+
+因为 `append` 要 `awaitApplied`（§4.3），**apply 循环里每一微秒都直接计入调用方写延迟**。三处可省：
+
+**C1 — 每条写多一次 KvStore `get`，只为喂 watch 的 `oldValue`：**
+
+```50:52:fluss-server/src/main/java/org/apache/fluss/server/coordinator/raft/RaftMetadataStore.java
+    public void apply(MetadataRecord record) {
+        byte[] key = MetadataKeys.keyOf(record);
+        byte[] oldValue = kvStore.get(key);
+```
+
+全仓只有 3 个 watcher（`RaftTableChangeWatcher` 3 个前缀、`RaftTabletServerChangeWatcher`、`RaftCoordinatorChangeWatcher`）。给 `MetadataWatchService` 加 `hasWatch(key)`，无匹配时跳过 `get` —— 绝大多数 record type 直接省掉一次 RocksDB 读。
+
+**C2 — `fireWatch` 在 apply 线程把 key 转 hex 字符串，再对每个前缀做 `String.startsWith`：**
+
+```61:70:fluss-server/src/main/java/org/apache/fluss/server/coordinator/raft/MetadataWatchService.java
+    public void fireWatch(byte[] key, byte[] oldValue, byte[] newValue) {
+        String h = hex(key);
+        for (Map.Entry<String, CopyOnWriteArrayList<WatchCallback>> e : watches.entrySet()) {
+            if (h.startsWith(e.getKey())) {
+                for (WatchCallback cb : e.getValue()) {
+                    cb.onChange(key, oldValue, newValue);
+                }
+            }
+        }
+    }
+```
+
+每条 apply 一次 `StringBuilder` 分配 + 2×keyLen 字符写入 + 全 watch 表遍历。改成字节前缀比较、并按 3 字节 type header 分桶查 `HashMap`。纯 CPU、零风险。
+
+**C3 — waiter 在持锁的 apply 线程上 complete（**这条是正确性问题，不只是性能**）：**
+
+```200:206:fluss-server/src/main/java/org/apache/fluss/server/coordinator/raft/FlussMetadataStateMachine.java
+    private synchronized void completeAppliedWaiters(long index) {
+        NavigableMap<Long, CompletableFuture<Long>> done = appliedWaiters.headMap(index, true);
+        for (CompletableFuture<Long> w : done.values()) {
+            w.complete(index);
+        }
+        done.clear();
+    }
+```
+
+调用方挂在这些 future 上的任何 `thenCompose` / `whenComplete` 都会在 **apply 线程 + 持有 state machine monitor** 时执行。
+
+- `RaftMetadataClient.append` 只做 `.get()`（park/unpark），尚可。
+- **但 `appendAll` 的 `allOf(...).whenComplete` 已经把「统计 applied 计数 + complete result」拽进了 apply 循环**（`RaftJournalWriter:107-129`）。这违反了 §5.6 以及 `setApplyListener` javadoc 自己定的规则 —— 对比 `MetadataStreamService.onApplied` 就老老实实只 `execute(drainWaiters)`。
+
+**改动：** 锁内只收集 waiter 列表，出锁后再 complete；或统一交给一个 completion executor。**必须在 8.9.2 分块推广之前修**，否则 per-bucket 批量会显著放大 apply 循环上的搭车工作。
+
+C1+C2+C3 各自只有几 µs~几十 µs，**动不了 8.5ms 的大头**，但零风险，且 C3 是正确性防线。
+
+#### 8.9.5 启动路径（§3.3，194ms vs 99.3ms）
+
+§3.3 的归因成立（first-election 窗口 + Ratis/RocksDB 初始化 + catch-up + 一次 leader 注册 append）。两个候选，**价值都低**：
+
+1. **单 voter 时缩短 first-election。** `coordinator.raft.first-election.timeout` 默认 300ms（夹具 150ms，min = 一半）。voter set size == 1 时没有竞争者，理论上无需等待窗口。只改善单节点 / bootstrap 与测试夹具，**生产 3-voter 零收益**。
+2. **leader 注册 append 合批 —— 实际不可行。** `registerCoordinatorLeader()`（`CoordinatorServer.java:433`）与 `createDefaultDatabase()`（`:492`）之间隔着 `synchronized (lock)` 块、`rpcClient` / `coordinatorChannelManager` / `autoPartitionManager` 构造、authorizer 启动、`coordinatorEventProcessor.startup()`。合成一次 `appendAll` 需要重排启动顺序，**风险远大于省一个 RTT**。不建议。
+
+另：`javap` 确认 `RaftServerConfigKeys.LeaderElection.PRE_VOTE_DEFAULT = true`，`setPreVote` 可用。3-voter 选举时长可据此调，但 §8.4 已把选举验收交给 `RaftLeaderElectionTimingITCase`，**1-node SingleShot 启动 bench 不该用来验收选举**（§3.3 末尾已声明）。
+
+---
+
+### 8.10 Third-cut 落地：ISR 批量 + apply 路径瘦身（2026-08-23，同机同 flags）
+
+落地了 §9.1 的 **#2 / #3 / #4 / #5 / #6**。**#1（归因打点）和 #7（本地直提交）仍未做**，所以本节不声称知道 8.5ms 里各成分占比。
+
+#### 8.10.1 实现
+
+| 项 | 改动 |
+|----|------|
+| **#2 C3** | `FlussMetadataStateMachine`：`applyEntry` / `notifyTermIndexUpdated` 锁内只 `drainAppliedWaiters` 收集 waiter，出锁后 `completeAll`；apply listener 也移出锁。 |
+| **#3 B1** | `RocksDBMetadataKvStore`：`new WriteOptions().setDisableWAL(true)`。 |
+| **#6 C1** | `MetadataWatchService.hasWatch(key)` 新增；`RaftMetadataStore.apply` 仅在有 watcher 匹配时才预读 `oldValue`。 |
+| **#6 C2** | `MetadataWatchService` 由「hex 字符串 + `String.startsWith` 全表遍历」改为 copy-on-write `Registration[]` + 原始字节前缀比较，热路径零分配。 |
+| **#5 A** | `RaftJournalWriter.appendAll` 改为分块 send-then-wait（`sendChunk` 递归，深度 `ceil(n/chunk)`）；`appendAll` 推广到 `deleteTableAssignment` / `deletePartitionAssignment` / `deleteTable` / `batchUpdateLeaderAndIsr` / `batchRegisterLeaderAndIsrForTablePartition`。 |
+| **#5 配套** | 新增 `coordinator.raft.append-chunk-size`（默认 64）；`RaftMetadataServer.applyAppendPipelineProperties` 把 Ratis `Async.OUTSTANDING_REQUESTS_MAX` 设为 `max(100, 2 * chunk)`，使 chunk 增大不会静默撞上客户端在途上限。 |
+| **#4 基准** | 新增 `MetadataStoreBenchmark.batchUpdateLeaderAndIsr`（100 buckets，跨默认 chunk 边界）。 |
+
+`batchRegisterLeaderAndIsrForTablePartition` **故意不做基准**：ZK 实现用非幂等 `create`（含父节点 create），AverageTime 模式下反复调用会抛 `NodeExists`，测不出东西。
+
+#### 8.10.2 新增基准：100-bucket ISR 批量
+
+**Flags：** warmup 2×1s、measurement 3×1s、`@Fork(0)`、1 thread、AverageTime µs/op，JAVA_HOME = TencentKona 11.0.23（同 §8.6）。
+
+| 配置 | ZK µs | Raft µs | Raft/ZK | chunk 数 |
+|------|------:|--------:|--------:|---------:|
+| `batchUpdateLeaderAndIsr`，chunk=64（默认） | **4456** | **18473** | **4.14×** | 2（64+36） |
+| `batchUpdateLeaderAndIsr`，chunk=128 | 4456 | **9425** | **2.12×** | 1（100） |
+| 单条 `updateLeaderAndIsr`（对照） | 4504 | 8315 | 1.85× | 1 |
+
+**归因是算术闭合的，不是猜测：**
+
+- 单条 Raft = 8315µs。chunk=64 时 18473 / 8315 = **2.22** ≈ 2 个 chunk。
+- chunk=128 时 9425 / 8315 = **1.13** ≈ 1 个 chunk，且 9425 ≈ 单条 8315 + 少量 pipeline 开销。
+- **结论：批量的成本 ≈ chunk 数 × 单条 append 成本。** pipeline 本身几乎不额外收费（100 条挤进一个 chunk 只比 1 条贵 13%）。
+
+#### 8.10.3 落地前 vs 落地后
+
+落地前 `batchUpdateLeaderAndIsr` 是逐条 `updateLeaderAndIsr(...)` 串行 `.get()`，即 100 × 单条：
+
+| | 估算/实测 | 说明 |
+|---|---:|---|
+| 落地前（100 × 8315µs） | ≈ **832ms** | 未直接测（旧代码已替换），由单条实测线性外推 |
+| 落地后 chunk=64 | **18.5ms** | ≈ **45×** 改善 |
+| 落地后 chunk=128 | **9.4ms** | ≈ **88×** 改善 |
+
+**这是本轮最重要的结果，而且它在 §8.4 的原 catalog 里完全不可见** —— 128-bucket 表的故障转移原本要 ~1.1 秒，现在是 ~10ms 量级。调用方全在关键路径：`TableBucketStateMachine:245`/`:275`/`:552`、`ReplicaStateMachine:491`、`CoordinatorEventProcessor:2035`。
+
+#### 8.10.4 chunk 默认值为什么留在 64（而不是 128）
+
+实测摆明 chunk=128 在这一行快一倍，但默认值仍是 64：
+
+- **64 是延迟/在途请求的折中，不是最优点。** chunk 越大，单批在途 Raft 请求越多，与并发的单条 append 争抢同一个 `RaftClient` 窗口和 server 端写队列。
+- 上限联动已经做了（`max(100, 2*chunk)`），所以**调大 chunk 是安全的配置动作**，不需要改代码：ISR 批量密集的部署可以设 `coordinator.raft.append-chunk-size=128`。
+- 但把**默认**改到 128 等于让所有部署都吃更大的在途窗口，而收益只体现在 >64 条的批量上。**这个取舍需要 3-voter 实测（§7.2）后再定，1-voter loopback 不足以支撑改默认值。**
+
+#### 8.10.5 未变的结论
+
+- **单条 append 仍是 8315µs（Raft）vs 4504µs（ZK），1.85×。** 本轮完全没有触碰这个带 —— C1/C2/C3 是 µs 级、B1 省的是一次用户态 write，都远小于噪声。§7.1 的判断不变。
+- `metadataWrite` 等单写行**不应该**因本轮改动而变化；若复跑发现变了，按 §9.3 当噪声或改错层处理。
+- **仍然没有归因数据**（§8.9.1）。chunk 数 × 单条成本的闭合只说明「批量已经退化成单条问题」，没说明单条 8.5ms 里 fsync / gRPC / 线程切换各占多少。#7（本地直提交）的价值判断依旧悬空。
+
+#### 8.10.6 验证
+
+- 单测：`fluss-server` raft 包 **79 tests 全过**。新增/扩充：`MetadataWatchServiceTest`（6）、`RaftJournalWriterTest`（9，含分块 / 自定义 chunk / 跨块失败前缀计数）、`FlussMetadataStateMachineTest`（12，含 3 个「continuation 不得在锁内跑」的回归）、`RaftMetadataServerTest`（7，含 outstanding 上限联动）。
+- IT（真实 Ratis + RocksDB）：`RaftMetadataClientITCase`、`RocksDBMetadataKvStoreITCase`、`MetadataStreamServiceITCase`、`MetadataStreamRpcITCase` 全过。
+
+---
+
+## 8.11 归因实测：8.5ms 里 96% 是 fsync，gRPC 只有 0.6µs（2026-08-23）
+
+落地了 §9.1 的 **#1**（唯一的前置项）。**这一节推翻了 §4 和 §8.9 的若干推测，后续所有优先级都要按它重排。**
+
+### 8.11.1 实现
+
+- `AppendLatencyStats`（新类）：在 `RaftJournalWriter.append` 上打三个时间戳（send / reply / applied），累加 sum+count（无 reservoir，零分配），导出两段均值与 `sendToReplyShare()`。经 `RaftMetadataClient.appendLatencyStats()` 暴露。
+- `MetadataJmhSupport.printAppendAttribution`：在 `@TearDown(Level.Trial)` 打印两段归因，并**反射**读取 Ratis 自带 `log_worker` / `server` 计时器（`flushTime` / `syncTime` / `appendEntryLatency` / `queueingDelay` / `enqueuedTime` / `clientWriteRequest`）。用反射是因为 Ratis 把 Dropwizard 重定位到 `ratis.thirdparty.com.codahale`，为一次性诊断不值得引入对重定位类的编译期依赖。
+
+**没有自造 fsync 打点** —— Ratis 内置计时器已经覆盖，自己再测一遍只会引入偏差。
+
+### 8.11.2 实测（单条 `updateLeaderAndIsr`，1-voter，flags 同 §8.6）
+
+```
+raft append attribution: appends=726 failures=0 total=8467.4us
+    sendToReply=8463.6us(100.0%)  replyToApplied=3.7us(0.0%)
+  ratis[...server...].clientWriteRequest:    count=726   mean=0.6us
+  ratis[...log_worker].queueingDelay:        count=1453  mean=9.4us
+  ratis[...log_worker].appendEntryLatency:   count=1452  mean=43.0us
+  ratis[...log_worker].writelogExecutionTime:count=1452  mean=4124.4us
+  ratis[...log_worker].flushTime:            count=1451  mean=4089.6us
+  ratis[...log_worker].syncTime:             count=1451  mean=4059.2us
+  ratis[...log_worker].enqueuedTime:         count=1264  mean=1706.0us
+  ratis[...log_worker].startlogsegmentExecutionTime: count=1 mean=45512.6us
+```
+
+**注意 count 列：`flushTime` / `syncTime` / `appendEntryLatency` 的 count ≈ 1451 ≈ 2 × 726。每次 `append` 触发两次 fsync。**
+
+预算表（每次 append，总 8467µs）：
+
+| 成分 | 来源 | 每 append | 占比 |
+|------|------|---------:|-----:|
+| **fsync（2 × 4090µs）** | `flushTime` × 2 | **≈ 8179µs** | **≈ 96.6%** |
+| log append CPU（2 × 43µs） | `appendEntryLatency` × 2 | ≈ 86µs | 1.0% |
+| worker 队列等待（2 × 9.4µs） | `queueingDelay` × 2 | ≈ 19µs | 0.2% |
+| **gRPC + Ratis 请求plumbing** | `clientWriteRequest` | **0.6µs** | **0.007%** |
+| commit→apply + apply 循环 | 本节 `replyToApplied` | **3.7µs** | 0.04% |
+| 残差 | — | ≈ 180µs | 2.1% |
+
+`syncTime`(4059) ≈ `flushTime`(4090)，说明 flush 几乎全是 `FileChannel.force`；`writelogExecutionTime`(4124) ≈ flush + append，即 log worker 任务时间就是 fsync 时间。
+
+### 8.11.3 被推翻的推测
+
+| 出处 | 原推测 | 实测 | 结论 |
+|------|--------|------|------|
+| §4.1 / §8.9.3 B2 | gRPC loopback 编解码是 3.8ms 差值的候选大头 | **0.6µs（0.007%）** | **B2 彻底作废。** 即便把 gRPC 完全消除，单条 append 也只快 0.6µs。§9.1 的 #7 应删除，不是延后 |
+| §4.2 | 「ZK 也 fsync，所以 fsync 不是净增」 | Raft **每次 append 两次 fsync**，每次 4.09ms | 部分错误：不是「fsync 更慢」，而是**次数翻倍** |
+| §8.9.1 | 「剩余候选是 gRPC + 5~6 次线程切换 + RocksDB WAL + 唤醒」 | 这些合计 < 4%（含 3.7µs 的 commit→apply） | 全部是噪声级 |
+| §8.9.4 C1/C2/C3 | apply 线程瘦身「几 µs~几十 µs」 | `replyToApplied` 总共只有 **3.7µs** | 判断正确但**上限极低**：整个 apply 段已经只有 3.7µs，再优化空间为零 |
+| §8.9.3 B1 | `disableWAL` 应让所有 append 行同向下降 | 未观察到（§9.3 已记录） | 与本节一致：RocksDB 侧根本不在预算里 |
+
+### 8.11.4 唯一有意义的方向：减少 fsync 次数
+
+fsync 占 96.6%，且**每 append 两次**。这把优化空间收窄到一件事：**降低每次写的 fsync 次数或频率**。
+
+1. **查清第二次 fsync 的来源（必须先做）。** `FORCE_SYNC_NUM_DEFAULT = 128`（`javap` 实测）不解释 2×。候选：commit-index metadata entry 单独 flush、`RaftServerConfigKeys.Log.StateMachineData` 相关同步、或 segment 预分配路径。若第二次 fsync 是 metadata entry 且可与数据 entry 合并/批量化，**单条 append 可望直接减半到 ~4.2ms，逼近 ZK 的 4.5ms**。这是目前唯一的高杠杆项。
+2. **`async-flush`（§8.1 / #8）的定位需要上调。** 原判断是「串行 `.get()` 下几乎无效」——在 fsync 占 96.6% 的事实下，这个判断仍然成立（串行时无批可合），但它现在是**唯一**能摊薄 fsync 的机制，因此并发写基准的价值从「补充」上升为「必需」。
+3. **`unsafe-flush` 依旧禁止**（§8.1.5）。fsync 占比高**不是**打开它的理由 —— 它的代价是静默丢元数据。
+4. **对比 ZK 的正确口径。** ZK `TestingServer` 每 txn 一次 fsync ≈ 4.5ms；Raft 是两次 ≈ 8.2ms。**1.85× 几乎精确等于 2 倍 fsync 之比。** 这说明 Raft 与 ZK 的单写差距**不是**共识开销，而是 fsync 次数 —— 一个可能可修的实现细节，而非 §7.1 所说的「设计内正确性税」。§7.1 需要按此修订。
+
+### 8.11.5 副产品：ISR 批量的解释完全闭合
+
+§8.10.2 得出「批量成本 ≈ chunk 数 × 单条成本」。本节给出机制：单条成本 = 2 次 fsync，一个 chunk 内的 N 条并发 append 会被 log worker 合并成少量 fsync 批次，所以一个 chunk ≈ 一个 fsync 批次 ≈ 一条 append 的时间。这也解释了为什么 100 条挤进一个 chunk 只比 1 条贵 13%。
+
+### 8.11.6 验证
+
+- 单测：`AppendLatencyStatsTest`（7）新增，raft 包共 **86 tests 全过**。
+- 打点开销：两次 `System.nanoTime()` + 三次原子加，相对 8.5ms 可忽略；实测 `updateLeaderAndIsr` 8151–8710µs，与打点前 8315µs 同噪声带内。
+- 归因是**恒等闭合**的：`sendToReply + replyToApplied = total`（`AppendLatencyStatsTest.testSegmentsSumToTotal` 固化）。
+
+---
+
+## 8.12 第二次 fsync 的根因 + async-flush 落地（2026-08-23）
+
+本节分两部分：**(A)** 确证 §8.11 发现的「每 append 两次 fsync」中第二次是什么、能不能消除（§9.0 #10）；**(B)** 据此落地唯一还有杠杆的优化 `async-flush`（§9.0 #8），并系统排查 #5 的覆盖面。
+
+---
+
+### A 部分：第二次 fsync 的根因
+
+**结论：Fluss 侧不能消除，但可被批量/并发摊薄。**
+
+#### 8.12.0 先确认 #5（appendAll 推广）已无遗漏
+
+用 AWK 扫描 `RaftMetadataClient` 全部方法，找「含循环或多次 `append`」的候选（41 处命中）。逐一核对后：**写路径无遗漏**。
+
+- 40 处是**读方法**（`listDatabases` / `getTables` / `bucketSnapshots` / …），循环只在内存 scan 结果上跑，不含 append。
+- `deleteTable` / `batchUpdateLeaderAndIsr` / `batchRegisterLeaderAndIsrForTablePartition` 命中「有循环」但 `appends=0` —— 因为已改成往 `List<MetadataRecord>` 里塞、最后一次 `appendAll`（§8.10.1）。这正是期望形态。
+- `updateMetadataVersion` 是 `appends=1 loop=1`：循环用于校验 voter 的 max supported version，只有一次 append。**正确，无需批量**。
+- `tryRegisterProducerOffsets` 单次 append + `synchronized` 去重，正确。
+
+**`appendAll` 的推广已完成，没有剩余的「N 次串行 append」写路径。**
+
+### 8.12.1 决定性证据：entry 计数精确闭合
+
+在 §8.11 的归因里补上 Ratis 的 entry 类型计数器，单条 `updateLeaderAndIsr` 一个 trial：
+
+```
+raft append attribution: appends=728 failures=0 total=8361.4us
+    sendToReply=8357.8us(100.0%)  replyToApplied=3.7us(0.0%)
+  stateMachineLogEntryCount: 728     ← 我们的数据 entry（= appends）
+  metadataLogEntryCount:     727     ← Ratis 自己追加的 commit-index entry
+  configLogEntryCount:         1     ← 启动时的配置 entry
+  appendEntryCount:         1456     = 728 + 727 + 1  ✓
+  flushCount:               1455     ≈ 每个 entry 一次 fsync  ✓
+  flushTime: count=1455 mean=4056.2us    syncTime: count=1455 mean=4023.6us
+```
+
+**`metadataLogEntryCount` = `stateMachineLogEntryCount` − 1**：每次业务 append 精确对应一条额外 metadata entry。而 `flushCount ≈ appendEntryCount`，即**每个 entry 各自 fsync 一次**。8361µs ≈ 2 × 4056µs，闭合。
+
+### 8.12.2 代码路径（`javap` 逐层确认）
+
+```
+LeaderStateImpl.updateCommit(LogEntryHeader[])
+  ├─ raftLog.getLastCommittedIndex()      → commitIndex
+  ├─ logMetadata(commitIndex)              ← 无条件调用，无分支、无去重
+  │    └─ raftLog.appendMetadata(currentTerm, commitIndex)
+  │         └─ RaftLogBase.appendMetadata → runner.runSequentially(...)
+  │              └─ 与数据 entry 同一条 appendEntry → 同一 log worker → fsync
+  └─ commitIndexChanged() → notifySenders()
+```
+
+`logMetadata` 的字节码只有 4 条指令（`getfield raftLog` / `getfield currentTerm` / `invokeinterface appendMetadata` / `notifySenders`），**没有任何条件判断**。commit index 每推进一次就写一条 metadata entry，且它走 `RaftLogBase.appendMetadata` → 同一个 `runner.runSequentially` → 同一个 log worker，因此享受同样的 fsync 语义。
+
+这是 Ratis 持久化 commit index 的方式（重启后无需重放即可知道 commit 位置），**属于 Ratis 内部实现，Fluss 无法通过配置关闭**。`FORCE_SYNC_NUM_DEFAULT = 128` 与此无关 —— 那是「连续多少 entry 强制 sync 一次」的上限，不是下限。
+
+### 8.12.3 为什么批量能摊薄它：批量场景对照
+
+同一归因跑在 `batchUpdateLeaderAndIsr`（100 buckets/op，chunk=64）：
+
+| 指标 | 单条场景 | 批量场景（100/op） | 变化 |
+|------|--------:|------------------:|------|
+| appends | 728 | 26520 | — |
+| `appendEntryLatency` count | 1456（**2.00×** appends） | 27184（**1.025×** appends） | metadata entry 占比 100% → 2.5% |
+| **`flushTime` count** | 1455（**2.00×** appends） | **1312（0.049×** appends） | **每次 fsync 覆盖 ~21 个 entry** |
+| `flushTime` mean | 4056µs | 4123µs | **基本不变** |
+| `appendEntryLatency` mean | 43.2µs | 2.1µs | 批量下摊薄 |
+| `clientWriteRequest` mean | 1.1µs | 0.1µs | gRPC 依旧可忽略 |
+
+两个关键事实：
+
+1. **fsync 单次成本恒定 ≈ 4.1ms，与批大小无关**（4056 vs 4123µs）。这是磁盘特性，不是软件开销。
+2. **批量把 fsync 次数从 2×appends 降到 0.05×appends**：log worker 把队列里积压的 entry 合并成一次 fsync，且 commit index 推进一次只产生一条 metadata entry（被 100 条 append 共享）。
+
+**这解释了 §8.10.2 的全部现象**：一个 chunk ≈ 一到两个 fsync 批次 ≈ 一条单独 append 的时间，所以 100 条挤进一个 chunk 只比 1 条贵 13%；chunk=64 需要 2 个 chunk 所以近似翻倍。
+
+### 8.12.4 #10 的结论：已诊断，不做
+
+原设想是「消除第二次 fsync → 单条 8.5ms 降到 ~4.2ms，逼近 ZK 的 4.5ms」。证据表明**这条路在 Fluss 侧不可行**：
+
+- metadata entry 由 `LeaderStateImpl.logMetadata` 无条件产生，**没有配置开关**，且承载 commit index 持久化 —— 去掉会损害 Ratis 自身的恢复语义。
+- 要改只能改 Ratis（把 metadata entry 与后续数据 entry 合并 flush，或让它不单独触发 fsync）。这是**上游改动**，不属于本仓库范围，也不该为了 JMH 分数 fork Ratis。
+- **真正的缓解手段是批量化，而它已经落地了**（§8.10）。
+
+因此 **#10 从「最高优先级」调整为「已诊断、不做」**。取而代之的结论是：**单写路径已无 Fluss 侧可做的优化，剩下的全部是「让写变成批量写」。**
+
+### 8.12.5 对 §7.1 / §8.11.4 的最终修订
+
+§8.11.4 曾据「1.85× ≈ 2 倍 fsync 之比」推断单写差距是「可能可修的实现细节」。本节收紧这个判断：
+
+- **机制已完全明确**：Raft 每写 2 次 fsync（数据 + commit-index metadata），ZK 每 txn 1 次。
+- **但对 Fluss 不可修**（§8.12.4）。所以在**单条写**口径上，1.85× 应视为**采用 Ratis 的既定成本**，而非待办优化项。
+- **有意义的口径转向两个**：(a) 批量写（已优化，§8.10）；(b) 3-voter 同 AZ 的 p50/p99（§7.2，未测 —— 届时网络 ack 会与 fsync 重叠，比值不会是简单的 2×）。
+
+### 8.12.6 验证
+
+- 诊断代码只加在 JMH 侧（`printAppendAttribution` 增加 counter dump），**未改动任何生产代码**。
+- raft 包 **86 单测**不变、全过；`spotless:check` 通过。
+- 数字可复现且恒等闭合：728 + 727 + 1 = 1456 ≈ `flushCount` 1455，不是统计估计。
+
+---
+
+
+---
+
+### B 部分：async-flush 落地（并发写 1.99× 提速）
+
+A 部分证明单条写在 Fluss 侧已到底，唯一剩下的杠杆是**让 fsync 被并发摊薄**。本部分落地 §9.0 #8 并实测验证。
+
+#### 8.12.B1 新增配置与并发写基准
+
+| 项 | 内容 |
+|----|------|
+| `coordinator.raft.async-flush.enabled`（默认 **false**） | 映射 Ratis `RaftServerConfigKeys.Log.setAsyncFlushEnabled`，在 `applyAppendPipelineProperties` 里设置 |
+| `MetadataStoreBenchmark.concurrentUpdateLeaderAndIsr` | `@Threads(8)`，512 个预注册 bucket 轮转，线程间无写写冲突 |
+| `-Dfluss.jmh.raft.async-flush=true` | JMH 侧覆盖开关，可 A/B 而不改 session cache key |
+
+`@Threads(8)` 是**方法级覆盖**类上的 `@Threads(1)` —— 这是 §8.1.3 一直缺失的验收手段：此前所有写行都是串行的，`async-flush` 根本无从体现。
+
+#### 8.12.B2 实测：A/B（1-voter，8 线程，其余 flags 同 §8.6）
+
+| 指标 | async-flush **off**（默认） | async-flush **on** | 变化 |
+|------|--------------------------:|------------------:|------|
+| **`concurrentUpdateLeaderAndIsr`** | **8067.8µs** | **4055.1µs** | **1.99× 提速** |
+| stdev | ±1551 | **±517** | 更稳 |
+| `sendToReply` | 8127.1µs (100.0%) | 4045.6µs (100.0%) | 减半 |
+| `replyToApplied` | 0.9µs | 0.6µs | 依旧可忽略 |
+| **`flushTime` mean** | **4041.2µs** | **7.2µs** | **fsync 移出关键路径** |
+| `flushCount` | 2518 | 12243 | 次数变多但每次几乎免费 |
+| `flushCount / appends` | 0.45 | 1.15 | — |
+| `metadataLogEntryCount / appends` | 0.23 | 0.18 | 并发本身已摊薄 metadata entry |
+
+**两个独立的效果叠加：**
+
+1. **并发本身就摊薄 fsync**（无需任何开关）：串行时 `flushCount/appends = 2.0`（§8.12.1），8 线程并发时降到 **0.45** —— log worker 把排队的 entry 合并了。这与 §8.12.3 的批量观察同源。
+2. **async-flush 让 fsync 不再阻塞 ack**：`flushTime` mean 从 4041µs 塌到 **7.2µs**。注意 `flushCount` 反而**上升**到 12243（1.15×/append），但总延迟仍减半 —— 说明它不是靠"少 flush"，而是靠**不等 flush**。
+
+#### 8.12.B3 为什么这不是 `unsafe-flush`（耐久性论证）
+
+`async-flush` 与 §8.1.5 禁止的 `unsafe-flush` 是**不同语义**，这一点必须写清楚，否则很容易被后人当成同类而误开：
+
+| | `async-flush`（本节采纳） | `unsafe-flush`（**永不采纳**） |
+|---|---|---|
+| ack 时机 | flush **完成之后** | flush **完成之前** |
+| 崩溃后果 | 已 ack 的写不会丢 | **已 ack 的写可能静默丢失** |
+| 作用机制 | flush 不阻塞其他 writer，可并行/合并 | 跳过等待 |
+| Ratis 约束 | 两者互斥，同开抛 `IllegalStateException` | 同左 |
+
+代码里已用注释锁死这个边界，并有两个测试守护：`testAsyncFlushDefaultsOffAndNeverEnablesUnsafeFlush`、`testAsyncFlushCanBeEnabledWithoutUnsafeFlush`（后者断言开 async 时 unsafe 仍为 false）。
+
+#### 8.12.B4 默认值仍为 false（不是遗漏）
+
+实测 1.99×，但默认值保持关闭，理由：
+
+1. **只在并发写下有效。** 串行写没有可合并对象 —— §8.1.3 的原判断在此得到确认，本节没有推翻它，而是补齐了它缺失的另一半场景。
+2. **1-voter loopback 不能代表生产。** 3-voter 下 follower ack 与 fsync 重叠，async-flush 的收益可能被网络掩盖，也可能仍显著 —— 未测（§7.2）。
+3. **它改变了 flush 的时序行为**，虽不牺牲已 ack 写的耐久性，但值得由部署方显式开启。**元数据写密集且并发的部署可以设 `coordinator.raft.async-flush.enabled=true`。**
+
+#### 8.12.B5 验证
+
+- 生产侧改动：1 个新 `ConfigOption` + `applyAppendPipelineProperties` 里一行 setter。
+- raft 包 **88 单测**全过（`RaftMetadataServerTest` 从 7 → 9，新增两个 flush 语义测试）；`spotless:check` 通过。
+- A/B 可复现：`-Dfluss.jmh.raft.async-flush=true` 切换，两次运行的 stdev（±1551 / ±517）都远小于 4013µs 的差值。
+
+---
+
+## 8.13 3-voter 实测：async-flush 在真实 quorum 下 2.2×（2026-08-23）
+
+补齐 §7.2 一直缺失的 3-voter 口径，并据此**定夺 §9.0 遗留的 async-flush 默认值问题**。结论与 1-voter 上的保守判断相反：**3-voter 下 async-flush 收益更大**。
+
+### 8.13.1 夹具：必须 1→N 增长，不能一次性 bootstrap
+
+`-Dfluss.jmh.raft.voters=3` 让 `StoreSession` 起 1 个 `RaftMetadataClient` + 2 个裸 `RaftMetadataServer` follower。两个坑都是实测踩出来的，**症状都是干净的 30s 静默超时，没有任何异常**：
+
+1. **peer-id 方案必须一致。** `RaftMetadataClient` 用 `peerIdForAddress`（`host:port` → `host_port`）。follower 若用 `RaftPeerId.valueOf(address)`，双方对 peer 身份认知不一致，选举永不完成。为此把 `resolveGroupForVoters` 从 private 提为 public，两侧共用一套解析。
+2. **必须 1→3 增长（`addVoter`）**，不能让 3 个 peer 都带完整 3-voter conf 启动 —— 后者每个 peer 都在等一个从未达成过配置共识的 quorum。`RaftVoterReconfigurationITCase` 的注释早已记录这个陷阱，但我第一次仍然踩了。
+
+修好后 3-voter 起集群只要 **2.1s**。夹具本身由新增的 `RaftThreeVoterQuorumITCase` 守护（选举 + 真实 quorum 提交），否则将来回归时基准会静默测不出数而不是报错。
+
+### 8.13.2 实测：单条写 A/B（3-voter，其余 flags 同 §8.6）
+
+| 指标 | 1-voter（§8.11） | **3-voter, async-flush off** | **3-voter, async-flush on** |
+|------|----------------:|----------------------------:|---------------------------:|
+| `updateLeaderAndIsr` | 8312µs | **18109µs** | **8233µs** |
+| stdev | ±243 | **±29564**（极不稳） | **±851** |
+| `sendToReply` | 8358µs (100%) | 17943µs (100%) | 8225µs (100%) |
+| `replyToApplied` | 3.7µs | 4.1µs | 1.8µs |
+| **leader `flushTime` mean** | 4056µs | **8213µs** | **68µs** |
+| follower `flushTime` mean | — | 9840 / 9811µs | 9.4 / 8.9µs |
+| `flushCount / appends` | 2.0 | 2.0 | 2.0 |
+| `clientWriteRequest` | 1.1µs | 0.6µs | — |
+
+**关键发现：3-voter 让 fsync 变慢了一倍，而不是引入了网络开销。**
+
+- `clientWriteRequest` 仍是 **0.6µs** —— 网络/gRPC 依然可忽略，§8.11.3 对 B2 的否定在 3-voter 下同样成立。
+- leader `flushTime` 从 4056µs 涨到 **8213µs**，follower 涨到 ~9.8ms。三个 Ratis 节点在**同一块磁盘**上各自 fsync、互相争抢 —— 这是 fsync 串行化，不是共识开销。
+- `flushCount/appends` 仍是 2.0（§8.12 的 commit-index metadata entry 在 3-voter 下不变）。
+
+**async-flush 基本消除了这个问题**：leader `flushTime` 8213µs → **68µs**，总延迟 18109µs → **8233µs（2.20×）**，stdev 从 ±29564 收敛到 ±851。
+
+### 8.13.3 修订 §8.12.B4：async-flush 的收益来源变了
+
+§8.12.B4 曾以「只在并发写下有效」为由保持默认 false。3-voter 数据要求修订：
+
+| 场景 | async-flush 收益 |
+|------|-----------------|
+| 1-voter 串行写 | 无（无可合并对象）—— §8.1.3 原判断成立 |
+| 1-voter 并发写（8 线程） | **1.99×**（§8.12.B2） |
+| **3-voter 串行写** | **2.20×** ← 新数据 |
+
+**async-flush 在真实 quorum 下即使串行写也有 2.2×**，因为收益来源不同：不再是「合并多个 writer 的 fsync」，而是**让 leader 的 fsync 不阻塞它给 follower 发 AppendEntries、也不与 follower 的 fsync 串行排队**。
+
+**但默认值仍保持 false**，理由收窄为一条：**三个节点共用一块磁盘是本基准的产物，不是生产形态**。生产 3-voter 分布在不同机器上，各自 fsync 不争抢同一磁盘，8213µs 不会出现。真实部署的收益应介于 1-voter（0×~1.99×，取决于并发度）与本节（2.20×）之间，需在目标硬件实测。
+
+**明确建议**：**元数据写有并发、或多个 coordinator 共享存储的部署，应设 `coordinator.raft.async-flush.enabled=true`**（不牺牲已 ack 写的耐久性，§8.12.B3）。
+
+### 8.13.4 副产品
+
+`replyToApplied` 在三种配置下是 3.7 / 4.1 / **1.8µs**，始终 < 5µs。再次确认 §8.9.4（C1/C2/C3）那条路线的天花板：**apply 段从来不是瓶颈，与 voter 数无关**。
+
+### 8.13.5 3-voter 批量写：chunk 128 优于 64，但本机数据被磁盘争抢污染
+
+跑 `batchUpdateLeaderAndIsr`（100 buckets/op）的 chunk A/B，验证 §8.10.4 遗留的 chunk 默认值问题。
+
+| 配置 | score | stdev | 逐次 iteration | leader `flushTime` |
+|------|------:|------:|---------------|-------------------:|
+| 3-voter, chunk=**64**, af=off | **44099µs** | ±40218 | 46016 / 44592 / … | 8793µs (count 1757) |
+| 3-voter, chunk=**128**, af=off | **27515µs** | ±34967 | 29721 / 26261 / … | 9233µs (count 1706) |
+
+**chunk=128 比 64 快 1.60×**（44099→27515µs），与 1-voter 上的 1.96×（§8.10.2）同向。机制一致：100 buckets 在 chunk=64 下要 2 个 chunk、在 128 下只要 1 个，而每个 chunk 至少一轮 fsync。
+
+**但这两个数字都不能用来定默认值**，两条独立理由：
+
+1. **stdev 大于均值的 80%+**（±40218 / ±34967）。JMH n=3 且三节点共用一块磁盘，fsync 排队使 iteration 间波动极大。**倍数关系可信（有 1-voter 同向数据 + chunk 数机制佐证），绝对值不可信。**
+2. **`flushTime` 在两个配置下几乎相同**（8793 vs 9233µs，均 ~9ms），说明**单次 fsync 的成本由磁盘争抢主导，与 chunk 无关**。chunk 只改变 fsync 的**次数**，改变不了每次的代价 —— 而生产 3-voter 分布在不同机器上，单次 fsync 不会是 9ms。
+
+**未完成的两格**：`async-flush=on` × {64, 128}。这两格本是用来把 fsync 移出关键路径、从而分离"chunk 效应"与"磁盘争抢"的对照组（若 af=on 下 128 仍优于 64，则 chunk 效应是真的 pipelining；若两者趋同，则此前的差异主要来自 fsync 次数）。**本机 shell 在连续跑完 4 组基准后不再可靠返回输出，这两格没跑出来**，因此上述"chunk 效应是真的"目前**只有 1-voter 数据（§8.10.2，stdev 仅 76–243µs）支撑，3-voter 侧未被独立确认**。
+
+#### 结论：chunk 默认值保持 64
+
+- 已知：chunk=128 在 1-voter（1.96×，数据干净）与 3-voter（1.60×，数据污染）下都更快，且**上限联动已做**（`max(100, 2*chunk)`，§8.10.1），调大是安全的配置动作。
+- 但改**默认值**意味着所有部署都吃更大的在途窗口，而本机的 3-voter 环境（共用磁盘、fsync 9ms）**不能代表生产**。
+- **建议**：ISR 批量密集的部署设 `coordinator.raft.append-chunk-size=128`，并在目标硬件上用 §9.2 的命令复核。
+
+### 8.13.6 验证
+
+- 新增 `RaftThreeVoterQuorumITCase`（1 test，2.1s）守护上述两个夹具陷阱。
+- 生产侧改动仅一处：`resolveGroupForVoters` 由 private 提为 public（附 javadoc 说明为何需共用）。
+- raft 包单测 + IT 全过；`spotless:check` 通过。
+- A/B 可复现：`-Dfluss.jmh.raft.voters=3 [-Dfluss.jmh.raft.async-flush=true]`。**注意 off 那一轮 stdev 极大（±29564），单次运行不可信** —— 但 18109 vs 8233 的差值远超噪声，且有 `flushTime`（8213 vs 68µs）作为机制侧佐证。
+
+---
+
+
+
+### 9.0 当前进度（2026-08-23，§8.11 归因后重排）
+
+> **§8.11 已把 #1 做完，并推翻了本节原有排序的前提。** 归因结果：单条 append 的 **96.6% 是 fsync（每次 append 两次，各 4.09ms）**，gRPC 只有 **0.6µs**，commit→apply 只有 **3.7µs**。因此 **#7 作废**，**#2/#3/#6 的性能上限已被证明极低**，唯一有杠杆的方向是**减少 fsync 次数**（§8.11.4）。
+
+| # | 项 | 状态 | 归因后的评价 |
+|---|----|------|--------------|
+| 1 | 写路径分段归因 | **已落地**（§8.11） | **本轮最有价值的一步**：把优化面从 5 个候选收敛到 1 个 |
+| 2 | C3 waiter 出锁 complete | **已落地**（§8.10.1） | 正确性修复有效；性能上限被证明只在 3.7µs 段内 |
+| 3 | B1 `disableWAL` | **已落地**（§8.10.1） | 未观察到可测下降，与 §8.11 一致（RocksDB 不在预算里） |
+| 4 | 补 ISR 批量基准 | **已落地**（§8.10.2） | 暴露了 45–88× 的真实风险 |
+| 5 | A `appendAll` + 分块推广 | **已落地**，45–88×（§8.10.3） | 机制由 §8.11.5 解释闭合 |
+| 6 | C1 / C2 apply 线程微优化 | **已落地**（§8.10.1） | 同 #2，上限极低 |
+| 7 | ~~B2 本地直提交绕过 gRPC~~ | **作废** | gRPC = 0.6µs（0.007%）。**不要做** |
+| 8 | B3 `async-flush` + 并发写 JMH | **已落地**（§8.12 B 部分） | **并发写 1.99× 提速**（8068→4055µs），`flushTime` 4041→7.2µs。默认 false，需显式开启 |
+| 9 | D 单 voter 启动窗口 | **未做** | 价值仍低 |
+| **10** | **查清第二次 fsync 的来源并尝试消除** | **已诊断 → 不做**（§8.12 A 部分） | 根因 = Ratis `LeaderStateImpl.logMetadata` 无条件写 commit-index metadata entry，**Fluss 侧无法关闭**；缓解手段是批量化（#5）与并发摊薄（#8），均已落地 |
+| 新 | chunk 默认值 64→128 的取舍 | **已实测，保持 64**（§8.13.5） | 1-voter 1.96×（数据干净）、3-voter 1.60×（**数据被同磁盘 fsync 争抢污染**）。上限联动已做，调大安全；**建议 ISR 批量密集的部署设 128 并在目标硬件复核** |
+| 新 | `async-flush` 默认值 false→true 的取舍 | **已实测，保持 false**（§8.13.3） | 1-voter 串行 0×、1-voter 并发 1.99×、**3-voter 串行 2.20×**。默认仍 false 的唯一理由是「三节点共用一块磁盘」是基准产物；**建议并发写或共享存储的部署显式开启** |
+| 新 | 3-voter 口径（§7.2） | **已补齐**（§8.13） | 结论：网络仍可忽略（`clientWriteRequest` 0.6µs），瓶颈是同磁盘 fsync 争抢 |
+
+**Fluss 侧的元数据写优化已做完，3-voter 口径也已补齐。**
+
+已系统核验与实测：
+- **覆盖面**：`appendAll` 无遗漏（§8.12.0）。
+- **单条写归因到底**：96.6% 是 fsync，其中一半是 Ratis 内部 commit-index entry，不可消除（§8.11 / §8.12 A）。
+- **三条摊薄路径全部落地并实测**：批量 45–88×（§8.10）、1-voter 并发 1.99×（§8.12 B）、3-voter 串行 2.20×（§8.13）。
+- **B2（绕过 gRPC）在 1-voter 与 3-voter 下均被否定**：`clientWriteRequest` 恒为 0.6~1.1µs。
+
+**剩余事项只有两类，都不是 1-voter 上能继续做的优化：**
+
+1. **在节点不共享磁盘的环境复核两个默认值**（chunk 64→128、async-flush false→true）。两者在本机都实测为「更快但数据被磁盘争抢污染」（§8.13.3 / §8.13.5），已做成配置项，**建议密集部署显式开启并在目标硬件复核**。3-voter 夹具已就绪（§8.13.1）。
+2. **#9（启动窗口）** 价值低，只影响单节点/测试夹具。
+
+**一个已知的测量缺口**：3-voter 批量写的 `async-flush=on` × {chunk 64, 128} 两格未跑出（§8.13.5 末尾）。它们本用于分离「chunk 效应」与「磁盘争抢」；目前「chunk 效应为真」只有 1-voter 侧的干净数据支撑。**在不共享磁盘的环境上重跑时应优先补这两格。**
+
+若还要继续压单写，只剩**上游改 Ratis**（合并 metadata entry 的 flush）—— 不属于本仓库范围。
+
+
+### 9.1 原始排序（保留作记录；已被 §8.11 重排，见 §9.0）
+
+按「风险 × 收益 ÷ 依赖」排。**1 和 2 是其余各项的前置条件。**
+
+| # | 项 | 出处 | 工作量 | 现有 JMH 上预期 | 风险 | 状态 |
+|---|----|------|--------|-----------------|------|------|
+| 1 | 写路径分段归因（`send` / `reply` / `applied`） | 8.9.1 | S | **无分数变化**；解锁后续取舍 | 无 | 未做 |
+| 2 | C3：waiter 出锁后 complete | 8.9.4 | S | **无分数变化**；修 §5.6 违反 | 低 | **已落地** |
+| 3 | B1：`disableWAL`（可选：内存后端） | 8.9.3 | S | 所有单 append 行同向下降，幅度待测 | 低（已论证恢复不依赖 RocksDB 持久化） | **已落地**（未见可测下降） |
+| 4 | 补基准：`batchUpdateLeaderAndIsr` / per-bucket 批量 | 8.9.2 | S | **新增行**，预期 Raft ≫ ZK | 无（只加 JMH） | **已落地** |
+| 5 | A：`appendAll` **+ 分块** 推广到删除级联与 ISR 批量 | 8.9.2 | M | `deleteTableAssignment` 2.64× 应大幅回落；**真正收益在生产 ISR 路径** | 中（分块上限必做） | **已落地**（45–88×） |
+| 6 | C1 / C2：apply 线程微优化 | 8.9.4 | S | 几 µs~几十 µs | 低 | **已落地** |
+| 7 | B2：leader 本地直提交绕过 gRPC | 8.9.3 | M | 所有 append 行；幅度取决于 #1 | 中 | 未做（需 #1） |
+| 8 | B3：`async-flush` + 新增并发写 JMH | 8.9.3 / 8.1 | S + M | 串行 JMH 无效；**并发才有** | 低–中 | 未做 |
+| 9 | D：单 voter 启动窗口 | 8.9.5 | S | 仅 1-node 启动 | 低 | 未做 |
+| — | `MULTI_OP` record type | §8.2.3 | L | 与 pipeline 同类 | 高（混版本 / stream） | 不做 |
+| — | `unsafe-flush` | §8.1.5 | S | 分数好看 | **不可接受（静默丢元数据）** | 永不做 |
+
+依赖关系：**#2 必须早于 #5**（分块放大 apply 线程搭车）；**#1 必须早于 #7 和 #8**（否则无法判断 gRPC / fsync 各占多少）；**#4 应早于 #5**（先有基准才能验收）。落地时按此顺序执行，实测见 §8.10。
+
+### 9.2 验收命令（沿用现有 JMH，flags 同 §8.6–§8.8）
+
+新增的 ISR 批量行（§8.10.2 实际用的命令，JMH 需 `test-compile` 生成 `BenchmarkList`）：
+
+```bash
+ mvn -o -pl fluss-jmh test-compile
+ java -cp "fluss-jmh/target/test-classes:fluss-jmh/target/classes:$(cat /tmp/jmh_cp.txt)" \
+   org.openjdk.jmh.Main -f 0 -wi 2 -w 1s -i 3 -r 1s -tu us \
+   MetadataStoreBenchmark.batchUpdateLeaderAndIsr
+```
+
+覆盖 chunk 做 A/B（不改代码，见 §8.10.4）：
+
+```bash
+ java -Dfluss.jmh.raft.append-chunk-size=128 -cp "..." org.openjdk.jmh.Main \
+   -f 0 -wi 2 -w 1s -i 3 -r 1s -tu us -p backend=RAFT \
+   MetadataStoreBenchmark.batchUpdateLeaderAndIsr
+```
+
+**3-voter 复核（§8.13）** —— 定夺两个默认值必须在**节点不共享磁盘**的环境上跑，否则测到的是 fsync 争抢：
+
+```bash
+ # 单条写 A/B：async-flush 的收益
+ java -Dfluss.jmh.raft.voters=3 [-Dfluss.jmh.raft.async-flush=true] -cp "..." \
+   org.openjdk.jmh.Main -f 0 -wi 2 -w 1s -i 3 -r 1s -tu us -p backend=RAFT \
+   'MetadataStoreBenchmark.updateLeaderAndIsr$'
+
+ # 批量写 2x2 矩阵：chunk {64,128} x async-flush {false,true}
+ # 注意 async-flush=true 的两格在 §8.13.5 中未跑出，应优先补齐 —— 它们是分离
+ # "chunk 效应" 与 "磁盘争抢" 的对照组。
+ java -Dfluss.jmh.raft.voters=3 -Dfluss.jmh.raft.append-chunk-size=128 \
+   -Dfluss.jmh.raft.async-flush=true -cp "..." org.openjdk.jmh.Main \
+   -f 0 -wi 2 -w 1s -i 3 -r 1s -tu us -p backend=RAFT \
+   MetadataStoreBenchmark.batchUpdateLeaderAndIsr
+```
+
+3-voter 下务必核对输出里的 `# raft append attribution (voters=3)` 与每个节点的 `flushTime` mean：**若三个节点的 `flushTime` 都是毫秒级且彼此接近，说明它们在争抢同一块磁盘，该轮数据的绝对值不可用**（§8.13.2 / §8.13.5）。
+
+其余会动的行 + 不应变化的对照：
+
+```bash
+ ./mvnw -pl fluss-jmh test -Dtest=MetadataStoreBenchmark.deleteTableAssignment
+ ./mvnw -pl fluss-jmh test -Dtest=MetadataStoreBenchmark.deletePartitionAssignment
+ ./mvnw -pl fluss-jmh test -Dtest=MetadataStoreBenchmark.deleteTable
+ ./mvnw -pl fluss-jmh test -Dtest=MetadataStoreBenchmark.metadataWrite
+```
+
+复跑约定与 §8.6 一致：warmup 2×1s、measurement 3×1s、`@Fork(0)`、1 thread、AverageTime µs/op、`JAVA_HOME` = TencentKona 11.0.23，**只复跑会动的行 + `metadataWrite` 作为「不应变化」对照**。
+
+### 9.3 判定标准（避免把噪声当收益）
+
+| 项 | 应该看到 | 实际结果 / 若没看到说明什么 |
+|----|----------|------------------------------|
+| #1 归因 | 无分数变化；给出分段预算 | **fsync 96.6% / gRPC 0.6µs / apply 3.7µs**（§8.11.2）。作废 #7，收窄到 #10 |
+| #3 B1 | 所有单 append 行同向小幅下降 | **未观察到可测下降**：单条 `updateLeaderAndIsr` 8315µs 与落地前 8.2–9.3ms 带同量级。§8.11 解释了原因 —— RocksDB 侧根本不在预算里 |
+| #5 A | `deleteTableAssignment` 从 2.64× 明显回落；`metadataWrite` **不变** | ISR 批量 **45–88× 改善**（§8.10.3）；批量成本闭合为「chunk 数 × 单条」，机制见 §8.11.5 |
+| ~~#7 B2~~ | 所有 append 行同向下降 | **作废**：`clientWriteRequest` 实测 **0.6µs** |
+| #8 B3 | **串行不变**（预期），并发写 JMH 下改善 | 未做。串行不变是**预期**（§8.1.6）；但在 fsync 占 96.6% 的事实下，它已是唯一已知的摊薄机制 |
+| #10 fsync 次数 | 单条 append 的 flush count 从 2× 降到 1× | **已诊断，不做**：根因是 Ratis 内部 commit-index metadata entry（§8.12.2），Fluss 侧无法关闭。批量下 flush count 已自然降到 0.049×（§8.12.3） |
+
+n=3 的 JMH CI 很宽（§1.2）。**单行 <10% 的变化按噪声处理**，不写进 catalog。注意 §8.10.2 三行的 stdev 都很小（76–243µs），chunk 数导致的 2× 差异远超噪声，属于可信信号。§8.11 / §8.12 的归因不受 JMH CI 影响 —— 它们是恒等分解（两段之和 = 总和；728+727+1 = 1456 ≈ flushCount 1455），count 是整数关系而非统计估计。
+
+### 9.4 结论修订（§8.11 / §8.12 之后）
+
+1. **「1-voter 单写追平 ZK」不是有效目标 —— 理由已从含糊变具体。** 原措辞是「共识开销是设计内的正确性税」（§7.1，含糊）。实测机制：**Raft 每写 2 次 fsync（数据 entry + Ratis 的 commit-index metadata entry），ZK 每 txn 1 次；1.85× ≈ 2 倍 fsync 之比**（§8.11.2 / §8.12.1）。第二次 fsync 由 `LeaderStateImpl.logMetadata` 无条件产生，**Fluss 侧无法消除**（§8.12.2/§8.12.4）。因此这是**采用 Ratis 的既定成本**，不是待办优化项。
+2. **仍然不要用 1-node JMH 声称「生产已对齐 ZK」。** §1.1 的不可外推表与 §6 的局限清单继续适用；3-voter 会引入真实网络 ack，与 fsync 重叠后比值不会是简单的 2×。
+3. **`unsafe-flush` 依旧禁止。** fsync 占比高**不是**打开它的理由（§8.1.5）。
+4. **单写已到 Fluss 侧的底。** 剩余方向只有两类：让写变成批量写（已落地，§8.10）；让 fsync 被并发摊薄（#8，机制已由 §8.12.3 证实）。
+
+---
+
 ## 附录：关键代码索引
 
 | 主题 | 位置 |
@@ -1343,4 +2115,12 @@ List<byte[][]> scanPrefixEntries(byte[] prefix);
 | stream max-wait | `ConfigOptions.COORDINATOR_METADATA_STREAM_MAX_WAIT`（默认 500ms；IT/JMH 集群 100ms） |
 | FetchMetadata 停车（已落地） | `MetadataStreamRpcServer.fetchMetadata` → `MetadataStreamService.fetchAsync`；timeout scheduler + metadata-stream pool；`onApplied` 只 enqueue（§8.7） |
 | Prefix iterator（已落地） | `MetadataKvStore.scanPrefixEntries`；`RaftMetadataStore` 委托；JMH before/after 见 **§8.6** |
-| 实现指南 | 本文 **§8**（8.2 / 8.3 / 8.4 已落地；8.1 仍是 sketch） |
+| **未接 `appendAll` 的多写路径（§8.9.2）** | `RaftMetadataClient.deleteTableAssignment` / `deletePartitionAssignment` / `deleteTable` / `batchUpdateLeaderAndIsr` / `batchRegisterLeaderAndIsrForTablePartition` |
+| **ISR 批量调用方（§8.9.2，JMH 未覆盖）** | `TableBucketStateMachine:245`/`:275`/`:552`、`ReplicaStateMachine:491`、`CoordinatorEventProcessor:2035`；ZK 对照 `ZooKeeperClient.batchRegisterLeaderAndIsrForTablePartition`（一次 Curator transaction） |
+| **Ratis 客户端窗口上限（§8.9.2）** | `RaftClientConfigKeys.Async.OUTSTANDING_REQUESTS_MAX_DEFAULT=100`；`Write.ELEMENT_LIMIT_DEFAULT=4096`；`Log.QUEUE_ELEMENT_LIMIT_DEFAULT=4096`（`javap` 实测） |
+| **RocksDB WAL 与恢复路径（§8.9.3 B1）** | `RocksDBMetadataKvStore.open`（默认 `WriteOptions`）；`FlussMetadataStateMachine.load` → `RaftMetadataStore.restoreFromSnapshot`（先 `clear()`，不读 RocksDB 持久内容） |
+| **本地直提交入口（§8.9.3 B2）** | `RaftServer extends RaftClientAsynchronousProtocol.submitClientRequestAsync`；`RaftClientRequest.newBuilder()` + `writeRequestType()`（`javap` 实测） |
+| **apply 线程搭车开销（§8.9.4）** | `RaftMetadataStore.apply` 的 `oldValue` 预读（C1）；`MetadataWatchService.fireWatch` hex+全表遍历（C2）；`FlussMetadataStateMachine.completeAppliedWaiters` 持锁 complete + `RaftJournalWriter.appendAll` 的 `whenComplete`（C3，违反 §5.6） |
+| **启动路径（§8.9.5）** | `CoordinatorServer.initCoordinatorLeader:433`（`registerCoordinatorLeader`）与 `:492`（`createDefaultDatabase`）之间隔着 `synchronized (lock)` 初始化块，无法合批；`LeaderElection.PRE_VOTE_DEFAULT=true` |
+| 实现指南 | 本文 **§8**（8.2 / 8.3 / 8.4 已落地；8.1 仍是 sketch；**8.9 剩余空间全部未落地**） |
+| **优先级路线图** | 本文 **§9**（排序 / 验收命令 / 判定标准 / 不可推翻的结论） |
